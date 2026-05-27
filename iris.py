@@ -132,6 +132,14 @@ SESSIONS_DIR = WORKSPACE_DIR / "_Iris_Memory" / "Sessions"
 RECENT_DECISIONS_LIMIT = 3
 RECENT_SESSIONS_LIMIT = 3
 
+# Context expansion (2026-05-27): three additional canonical files Iris loads
+# on every cloud-tier message so she's fully clued in to (a) what other agents
+# did most recently — bridge file last entry, (b) the current Phase 4/5 work
+# state — Build Queue, (c) the vault navigation contract — Vault_MOC.
+BRIDGE_FILE = SESSIONS_DIR / "CLAUDE_CODE_HANDOFF.md"
+BUILD_QUEUE_FILE = WORKSPACE_DIR / "06_CEO" / "Designs" / "2026-05-26_Phase_4_and_5_Build_Queue.md"
+VAULT_MOC_FILE = WORKSPACE_DIR / "_MAP" / "Vault_MOC.md"
+
 # Task #6 — Quick Capture bridge (WRITE side, bridge solution per
 # post-transfer-additions/iris-future-enhancements.md #2b Option A):
 # When Steve sends a Quick Capture-prefixed message on Telegram, the daemon
@@ -184,8 +192,19 @@ LOCAL_MODEL_PATH = "mlx-community/Llama-3.1-8B-Instruct-4bit"
 LOCAL_MAX_TOKENS = 400
 LOCAL_TIMEOUT_SECONDS = 30.0
 
+# === Tier 2 — Local Qwen 2.5 14B (W3 from engineering handoff) ===
+# Added 2026-05-27 to leverage the Mac Mini M4 + 24GB RAM more fully:
+# Tier 2 fills the gap between Llama 3.1 8B (Tier 1, fast but limited) and
+# Haiku 4.5 via cloud (Tier 3, smart but cloud-bound). Qwen 14B at 4-bit fits
+# in ~9GB RAM and runs ~12-15 tok/sec on M4. Accessed via /tier2 or !tier2
+# force prefix from Telegram. Router auto-routing to Tier 2 deferred to a
+# follow-on tuning pass.
+LOCAL_TIER2_MODEL_PATH = "mlx-community/Qwen2.5-14B-Instruct-4bit"
+LOCAL_TIER2_MAX_TOKENS = 600
+LOCAL_TIER2_TIMEOUT_SECONDS = 60.0
+
 # === Conversation memory (Task #5) config ===
-DB_PATH = Path.home() / "iris_studio" / "iris.db"
+DB_PATH = Path("/Volumes/AI_Workspace/iris_studio/iris.db")
 HISTORY_LIMIT_LOCAL = 10  # Llama 8B is small; tight history keeps it focused
 HISTORY_LIMIT_CLOUD = 20  # Haiku 4.5 handles longer context cleanly
 
@@ -212,6 +231,11 @@ _local_model = None
 _local_tokenizer = None
 _local_load_lock: asyncio.Lock | None = None
 
+# Tier 2 Qwen 14B — separate singletons so both can be loaded simultaneously.
+_local_tier2_model = None
+_local_tier2_tokenizer = None
+_local_tier2_load_lock: asyncio.Lock | None = None
+
 _db_initialized = False
 _db_init_lock: asyncio.Lock | None = None
 
@@ -220,6 +244,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("iris")
+
+# A-4: silence Telegram getUpdates polling INFO from httpx/httpcore.
+# Was burying real iris errors under ~360 lines/hour of HTTP/1.1 200 OK noise
+# in iris.err.log. Real errors from these libs still surface at WARNING+.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_MAX_MSG = 4000
 
@@ -316,6 +346,22 @@ def _read_file(path: Path) -> str:
         return ""
 
 
+def _read_bridge_latest_entry(path: Path) -> str:
+    """Read the CLAUDE_CODE_HANDOFF.md bridge file and return only the latest
+    session entry (from the last "## [...] Session N" header to EOF). Past
+    sessions are historical; the latest is what Iris needs to be clued in to.
+    Returns empty string if file missing or no session headers found."""
+    full = _read_file(path)
+    if not full:
+        return ""
+    # Find the LAST occurrence of a "## [" session header.
+    last_header_idx = full.rfind("\n## [")
+    if last_header_idx == -1:
+        # No session headers — return the whole file (it's just header/intro).
+        return full
+    return full[last_header_idx + 1:].strip()
+
+
 def _detect_quick_capture(text: str) -> str | None:
     """If text starts with a Quick Capture prefix, return the matched prefix uppercased; else None."""
     stripped = text.strip()
@@ -368,11 +414,118 @@ async def save_quick_capture(prefix: str, raw_text: str, user_id: int, username:
         return False
 
 
-def _read_recent_markdown_files(directory: Path, limit: int) -> str:
+# A-1: Quick Capture routing — when a markdown-safe prefix arrives, route the
+# entry to its canonical home inline (in addition to the TELEGRAM_CAPTURE.md
+# append above, which remains the audit-trail of record). xlsx-bound prefixes
+# (RECEIPT, PURCHASE, PAYMENT, STATEMENT, MILESTONE) are intentionally not
+# routed here — Cowork-Iris still handles those at desktop sessions because
+# the Expense_Tracker.xlsx surface is risky to auto-modify from the daemon.
+_QC_NEW_FILE_ROUTES = {
+    "DECISION": ("06_CEO", "Decisions_Log"),
+    "MEETING":  ("06_CEO", "Meeting_Notes"),
+}
+_QC_APPEND_ROUTES = {
+    "IDEA":     ("06_CEO", "Improvements_Backlog.md"),
+    "QUESTION": ("_Iris_Memory", "Questions.md"),
+    "FEEDBACK": ("_Iris_Memory", "Feedback.md"),
+}
+
+
+def _route_quick_capture_sync(prefix: str, raw_text: str, user_id: int, username: str, timestamp: datetime) -> str | None:
+    """Route a Quick Capture entry to its canonical home if the prefix is markdown-safe.
+    Returns the vault-relative path written, or None if the prefix is xlsx-bound or unrecognized.
+    Raises on filesystem errors so the async wrapper can log + swallow."""
+    prefix_clean = prefix.rstrip(":").upper()
+
+    stripped = raw_text.strip()
+    content = stripped[len(prefix):].strip() if stripped.upper().startswith(prefix) else stripped
+
+    date_str = timestamp.strftime("%Y-%m-%d")
+    time_str = timestamp.strftime("%H%M%S")
+
+    slug_source = content[:60] if content else "untitled"
+    slug = re.sub(r"[^a-z0-9]+", "_", slug_source.lower()).strip("_")[:40] or "untitled"
+
+    if prefix_clean in _QC_NEW_FILE_ROUTES:
+        folder = WORKSPACE_DIR.joinpath(*_QC_NEW_FILE_ROUTES[prefix_clean])
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / f"{date_str}_{slug}.md"
+        if dest.exists():
+            dest = folder / f"{date_str}_{slug}_{time_str}.md"
+        body = (
+            "---\n"
+            f"type: {prefix_clean.lower()}\n"
+            f"date: {date_str}\n"
+            "captured_via: telegram-quick-capture\n"
+            f"captured_by: \"@{username} (id={user_id})\"\n"
+            "---\n\n"
+            f"# {prefix_clean.title()}: {slug_source[:60]}\n\n"
+            f"_Auto-routed from `TELEGRAM_CAPTURE.md` by iris.py daemon at "
+            f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} ET._\n\n"
+            f"{content}\n"
+        )
+        dest.write_text(body, encoding="utf-8")
+        return str(dest.relative_to(WORKSPACE_DIR))
+
+    if prefix_clean in _QC_APPEND_ROUTES:
+        dest = WORKSPACE_DIR.joinpath(*_QC_APPEND_ROUTES[prefix_clean])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            header = (
+                f"# {prefix_clean.title()} Log\n\n"
+                "Auto-routed entries from Telegram Quick Capture (`TELEGRAM_CAPTURE.md`) "
+                "by the iris.py daemon. Most recent on top.\n\n"
+                "---\n\n"
+            )
+            dest.write_text(header, encoding="utf-8")
+        entry = (
+            f"## {timestamp.strftime('%Y-%m-%d %H:%M:%S')} — @{username}\n\n"
+            f"{content}\n\n"
+        )
+        existing = dest.read_text(encoding="utf-8")
+        if "---\n\n" in existing:
+            head, rest = existing.split("---\n\n", 1)
+            dest.write_text(head + "---\n\n" + entry + rest, encoding="utf-8")
+        else:
+            with open(dest, "a", encoding="utf-8") as f:
+                f.write("\n" + entry)
+        return str(dest.relative_to(WORKSPACE_DIR))
+
+    return None
+
+
+async def route_quick_capture(prefix: str, raw_text: str, user_id: int, username: str) -> str | None:
+    """Async wrapper for _route_quick_capture_sync. Best-effort — failures are logged + swallowed,
+    since TELEGRAM_CAPTURE.md already holds the entry for manual filing if routing fails."""
+    try:
+        loop = asyncio.get_event_loop()
+        timestamp = datetime.now()
+        dest = await loop.run_in_executor(
+            None,
+            lambda: _route_quick_capture_sync(prefix, raw_text, user_id, username, timestamp),
+        )
+        if dest:
+            logger.info(f"Quick Capture routed: prefix={prefix} -> {dest}")
+        return dest
+    except Exception as exc:
+        logger.warning(
+            f"Quick Capture routing failed for {prefix}: {exc}. "
+            "TELEGRAM_CAPTURE.md append still holds the entry for manual filing."
+        )
+        return None
+
+
+def _read_recent_markdown_files(directory: Path, limit: int, max_lines_per_file: int | None = None) -> str:
     """Read N most recent .md files from a directory by mtime; return concatenated text with filename headers.
 
     Used for Decisions_Log/ and Sessions/ where the most recent few entries
     are the most relevant context for Iris-on-Telegram.
+
+    Token-reduction (2026-05-27): pass `max_lines_per_file` to truncate each
+    file to its first N lines. The headline + summary of a session/decision
+    digest is at the top; the body is detail Iris can pull on demand via
+    the Obsidian MCP if needed. Capping prevents the recent-sessions section
+    from dominating the system-prompt budget when digests grow long.
     """
     try:
         if not directory.exists() or not directory.is_dir():
@@ -387,8 +540,14 @@ def _read_recent_markdown_files(directory: Path, limit: int) -> str:
         sections: list[str] = []
         for f in files:
             content = _read_file(f)
-            if content:
-                sections.append(f"## {f.name}\n\n{content}")
+            if not content:
+                continue
+            if max_lines_per_file is not None:
+                lines = content.splitlines()
+                if len(lines) > max_lines_per_file:
+                    truncated = "\n".join(lines[:max_lines_per_file])
+                    content = truncated + f"\n\n_[truncated to first {max_lines_per_file} lines — full digest at `{f.name}`; pull via Obsidian MCP if needed]_"
+            sections.append(f"## {f.name}\n\n{content}")
         return "\n\n".join(sections)
     except Exception as exc:
         logger.warning(f"Failed to read recent files from {directory}: {exc}")
@@ -426,18 +585,24 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
       2. Runtime date
       3. Operator Blueprint (canonical identity + business map)
       4. STEVE_CONTEXT.md (technical addendum)
-      5. INBOX.md (active items this week)
-      6. DAILY_BRIEFING.md (today's status snapshot)
-      7. Last 3 Decisions_Log entries (by mtime — most recent first)
-      8. Last 3 Session digests (by mtime — most recent first)
-      9. Recent conversation history (last 20 messages)
+      5. Vault_MOC.md (AI-agent contract + navigation index)
+      6. INBOX.md (active items this week)
+      7. DAILY_BRIEFING.md (today's status snapshot)
+      8. Build Queue (current Phase 4/5 work state)
+      9. CLAUDE_CODE_HANDOFF.md — LATEST entry only (what other agents did most recently)
+     10. Last 3 Decisions_Log entries (by mtime — most recent first)
+     11. Last 3 Session digests (by mtime — most recent first)
+     12. Recent conversation history (last 20 messages)
     """
     blueprint = _read_file(BLUEPRINT_FILE)
     addendum = _read_file(CONTEXT_FILE)
+    vault_moc = _read_file(VAULT_MOC_FILE)
     inbox = _read_file(INBOX_FILE)
     briefing = _read_file(DAILY_BRIEFING_FILE)
-    recent_decisions = _read_recent_markdown_files(DECISIONS_DIR, RECENT_DECISIONS_LIMIT)
-    recent_sessions = _read_recent_markdown_files(SESSIONS_DIR, RECENT_SESSIONS_LIMIT)
+    build_queue = _read_file(BUILD_QUEUE_FILE)
+    bridge_latest = _read_bridge_latest_entry(BRIDGE_FILE)
+    recent_decisions = _read_recent_markdown_files(DECISIONS_DIR, RECENT_DECISIONS_LIMIT, max_lines_per_file=40)
+    recent_sessions = _read_recent_markdown_files(SESSIONS_DIR, RECENT_SESSIONS_LIMIT, max_lines_per_file=30)
     date_block = _runtime_date_block()
     history_block = _format_history_for_cloud(history)
 
@@ -451,6 +616,11 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
             "# === TECHNICAL ADDENDUM (current deployment state) ===\n\n"
             + addendum
         )
+    if vault_moc:
+        sections.append(
+            "# === VAULT MAP OF CONTENT (AI-agent boot sequence + registry + coordination conventions) ===\n\n"
+            + vault_moc
+        )
     if inbox:
         sections.append(
             "# === INBOX (active items this week) ===\n\n" + inbox
@@ -458,6 +628,16 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
     if briefing:
         sections.append(
             "# === DAILY BRIEFING (today's status snapshot) ===\n\n" + briefing
+        )
+    if build_queue:
+        sections.append(
+            "# === BUILD QUEUE (current Phase 4/5 work state — see for what's done, in-progress, queued, blocked) ===\n\n"
+            + build_queue
+        )
+    if bridge_latest:
+        sections.append(
+            "# === CLAUDE CODE BRIDGE — LATEST SESSION (what other agents did most recently — for Iris's awareness when asked about engineering state) ===\n\n"
+            + bridge_latest
         )
     if recent_decisions:
         sections.append(
@@ -882,7 +1062,7 @@ _CLOUD_REQUIRED_KEYWORDS = frozenset([
     "3sk",
 ])
 
-_FORCE_PREFIXES = ("/cloud ", "/local ", "!cloud ", "!local ")
+_FORCE_PREFIXES = ("/cloud ", "/local ", "/tier2 ", "!cloud ", "!local ", "!tier2 ")
 
 # Hybrid router v2 — fast deterministic rules first; Haiku classifier only as
 # a tiebreaker for genuinely ambiguous messages. Keeps cloud and greeting
@@ -924,12 +1104,14 @@ def is_obvious_local(prompt: str) -> bool:
 
 
 def _decide_tier_deterministic(prompt: str) -> str | None:
-    """Fast deterministic routing rules. Return 'local', 'cloud', or None if ambiguous."""
+    """Fast deterministic routing rules. Return 'local', 'tier2', 'cloud', or None if ambiguous."""
     p_lower = prompt.lower().strip()
     if p_lower.startswith(("/cloud ", "!cloud ")):
         return "cloud"
     if p_lower.startswith(("/local ", "!local ")):
         return "local"
+    if p_lower.startswith(("/tier2 ", "!tier2 ")):
+        return "tier2"
     if _detect_quick_capture(prompt):
         return "cloud"
     if len(prompt.split()) > 25 or len(prompt) > 150:
@@ -1101,6 +1283,71 @@ async def query_local(prompt: str, history: list[dict]) -> str:
 
 
 # ============================================================
+# Tier 2 — Local Qwen 2.5 14B via MLX (W3 — 2026-05-27)
+# ============================================================
+
+async def _ensure_local_tier2_model() -> None:
+    global _local_tier2_model, _local_tier2_tokenizer, _local_tier2_load_lock
+    if _local_tier2_model is not None:
+        return
+    if _local_tier2_load_lock is None:
+        _local_tier2_load_lock = asyncio.Lock()
+    async with _local_tier2_load_lock:
+        if _local_tier2_model is not None:
+            return
+        logger.info(
+            f"Loading Tier 2 model {LOCAL_TIER2_MODEL_PATH} from HF_HOME="
+            f"{os.environ.get('HF_HOME', '~/.cache/huggingface')} "
+            "(first use; takes ~30-90 sec for 14B model)..."
+        )
+        loop = asyncio.get_event_loop()
+        m, t = await loop.run_in_executor(None, lambda: mlx_load(LOCAL_TIER2_MODEL_PATH))
+        _local_tier2_model = m
+        _local_tier2_tokenizer = t
+        logger.info("Tier 2 model (Qwen 14B) loaded and ready for inference.")
+
+
+async def query_local_tier2(prompt: str, history: list[dict]) -> str:
+    """Generate via local Qwen 14B with multi-turn history. Same TIER1 system
+    prompt template (trimmed) — Tier 2 is for fast local inference on medium
+    queries; if Iris needs full workspace awareness, escalate to cloud Tier 3."""
+    if not MLX_AVAILABLE:
+        raise RuntimeError(
+            f"mlx_lm not installed; Tier 2 disabled. Import error: {_MLX_IMPORT_ERROR}"
+        )
+
+    await _ensure_local_tier2_model()
+
+    # Reuse the Tier 1 messages-builder — same trimmed system prompt fits Qwen 14B too.
+    system_prompt = TIER1_SYSTEM_PROMPT_TEMPLATE.format(date_block=_runtime_date_block())
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        if h["role"] in ("user", "assistant") and h["content"]:
+            messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": prompt})
+
+    chat_prompt = _local_tier2_tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    loop = asyncio.get_event_loop()
+    text = await asyncio.wait_for(
+        loop.run_in_executor(
+            None,
+            lambda: mlx_generate(
+                _local_tier2_model,
+                _local_tier2_tokenizer,
+                prompt=chat_prompt,
+                max_tokens=LOCAL_TIER2_MAX_TOKENS,
+                verbose=False,
+            ),
+        ),
+        timeout=LOCAL_TIER2_TIMEOUT_SECONDS,
+    )
+    return text.strip() or "(Tier 2 model returned no text)"
+
+
+# ============================================================
 # Tier 3 — Claude Agent SDK via Max sub OAuth
 # ============================================================
 
@@ -1190,10 +1437,10 @@ async def ask_iris(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
     await save_message(chat_id, user_id, "user", prompt)
 
     # Fetch history sized to the chosen tier
-    if decided_tier == "local":
+    if decided_tier in ("local", "tier2"):
         history = await get_history(chat_id, HISTORY_LIMIT_LOCAL)
         # Drop the just-saved user message from history since we append it
-        # explicitly inside query_local.
+        # explicitly inside query_local / query_local_tier2.
         if history and history[-1]["role"] == "user":
             history = history[:-1]
     else:
@@ -1204,6 +1451,32 @@ async def ask_iris(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
             history = history[:-1]
 
     actual_tier: str
+
+    if decided_tier == "tier2":
+        if not MLX_AVAILABLE:
+            logger.warning("Router chose tier2 but MLX is unavailable; falling through to cloud.")
+            decided_tier = "cloud_fallback"
+        else:
+            try:
+                text = await query_local_tier2(stripped, history)
+                actual_tier = "tier2"
+                await save_message(chat_id, user_id, "assistant", text, tier=actual_tier)
+                await record_message_stat(actual_tier, cost_usd=0.0)
+                return text, actual_tier
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Tier 2 timed out after {LOCAL_TIER2_TIMEOUT_SECONDS}s; falling back to cloud."
+                )
+                decided_tier = "cloud_fallback"
+            except Exception as exc:
+                logger.warning(
+                    f"Tier 2 failed, falling back to cloud: {type(exc).__name__}: {exc}"
+                )
+                decided_tier = "cloud_fallback"
+            # Re-fetch with cloud-sized history for the fallback call
+            history = await get_history(chat_id, HISTORY_LIMIT_CLOUD)
+            if history and history[-1]["role"] == "user":
+                history = history[:-1]
 
     if decided_tier == "local":
         if not MLX_AVAILABLE:
@@ -1325,6 +1598,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         saved = await save_quick_capture(qc_prefix, text, user_id, username)
         if not saved:
             logger.warning(f"Quick Capture for @{username} prefix={qc_prefix} did not persist; user reply will continue.")
+        # A-1: also route markdown-safe prefixes to canonical homes inline.
+        # xlsx-bound prefixes (RECEIPT/PURCHASE/PAYMENT/STATEMENT/MILESTONE) return None.
+        await route_quick_capture(qc_prefix, text, user_id, username)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
@@ -1342,10 +1618,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "oauth", "authenticate", "unauthorized", "401",
             "token expir", "credential", "auth failed", "auth error",
         )
+        # A-5: detect sqlite / X9-unmount errors and give Steve the diskutil hint
+        sqlite_signals = (
+            "no such file", "unable to open database", "disk i/o error",
+            "database is locked", "database disk image is malformed",
+            "/volumes/ai_workspace",
+        )
         if any(s in exc_str for s in oauth_signals):
             err_msg = (
                 f"Iris auth/OAuth failure: {exc}\n\n"
                 "On the Mac Mini Terminal, run: claude login\n"
+                "Then text me again to verify."
+            )
+        elif any(s in exc_str for s in sqlite_signals):
+            err_msg = (
+                f"Iris SQLite/disk error: {exc}\n\n"
+                "Looks like the X9 SSD may be unmounted. On the Mac Mini Terminal, run:\n"
+                "diskutil mount /Volumes/AI_Workspace\n"
                 "Then text me again to verify."
             )
         else:
