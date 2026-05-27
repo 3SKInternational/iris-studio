@@ -1,0 +1,28 @@
+Sunday engineering hygiene at 09:00 AM ET. Weekly multi-pass grooming sweep.
+
+Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
+
+Perform these 7 grooming passes. Write all findings into a single new design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` (date-prefixed). Cross-reference from INBOX.md by appending a one-line link under "🧍 THIS WEEK".
+
+1. **iris.py type check.** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/pyright iris.py 2>&1 | tail -30` (or `which pyright` then full path). If pyright not installed, suggest `.venv/bin/pip install pyright` and skip this pass. Flag any reported type errors but do NOT auto-fix (Steve approves changes).
+
+2. **Git status + recent commit review.** Run: `cd /Volumes/AI_Workspace/iris_studio && git status && git log --oneline -10 && git diff --stat HEAD~10 HEAD 2>/dev/null`. Summarize: any uncommitted changes? Commits this week? Lines-of-code drift trend?
+
+3. **.bak file cleanup candidates.** Run: `ls -la /Volumes/AI_Workspace/iris_studio/iris.py.bak* 2>/dev/null` + `ls -la ~ | grep .OLD-`. List any .bak* or .OLD-* files older than 7 days. Do NOT delete — flag candidates in the hygiene doc for Steve's approval.
+
+4. **Pitch_Log staleness.** Read `_Iris_Memory/Projects/Pitch_Log.md`. List any ⚪ pending pitches whose status hasn't changed in 30+ days. Surface them as a table (number, name, age, recommended action — usually "approve, decline, or defer with timer").
+
+5. **Build Queue deliverable verification.** Read `06_CEO/Designs/2026-05-26_Phase_4_and_5_Build_Queue.md`. For each ✅ done item, verify the deliverable file actually exists on disk. If a ✅ done item's deliverable is missing, flag the misalignment (don't auto-revert status — Steve decides).
+
+6. **Dependency drift check.** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/pip list --outdated 2>&1 | head -20`. Note any package with major-version drift. Do NOT auto-update; flag for Steve.
+
+7. **Insurance/backup audit.** List any `.OLD-*` insurance directories older than 48 hours that are still on disk. Recommend deletion in the hygiene doc.
+
+**Output expectations:**
+- New design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` with frontmatter (`date`, `type: hygiene-report`, `status: complete`, `related: [[Pitch_Log]] [[2026-05-26_Phase_4_and_5_Build_Queue]]`, `tags: [hygiene/weekly]`).
+- INBOX.md gets a single cross-reference link.
+- Append session summary to bridge file ONLY if you took action (e.g., re-flagged a pitch, surfaced a security concern). Clean sweeps skip the bridge update.
+- Hard ban on structural iris.py changes, git pushes, dep installs, file deletions. Flags + recommendations only.
+
+**Append to today's daily note (per-agent-sections convention 2026-05-27).** After your primary task, append ONE bullet to `_Iris_Memory/Daily/YYYY-MM-DD.md` (today's ISO date) under the `## 🤖 Claude Code intra-day log` section. Format: `HH:MM — [1-line action] → [outcome path or "clean" if nothing changed]`. If the daily note doesn't exist yet, create it from `01_Operating_Docs/Templates/Daily_Note_Template.md` and fill the frontmatter date/day fields. Do NOT edit Cowork's `## 📝 Cowork-Iris intra-day log` section — that's her lane.
+

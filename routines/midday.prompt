@@ -1,0 +1,24 @@
+Midday engineering pulse at 12:00 PM ET (Mon-Fri).
+
+Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` — focus on entries written since the previous midday pulse (or, on Mondays, since Friday's). Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
+
+Quick triage — 5 spot checks:
+
+1. **Autonomous nightly carry-over.** Did last night's 2 AM autonomous Claude Code session leave anything blocked or surprising in the bridge file? If yes, summarize.
+
+2. **Daemon stability since this morning.** Run: `launchctl print gui/$(id -u)/com.iris.studio | grep -E "state|pid|runs"`. Cross-reference with the runs count from this morning's 5 AM pre-brief sweep (if logged in INBOX). If runs increased by 5+ since 5 AM, daemon is crashlooping — flag urgently.
+
+3. **New errors since 5 AM.** Run: `tail -200 /Users/steve/iris_studio/logs/iris.err.log | grep -iE "error|exception|traceback|fatal" | grep -v "OAuth-aware error reply"`. Cross-reference with what 5 AM pre-brief flagged. Surface only NEW errors.
+
+4. **MCP fresh state.** Run: `claude mcp list 2>&1`. Flag any MCP newly showing `✗ Failed to connect` since this morning.
+
+5. **Recent commits + Build Queue advances.** Run: `cd /Volumes/AI_Workspace/iris_studio && git log --oneline --since=midnight`. Note any commits since midnight. Read the Build Queue file: any items advanced status since this morning?
+
+**Output expectations:**
+- Update INBOX.md ONLY if something Steve should know about — append a "🕛 Midday pulse (YYYY-MM-DD HH:MM)" subsection under the day's pre-brief sweep entry. Skip the INBOX update entirely if everything is clean (no noise on routine days).
+- Append to bridge file ONLY if you took corrective action (e.g., re-kickstarted a crashlooping daemon, re-added a failed MCP). Skip for clean pulses.
+- Keep it brief — this is a 5-min sanity check, not a deep audit.
+- Hard ban on structural changes. Read + small inline fixes (kickstart, MCP re-add) only.
+
+**Append to today's daily note (per-agent-sections convention 2026-05-27).** After your primary task, append ONE bullet to `_Iris_Memory/Daily/YYYY-MM-DD.md` (today's ISO date) under the `## 🤖 Claude Code intra-day log` section. Format: `HH:MM — [1-line action] → [outcome path or "clean" if nothing changed]`. If the daily note doesn't exist yet, create it from `01_Operating_Docs/Templates/Daily_Note_Template.md` and fill the frontmatter date/day fields. Do NOT edit Cowork's `## 📝 Cowork-Iris intra-day log` section — that's her lane.
+

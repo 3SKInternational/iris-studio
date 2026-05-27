@@ -1,0 +1,36 @@
+Twice-weekly automation scan at 03:00 AM ET, Mondays and Thursdays. Grooming pass focused on workflow → code conversions.
+
+Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
+
+Read `06_CEO/Automation_Backlog.md` — this is the canonical ranked list. Maintain it in place.
+
+Perform these four passes:
+
+1. **Backlog re-evaluation.** For each ⚪ pending item: has state changed (deps shipped, priority rationale obsolete, effort estimate updated, item now blocked or unblocked)? Update inline. For each 🟡 in-progress item: still moving or stuck? Promote/demote priority tags accordingly.
+
+2. **New candidate discovery.** Re-read:
+   - INBOX.md (any items added since last scan)
+   - STEVE_CONTEXT.md date-bumps in the last 7 days
+   - The last 7 `_Iris_Memory/Daily/YYYY-MM-DD.md` notes
+   - The 3 most recent `_Iris_Memory/Sessions/*_Nightly_Value_Pulse.md` digests (if present)
+   - The 3 most recent `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` bridge entries
+
+   Look for:
+   - Manual processes Steve mentioned doing (text patterns: "I do X every", "I forgot to", "I have to remember")
+   - Pain points (text patterns: "this is annoying", "wish I didn't have to", "manually")
+   - Iris-stack drift: duplicate scripts, routines firing but invisible to Steve, files growing unbounded, manual steps Steve takes between Iris-runs
+   - New tech additions that could be auto-monitored or auto-maintained
+
+   Add each as a new candidate row in `Automation_Backlog.md` with: manual-today, proposed automation, saves, effort, dependencies, priority tag.
+
+3. **Promote top picks to INBOX.** Pick the 1-2 highest-leverage 🔥 items where deps are met and effort is under 2 hours. Add (or update) a subsection under INBOX `## 🤖 Iris-recommended automations` with one-liner + backlog link. Don't repeat items already promoted in the past 2 weeks unless Steve still hasn't acted — then re-surface with a higher urgency note.
+
+4. **Meta-improvement on the routine itself.** Reflect: did last week's promoted candidates get Steve's action? If not, why? Was the framing wrong, the effort estimate off, the dependency unclear? Update this prompt file (the one you are reading) if a process change is warranted. This is the "improve the improvement loop" pass.
+
+**Output expectations:**
+- `06_CEO/Automation_Backlog.md` updated in place (priority shifts, new rows, deduplicated).
+- INBOX.md may get a new `## 🤖 Iris-recommended automations` subsection (or its existing one updated).
+- New session digest at `_Iris_Memory/Sessions/YYYY-MM-DD_automation-scan.md` with frontmatter (`type: session`, `agent: claude-code`, `routine: automation-scan`) + four-pass summary + which items were promoted to INBOX.
+- Append one line to today's daily note under `## 🤖 Claude Code intra-day log`. Format: `HH:MM — automation scan: N new, M promoted → Sessions/...`.
+
+**Hard ban on building.** This routine surfaces + ranks only. No code changes, no plist deploys, no daemon edits. Builds happen in the nightly engineering routine after Steve ✅s a candidate via Telegram or in-session.

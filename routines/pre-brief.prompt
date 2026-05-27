@@ -1,0 +1,32 @@
+Pre-brief sweep at 05:00 AM ET. You have ~60 min before Iris's 6 AM morning brief fires.
+
+Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply. Stay strictly within the engineering-side-car role.
+
+Perform these 7 health checks and write findings into INBOX.md as a single "🌅 Pre-brief sweep (YYYY-MM-DD)" subsection at the top of "🧍 THIS WEEK — actions only Steve can do" (replacing the previous day's subsection if present — keep only the most recent). If everything is clean, the subsection's body should be a single line: "All systems healthy — no action required."
+
+1. **Daemon health.** Run: `launchctl print gui/$(id -u)/com.iris.studio | grep -E "state|pid|runs"`. If state is not "running" or if runs counter increased by 10+ since last sweep, flag urgently.
+
+2. **MCP health.** Run: `claude mcp list 2>&1`. Surface any MCP showing `✗ Failed to connect`.
+
+3. **iris.err.log scan.** Run: `tail -500 /Users/steve/iris_studio/logs/iris.err.log | grep -iE "error|exception|traceback|fatal" | grep -v "OAuth-aware error reply"`. Summarize anything new since yesterday's sweep — group by error class, count occurrences.
+
+4. **Disk space.** Run: `df -h /` and `df -h /Volumes/AI_Workspace 2>/dev/null`. Flag if either > 85% used.
+
+5. **Log rotation verification.** Run: `ls -lh /Users/steve/iris_studio/logs/iris.err.log /Users/steve/iris_studio/logs/iris.err.log.*.gz 2>/dev/null | tail -6`. The weekly `com.iris.log-rotate` job runs Sun 03:00 ET and copytruncates `iris.err.log` (keeping 4 rotated `.gz` copies). If `iris.err.log` is > 50 MB AND no recent `.gz` exists, the rotate job may have failed — flag it and run the rotate manually via `launchctl kickstart -k gui/$(id -u)/com.iris.log-rotate`.
+
+6. **X9 mount + auto-remount.** Run: `mount | grep -E "AI_Workspace"`. If X9 is mounted, proceed. If NOT mounted, run `diskutil mount /Volumes/AI_Workspace` to auto-remount; if that fails too, flag urgently in INBOX with "X9 unmounted — daemon DB unavailable. Recovery: `diskutil mount /Volumes/AI_Workspace`" and curl a Telegram alert to Steve via `/Volumes/AI_Workspace/iris_studio/.env` token (assuming X9 came back) or skip the Telegram step if X9 is still gone.
+
+7. **Security sweep (Hard Rule #1 enforcement).** Run: `lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '$9 !~ /^(127\.0\.0\.1|::1|\*):/ && $9 !~ /^\[::1\]:/' | head -20`. Should be effectively empty (no external-facing listeners). If anything has a non-loopback bind address, flag urgently with the process name + port.
+
+8. **SSH login log.** Run: `log show --predicate 'process == "sshd" AND eventMessage CONTAINS "Accepted"' --last 24h 2>/dev/null | tail -10`. Note any SSH session from an unfamiliar source IP (Steve's tailnet IPs and his Air's local IP are expected; anything else flag).
+
+9. **INBOX completed-items archival (A-3).** Open INBOX.md. Find every `[x]` task that has been completed for 7+ days (look for date markers in the line or in the surrounding subsection). Cut them, append to `INBOX_Archive.md` under a `## YYYY-MM-DD pre-brief archival` heading. Keep the most-recent week of completions visible in INBOX so Steve can still see fresh wins. If nothing qualifies, skip silently. Note in the sweep summary: `Archived N completed items → INBOX_Archive.md`.
+
+**Output expectations:**
+- Write findings to INBOX.md. ONE subsection per sweep, dated.
+- If you find something fixable inline (e.g., MCP needs a re-add via `claude mcp add`), fix it and note "Auto-fixed: <thing>" in the findings.
+- Append a 3-line session summary to `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` ONLY if you fixed or flagged something significant. For clean sweeps, skip the bridge update — INBOX is enough.
+- Do NOT make structural iris.py changes. Do NOT touch git. Do NOT install/uninstall plugins. Do NOT modify .env files. This routine is read-only sweep + small auto-fixes only.
+
+**Append to today's daily note (per-agent-sections convention 2026-05-27).** After your primary task, append ONE bullet to `_Iris_Memory/Daily/YYYY-MM-DD.md` (today's ISO date) under the `## 🤖 Claude Code intra-day log` section. Format: `HH:MM — [1-line action] → [outcome path or "clean" if nothing changed]`. If the daily note doesn't exist yet, create it from `01_Operating_Docs/Templates/Daily_Note_Template.md` and fill the frontmatter date/day fields. Do NOT edit Cowork's `## 📝 Cowork-Iris intra-day log` section — that's her lane.
+

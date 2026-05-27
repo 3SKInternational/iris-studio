@@ -17,3 +17,11 @@ logs/
 
 # Symlink into the vault (set up per-machine; not portable)
 STEVE_CONTEXT.md
+
+# SQLite databases — live mutating state with conversation history.
+# Never commit: bloat + privacy. iris.db moved to /Volumes/AI_Workspace/iris_studio/
+# on 2026-05-27 per commit 589eb99.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

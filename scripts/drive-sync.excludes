@@ -1,0 +1,15 @@
+.git/**
+.venv/**
+__pycache__/**
+*.pyc
+*.pyo
+arrow
+*.bak*
+*.OLD-*
+.DS_Store
+.obsidian/workspace*
+.obsidian/cache/**
+.fseventsd/**
+.Spotlight-V100/**
+.Trashes/**
+node_modules/**
