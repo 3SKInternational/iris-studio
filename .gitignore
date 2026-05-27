@@ -1,0 +1,18 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Backup-chain files from the pre-git era — superseded by git history
+*.bak
+*.bak-*
+
+# Stray captured-output file from 2026-05-25 setup
+arrow
+
+# Local logs (real logs live at ~/iris_studio/logs/)
+logs/
+
+# Symlink into the vault (set up per-machine; not portable)
+STEVE_CONTEXT.md
