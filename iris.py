@@ -256,7 +256,10 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "deliverable_dir": "05_Research_and_Intelligence/Research_Reports",
     },
     "scriptwriter": {
-        "timeout_seconds": 600,  # 10 min — single-pass generation vs existing scripts
+        # 20 min — bumped 2026-05-30 from 10 min after a flagship dispatch hit
+        # the cap. The original 10-min figure was a design-doc estimate; reality
+        # for a 2,250-word structured draft + 3 reference reads runs longer.
+        "timeout_seconds": 1200,
         "deliverable_dir": "BRANDS/3SK_Finance/Scripts",
     },
     "thumbnail-coordinator": {
@@ -267,6 +270,35 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 900,  # 15 min — light web research per sponsor + drafting
         "deliverable_dir": "04_Marketing_and_Sponsors/Outreach",
     },
+    # --- Added 2026-05-30: 4 vault-native agents (the "easy adds" pass) ---
+    "scene-image-prompt-generator": {
+        "timeout_seconds": 600,  # 10 min — Haiku, mechanical 5-field transformation
+        "deliverable_dir": "BRANDS/3SK_Finance/Scene_Image_Prompts",
+    },
+    "video-description-writer": {
+        "timeout_seconds": 600,  # 10 min — Sonnet, single-pass YouTube upload pack
+        "deliverable_dir": "BRANDS/3SK_Finance/Video_Descriptions",
+    },
+    "researcher": {
+        "timeout_seconds": 1800,  # 30 min — general technical/factual web research
+        "deliverable_dir": "05_Research_and_Intelligence/Research_Reports",
+    },
+    "project-manager": {
+        "timeout_seconds": 600,  # 10 min — reads vault state + writes status report
+        "deliverable_dir": "06_CEO/Status_Reports",
+    },
+    # The 4 engineering agents (senior-systems-architect, senior-engineer,
+    # skeptical-code-reviewer, performance-optimizer) are deliberately NOT in this
+    # enum yet — their target is a codebase (typically /Volumes/AI_Workspace/iris_studio/),
+    # not the vault, and this dispatcher hardcodes cwd=WORKSPACE_DIR. Add them
+    # once a per-agent working_dir override is wired (the dispatch spawn block uses
+    # WORKSPACE_DIR in two places; parameterize via cfg.get("working_dir", ...)).
+    # They remain fully usable via interactive Claude Code's Task tool.
+    #
+    # expense-categorizer is similarly held back — it needs the post-P5-2 iris.py
+    # batch (SQLite migration for expense_categorizer_processed_msg_ids, a 09:00 ET
+    # scheduled-job entry, and the /approve <run-id> Telegram handler) before it's
+    # actually useful when dispatched.
 }
 # Agent names the MODEL is allowed to dispatch (the dispatch_subagent enum).
 DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
@@ -294,10 +326,19 @@ that takes minutes — never for quick chat answers you can give from context.
 Available subagents (agent_name -> what it does):
 - `market-researcher` — web research -> structured report (YouTube competitors,
   sponsor prospects, niche/trend analysis). ~30 min.
-- `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~10 min.
+- `researcher` — general technical/factual/comparative research (libraries, tools,
+  prior art, how-X-works). Distinct from market-researcher (which is business/
+  niche). Pair with engineering work when facts are missing. ~30 min.
+- `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~20 min.
+- `scene-image-prompt-generator` — turns a script's scene blocks into paste-ready
+  ChatGPT 5-field SCENE PROMPTs + verbatim Master Character Prompt v3. ~10 min.
+- `video-description-writer` — drafts a YouTube upload pack from a finished script
+  (description, chapter timestamps, affiliate disclosure, hashtags, pinned). ~10 min.
 - `thumbnail-coordinator` — turns a script into a thumbnail brief (image-gen
   prompt + title overlay spec). ~5 min.
 - `sponsor-outreach-drafter` — drafts a personalized cold sponsor email. ~15 min.
+- `project-manager` — honest status read on the whole operation (what shipped,
+  what's blocked, what needs Steve, where contract & reality drift). ~10 min.
 
 When you dispatch:
 1. Call `dispatch_subagent` with agent_name, a clear self-contained prompt, and
@@ -1173,8 +1214,43 @@ def _synthesize(stdout: str, deliverable: str | None) -> str:
 
 # --- The dispatch lifecycle ---
 
+def _save_partial_dispatch_output(d_id: str, agent_name: str, prompt: str,
+                                  started_epoch: float, timeout_s: int,
+                                  stdout: str, stderr: str) -> str | None:
+    """On dispatch timeout, write whatever the subagent produced before being
+    killed to a vault file, so the work isn't lost. The original behavior was to
+    discard it (Telegram message even said so). Returns the vault-relative path
+    string on success, None on error. Steve can open the file and finish the work
+    with Cowork, or paste a chunk into a retry with a tighter ask."""
+    try:
+        out_dir = WORKSPACE_DIR / "_Iris_Memory" / "Dispatch_Partials"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        date_s = datetime.now().strftime("%Y-%m-%d")
+        path = out_dir / f"{date_s}_{agent_name}_{d_id}.md"
+        elapsed = max(0, int(_now_epoch() - started_epoch))
+        elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
+        stderr_tail = (stderr or "")[-2000:]
+        started_iso = datetime.fromtimestamp(started_epoch).isoformat(timespec="seconds")
+        body = (
+            f"# Partial output — {agent_name} dispatch `{d_id}` (timed out)\n\n"
+            f"- **Dispatched:** {started_iso}\n"
+            f"- **Timed out after:** {elapsed_str} (configured limit {timeout_s}s)\n"
+            f"- **Prompt:**\n\n```\n{prompt}\n```\n\n"
+            f"## Captured stdout ({len(stdout or '')} bytes)\n\n"
+            f"```\n{stdout or '(empty)'}\n```\n\n"
+            f"## Captured stderr (last 2000 chars)\n\n"
+            f"```\n{stderr_tail or '(empty)'}\n```\n"
+        )
+        path.write_text(body, encoding="utf-8")
+        return str(path.relative_to(WORKSPACE_DIR))
+    except Exception as exc:
+        logger.warning(f"Failed to save partial dispatch output for {d_id}: {exc}")
+        return None
+
+
 async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
-                           returncode, stdout, stderr, timed_out):
+                           returncode, stdout, stderr, timed_out,
+                           partial_path=None):
     """Resolve terminal state, find the deliverable, persist, notify Steve."""
     elapsed = max(0, int(_now_epoch() - started_epoch))
     elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
@@ -1214,11 +1290,22 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
             msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
         await _send_telegram(chat_id, msg)
     elif status == "timed_out":
-        await _send_telegram(
-            chat_id,
-            f"⏱️ {agent_name} timed out after {elapsed_str}. Partial output was "
-            f"discarded. Retry, simplify the ask, or hand it to Cowork."
-        )
+        if partial_path:
+            partial_bytes = len(stdout or "")
+            await _send_telegram(
+                chat_id,
+                f"⏱️ {agent_name} timed out after {elapsed_str}. Partial output "
+                f"captured ({partial_bytes} bytes) — open it and finish with "
+                f"Cowork, or retry with a tighter ask.\n\n"
+                f"📂 Partial: {partial_path}"
+            )
+        else:
+            await _send_telegram(
+                chat_id,
+                f"⏱️ {agent_name} timed out after {elapsed_str}. No partial "
+                f"output was captured (subagent produced nothing before the "
+                f"kill). Retry, simplify the ask, or hand it to Cowork."
+            )
     else:
         tail = (stderr or stdout or "no output").strip()[-600:]
         await _send_telegram(
@@ -1281,9 +1368,14 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes):
                     out_b, err_b = b"", b""
             out = (out_b or b"").decode("utf-8", "replace").strip()
             err = (err_b or b"").decode("utf-8", "replace").strip()
+            partial_path = None
+            if timed_out:
+                partial_path = _save_partial_dispatch_output(
+                    d_id, agent_name, prompt, started_epoch, timeout, out, err,
+                )
             await _finish_dispatch(
                 d_id, agent_name, chat_id, started_epoch,
-                proc.returncode, out, err, timed_out,
+                proc.returncode, out, err, timed_out, partial_path,
             )
     except Exception as exc:
         logger.exception(f"Dispatch {d_id} crashed: {exc}")
