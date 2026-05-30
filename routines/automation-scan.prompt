@@ -7,6 +7,7 @@ Read `06_CEO/Automation_Backlog.md` — this is the canonical ranked list. Maint
 Perform these four passes:
 
 1. **Backlog re-evaluation.** For each ⚪ pending item: has state changed (deps shipped, priority rationale obsolete, effort estimate updated, item now blocked or unblocked)? Update inline. For each 🟡 in-progress item: still moving or stuck? Promote/demote priority tags accordingly.
+   - **Verify status against LIVE state, don't trust the row.** A backlog row's status can lag reality — an item marked ⚪ pending may already be shipped. Before re-ranking, spot-check ⚪ items against the actual system: `grep` iris.py for the proposed change, check whether the target file/dir/script already exists, check `git log`/`git status` in `/Volumes/AI_Workspace/iris_studio/`. (Reading/grep only — the hard build-ban still holds.) Lesson from the 2026-05-28 first run: A-8 was marked ⚪ but had shipped on 2026-05-27; only a grep of iris.py caught it.
 
 2. **New candidate discovery.** Re-read:
    - INBOX.md (any items added since last scan)

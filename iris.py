@@ -1,4 +1,31 @@
-"""Iris Studio v0.4 (2026-05-26) — Telegram bot with Tier 1 local + Tier 3 cloud + WebSearch/WebFetch for explicit research asks.
+"""Iris Studio v0.7 (2026-05-28) — adds the Phase 5 (P5-2) multi-agent dispatcher.
+
+What's new in v0.7 (P5-2 — multi-agent dispatch):
+  - In-process SDK MCP tool `dispatch_subagent` exposed to the cloud tier
+    (interactive chat turns only — NOT briefing/regen calls). Lets Iris spawn
+    specialist subagents (market-researcher, scriptwriter, thumbnail-coordinator,
+    sponsor-outreach-drafter) as background asyncio tasks and deliver their
+    output back to Steve via Telegram when they finish. Implements the locked
+    Interface Contract in 06_CEO/Designs/2026-05-26_Phase_5_Multi_Agent_Architecture.md.
+  - Hardcoded allowed-agent enum = security envelope (model cannot spawn
+    arbitrary `claude --agent <anything>`). Each subagent's own tools: frontmatter
+    (Read/Write/Grep, no Bash) is the real capability restriction.
+  - New SQLite tables: `dispatches` (state machine: pending/running/completed/
+    failed/timed_out) + `pending_notifications` (deliver-on-reconnect queue).
+  - Per-agent timeouts, 3-concurrent semaphore, boot-time orphan reconciliation,
+    deliverable-by-mtime detection with stdout fallback.
+  - Debug `/agent <name> <prompt>` + `/dispatches` Telegram commands. The `echo`
+    pseudo-agent short-circuits the subprocess for a deterministic plumbing test.
+  - Everything from v0.4-v0.6 (Tier 1/2 local, MCP stack, token reduction,
+    morning briefing, router v2) unchanged.
+
+Deploy: see 06_CEO/Designs/2026-05-28_Phase_5_P5-2_Dispatcher_Deploy.md
+        cp iris.py iris.py.bak-pre-dispatcher
+        cp iris-py-v0.7-dispatcher.py iris.py
+        launchctl kickstart -k gui/$(id -u)/com.iris.studio
+        Test: Telegram "/agent echo hello world" → expect "📦 echo done ... hello world"
+
+Original v0.4 notes:
 
 What's new in v0.4:
   - WebSearch + WebFetch enabled on Tier 3 (cloud) calls via
@@ -75,10 +102,14 @@ Lazy model load:
   one-time load cost.
 """
 import asyncio
+import contextvars
+import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -99,7 +130,12 @@ ANTHROPIC_API_KEY_FALLBACK = os.environ.pop("ANTHROPIC_API_KEY", None)
 os.environ.setdefault("HF_HOME", "/Volumes/AI_Workspace/models")
 
 # Import the Agent SDK AFTER the env strip.
-from claude_agent_sdk import query, ClaudeAgentOptions  # noqa: E402
+from claude_agent_sdk import (  # noqa: E402
+    query,
+    ClaudeAgentOptions,
+    create_sdk_mcp_server,
+    tool,
+)
 
 # MLX import is allowed to fail; in that case Tier 1 is disabled.
 MLX_AVAILABLE: bool = False
@@ -187,6 +223,95 @@ MCP_SERVERS: dict = {
     },
 }
 
+# === Phase 5 (P5-2) — Multi-agent dispatcher config ===
+# The dispatcher lets the cloud-tier Iris model spawn specialist subagents
+# (defined as ~/.claude/agents/<name>.md) as background asyncio tasks, then
+# delivers their output to Steve via Telegram when they finish. The model
+# invokes them through ONE in-process MCP tool: dispatch_subagent. DISPATCH_AGENTS
+# below is the SECURITY ENVELOPE — the model cannot spawn arbitrary
+# `claude --agent <anything>`; only these names are accepted. Each subagent's own
+# `tools:` frontmatter (Read/Write/Grep, no Bash) is the real capability limit;
+# --dangerously-skip-permissions only suppresses interactive prompts for the
+# unattended subprocess. Implements the locked Interface Contract in
+# 06_CEO/Designs/2026-05-26_Phase_5_Multi_Agent_Architecture.md.
+
+# Resolve the claude CLI binary. launchd jobs don't reliably have /opt/homebrew
+# on PATH, so prefer an explicit env override, then the known Homebrew path,
+# then a PATH lookup, then a bare "claude".
+CLAUDE_CLI_PATH = (
+    os.environ.get("CLAUDE_CLI_PATH")
+    or ("/opt/homebrew/bin/claude" if Path("/opt/homebrew/bin/claude").exists() else None)
+    or shutil.which("claude")
+    or "claude"
+)
+
+# Per-agent: timeout + the vault-relative dir the agent is expected to write its
+# deliverable into. Deliverable detection scans that dir for files modified after
+# dispatch start; if none, it falls back to the newest file modified anywhere in
+# the vault during the run, then to the subagent's stdout. Timeouts per the
+# architecture doc's "Per-agent timeouts" table.
+DISPATCH_AGENTS: dict[str, dict] = {
+    "market-researcher": {
+        "timeout_seconds": 1800,  # 30 min — multi-source web research is slow
+        "deliverable_dir": "05_Research_and_Intelligence/Research_Reports",
+    },
+    "scriptwriter": {
+        "timeout_seconds": 600,  # 10 min — single-pass generation vs existing scripts
+        "deliverable_dir": "BRANDS/3SK_Finance/Scripts",
+    },
+    "thumbnail-coordinator": {
+        "timeout_seconds": 300,  # 5 min — structured transformation, no research
+        "deliverable_dir": "BRANDS/3SK_Finance/Thumbnails",
+    },
+    "sponsor-outreach-drafter": {
+        "timeout_seconds": 900,  # 15 min — light web research per sponsor + drafting
+        "deliverable_dir": "04_Marketing_and_Sponsors/Outreach",
+    },
+}
+# Agent names the MODEL is allowed to dispatch (the dispatch_subagent enum).
+DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
+# Max simultaneous subagent subprocesses (asyncio semaphore). A request beyond
+# this still gets a dispatch_id but waits for a free slot (reported as queued).
+DISPATCH_MAX_CONCURRENT = 3
+# Debug-only pseudo-agent: short-circuits the subprocess and returns the prompt
+# verbatim so the dispatch -> notify round trip can be smoke-tested
+# deterministically (P5-2 acceptance: `/agent echo hello world` -> "hello world").
+# Only reachable via the /agent debug command, never via the model.
+DISPATCH_ECHO_AGENT = "echo"
+
+# Appended to the cloud system prompt ONLY on interactive chat turns (chat_id set),
+# never on briefing/regen calls. Teaches the model when/how to dispatch.
+DISPATCHER_MODE_SUFFIX = """
+
+---
+
+# === DISPATCHER MODE (Phase 5) ===
+
+You can delegate substantive, slow work to specialist subagents via the
+`dispatch_subagent` tool. Use it ONLY when Steve asks for real deliverable work
+that takes minutes — never for quick chat answers you can give from context.
+
+Available subagents (agent_name -> what it does):
+- `market-researcher` — web research -> structured report (YouTube competitors,
+  sponsor prospects, niche/trend analysis). ~30 min.
+- `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~10 min.
+- `thumbnail-coordinator` — turns a script into a thumbnail brief (image-gen
+  prompt + title overlay spec). ~5 min.
+- `sponsor-outreach-drafter` — drafts a personalized cold sponsor email. ~15 min.
+
+When you dispatch:
+1. Call `dispatch_subagent` with agent_name, a clear self-contained prompt, and
+   your best expected_turnaround_minutes.
+2. The tool returns immediately with a dispatch_id. The subagent runs in the
+   background; its deliverable is sent to Steve via Telegram when it finishes.
+3. In your reply, confirm what you dispatched and that you'll ping him when it
+   lands (e.g. "Dispatched to market-researcher — ~20 min, I'll send the report
+   here when it's ready."). Do NOT pretend you already have the result.
+
+Do NOT dispatch for things you can answer directly. Do NOT dispatch the same work
+twice. If unsure which agent fits, ask Steve a one-line clarifying question.
+"""
+
 # === Local (Tier 1) config ===
 LOCAL_MODEL_PATH = "mlx-community/Llama-3.1-8B-Instruct-4bit"
 LOCAL_MAX_TOKENS = 400
@@ -238,6 +363,17 @@ _local_tier2_load_lock: asyncio.Lock | None = None
 
 _db_initialized = False
 _db_init_lock: asyncio.Lock | None = None
+
+# Phase 5 dispatcher runtime state.
+_telegram_bot = None  # set in _post_init; used to deliver subagent results
+_dispatch_semaphore: asyncio.Semaphore | None = None  # created on the loop at boot
+_DISPATCHER_MCP = None  # in-process MCP server config, built after the tool is defined
+# Carries the current chat_id into the in-process dispatch tool handler. Set in
+# query_cloud on interactive turns; read by the tool so the deliverable goes to
+# the right Telegram chat. Background dispatch tasks capture it at create_task().
+_current_dispatch_chat_id: contextvars.ContextVar = contextvars.ContextVar(
+    "current_dispatch_chat_id", default=None
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -695,6 +831,43 @@ def _init_db_sync() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_daily_stats_date_tier ON daily_stats(date, tier)"
         )
+        # === Phase 5 (P5-2) — dispatcher state machine ===
+        # One row per dispatch. status in {pending, running, completed, failed,
+        # timed_out}. started_epoch is a float wall-clock used for deliverable
+        # detection (files modified at/after start).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispatches (
+                id TEXT PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL,
+                chat_id TEXT,
+                pid INTEGER,
+                deliverable_path TEXT,
+                error TEXT,
+                expected_turnaround_minutes INTEGER,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_epoch REAL,
+                completed_at TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dispatches_status ON dispatches(status)"
+        )
+        # Notifications that couldn't be delivered (bot not ready / Telegram down).
+        # Flushed on next daemon boot (and after a successful reconnect).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
 async def _ensure_db() -> None:
@@ -834,6 +1007,394 @@ async def is_tier4_capped() -> bool:
     """
     stats = await get_today_stats()
     return stats["tier4_spend_usd"] >= DAILY_TIER4_CAP_USD
+
+
+# ============================================================
+# Phase 5 (P5-2) — Multi-agent dispatcher
+# Implements the locked Interface Contract:
+#   06_CEO/Designs/2026-05-26_Phase_5_Multi_Agent_Architecture.md
+# ============================================================
+
+def _now_epoch() -> float:
+    return datetime.now().timestamp()
+
+
+def _vault_rel(path_str: str | None) -> str:
+    if not path_str:
+        return "—"
+    try:
+        return str(Path(path_str).relative_to(WORKSPACE_DIR))
+    except ValueError:
+        return path_str
+
+
+# --- SQLite helpers (sync; run via executor like the rest of the daemon) ---
+
+def _insert_dispatch_sync(d_id, agent_name, prompt, chat_id, expected, started_epoch):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO dispatches (id, agent_name, prompt, status, chat_id, "
+            "expected_turnaround_minutes, started_epoch) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            (d_id, agent_name, prompt, chat_id, expected, started_epoch),
+        )
+
+
+def _update_dispatch_sync(d_id, fields: dict):
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [d_id]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(f"UPDATE dispatches SET {cols} WHERE id = ?", vals)
+
+
+def _list_dispatches_by_status_sync(status):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute("SELECT * FROM dispatches WHERE status = ?", (status,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _count_active_dispatches_sync():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM dispatches WHERE status IN ('pending', 'running')"
+        )
+        return cur.fetchone()[0]
+
+
+def _list_recent_dispatches_sync(limit):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT * FROM dispatches ORDER BY started_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _queue_notification_sync(chat_id, text):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO pending_notifications (chat_id, text) VALUES (?, ?)",
+            (chat_id, text),
+        )
+
+
+def _pop_pending_notifications_sync():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM pending_notifications ORDER BY id"
+        ).fetchall()]
+        if rows:
+            conn.execute("DELETE FROM pending_notifications")
+    return rows
+
+
+async def _db_call(fn, *args):
+    """Run a sync DB helper in the executor (mirrors get_history's pattern)."""
+    await _ensure_db()
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: fn(*args))
+
+
+async def _update_dispatch(d_id, **fields):
+    await _db_call(_update_dispatch_sync, d_id, fields)
+
+
+# --- Telegram delivery (with deliver-on-reconnect fallback) ---
+
+async def _send_telegram(chat_id, text) -> bool:
+    """Send a Telegram message via the daemon bot, chunked. If the bot isn't
+    ready or the send fails, queue the message to pending_notifications so it
+    goes out on the next daemon boot."""
+    if not chat_id:
+        return False
+    if _telegram_bot is None:
+        await _db_call(_queue_notification_sync, str(chat_id), text)
+        logger.warning("Dispatcher: bot not ready; notification queued to SQLite.")
+        return False
+    try:
+        for i in range(0, len(text), TELEGRAM_MAX_MSG):
+            await _telegram_bot.send_message(
+                chat_id=int(chat_id), text=text[i:i + TELEGRAM_MAX_MSG]
+            )
+        return True
+    except Exception as exc:
+        logger.warning(f"Dispatcher: Telegram send failed ({exc}); queuing notification.")
+        await _db_call(_queue_notification_sync, str(chat_id), text)
+        return False
+
+
+# --- Deliverable detection + synthesis ---
+
+def _find_deliverable(agent_name: str, started_epoch: float) -> str | None:
+    """Best-effort: the file the subagent most likely produced. Prefer the
+    newest file modified at/after dispatch start under the agent's configured
+    deliverable_dir; else the newest such file anywhere in the vault; else None
+    (caller falls back to stdout). Skips dotfiles/dot-dirs."""
+    cfg = DISPATCH_AGENTS.get(agent_name, {})
+    search_dirs = []
+    if cfg.get("deliverable_dir"):
+        search_dirs.append(WORKSPACE_DIR / cfg["deliverable_dir"])
+    search_dirs.append(WORKSPACE_DIR)
+    for base in search_dirs:
+        if not base.exists():
+            continue
+        newest, newest_mtime = None, started_epoch - 1
+        for p in base.rglob("*"):
+            if not p.is_file() or any(part.startswith(".") for part in p.parts):
+                continue
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m >= started_epoch and m > newest_mtime:
+                newest, newest_mtime = p, m
+        if newest is not None:
+            return str(newest)
+    return None
+
+
+def _synthesize(stdout: str, deliverable: str | None) -> str:
+    """Short synthesis for the Telegram notification: prefer the subagent's own
+    stdout; if it's thin and a deliverable exists, peek at the file head."""
+    text = (stdout or "").strip()
+    if len(text) < 40 and deliverable:
+        try:
+            text = Path(deliverable).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pass
+    if len(text) > 1500:
+        text = text[:1500].rstrip() + "…"
+    return text or "(subagent produced no stdout)"
+
+
+# --- The dispatch lifecycle ---
+
+async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
+                           returncode, stdout, stderr, timed_out):
+    """Resolve terminal state, find the deliverable, persist, notify Steve."""
+    elapsed = max(0, int(_now_epoch() - started_epoch))
+    elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
+
+    if timed_out:
+        status = "timed_out"
+    elif returncode == 0:
+        status = "completed"
+    else:
+        status = "failed"
+
+    deliverable = None
+    if status == "completed" and agent_name != DISPATCH_ECHO_AGENT:
+        loop = asyncio.get_event_loop()
+        deliverable = await loop.run_in_executor(
+            None, lambda: _find_deliverable(agent_name, started_epoch)
+        )
+
+    await _update_dispatch(
+        d_id,
+        status=status,
+        deliverable_path=deliverable,
+        error=(stderr[:2000] if status != "completed" else None),
+        completed_at=datetime.now().isoformat(),
+    )
+    logger.info(
+        f"Dispatch {d_id}: {status} after {elapsed_str} "
+        f"(rc={returncode}, deliverable={deliverable})"
+    )
+
+    if not chat_id:
+        return
+
+    if status == "completed":
+        msg = f"📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
+        if deliverable:
+            msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
+        await _send_telegram(chat_id, msg)
+    elif status == "timed_out":
+        await _send_telegram(
+            chat_id,
+            f"⏱️ {agent_name} timed out after {elapsed_str}. Partial output was "
+            f"discarded. Retry, simplify the ask, or hand it to Cowork."
+        )
+    else:
+        tail = (stderr or stdout or "no output").strip()[-600:]
+        await _send_telegram(
+            chat_id,
+            f"⚠️ {agent_name} failed after {elapsed_str} (exit {returncode}).\n\n"
+            f"{tail}\n\nRetry, dispatch a different subagent, or hand to Cowork."
+        )
+
+
+async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes):
+    """Background task: acquire a slot, spawn the subagent, wait with timeout,
+    detect the deliverable, notify Steve. Never raises (logs + notifies)."""
+    global _dispatch_semaphore
+    if _dispatch_semaphore is None:
+        _dispatch_semaphore = asyncio.Semaphore(DISPATCH_MAX_CONCURRENT)
+    try:
+        async with _dispatch_semaphore:
+            started_epoch = _now_epoch()
+            await _update_dispatch(d_id, status="running", started_epoch=started_epoch)
+
+            # Debug echo: deterministic plumbing check, no subprocess / no quota.
+            if agent_name == DISPATCH_ECHO_AGENT:
+                logger.info(f"Dispatch {d_id}: echo short-circuit")
+                await _finish_dispatch(
+                    d_id, agent_name, chat_id, started_epoch, 0, prompt, "", False
+                )
+                return
+
+            timeout = DISPATCH_AGENTS[agent_name]["timeout_seconds"]
+            logger.info(
+                f"Dispatch {d_id}: spawning {agent_name} via {CLAUDE_CLI_PATH} "
+                f"(timeout {timeout}s)"
+            )
+            proc = await asyncio.create_subprocess_exec(
+                CLAUDE_CLI_PATH,
+                "--print",
+                "--agent", agent_name,
+                "--add-dir", str(WORKSPACE_DIR),
+                "--dangerously-skip-permissions",
+                "--", prompt,
+                cwd=str(WORKSPACE_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await _update_dispatch(d_id, pid=proc.pid)
+            timed_out = False
+            try:
+                out_b, err_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    out_b, err_b = await proc.communicate()
+                except Exception:
+                    out_b, err_b = b"", b""
+            out = (out_b or b"").decode("utf-8", "replace").strip()
+            err = (err_b or b"").decode("utf-8", "replace").strip()
+            await _finish_dispatch(
+                d_id, agent_name, chat_id, started_epoch,
+                proc.returncode, out, err, timed_out,
+            )
+    except Exception as exc:
+        logger.exception(f"Dispatch {d_id} crashed: {exc}")
+        await _update_dispatch(
+            d_id, status="failed", error=f"dispatcher-exception: {exc}",
+            completed_at=datetime.now().isoformat(),
+        )
+        await _send_telegram(chat_id, f"⚠️ Dispatch to {agent_name} crashed: {exc}")
+
+
+async def _start_dispatch(agent_name, prompt, chat_id, expected) -> dict:
+    """Insert the row, spawn the background task, return a status payload.
+    Shared by the model-facing MCP tool and the /agent debug command."""
+    d_id = uuid.uuid4().hex[:12]
+    chat_id_str = str(chat_id) if chat_id else None
+    await _db_call(
+        _insert_dispatch_sync, d_id, agent_name, prompt, chat_id_str,
+        expected, _now_epoch(),
+    )
+    active = await _db_call(_count_active_dispatches_sync)
+    queued = active > DISPATCH_MAX_CONCURRENT
+    # Fire-and-forget: the loop stays unblocked; the task captures the current
+    # context (incl. chat_id) at creation.
+    asyncio.create_task(
+        _run_dispatch(d_id, agent_name, prompt, chat_id_str, expected)
+    )
+    return {"dispatch_id": d_id, "queued": queued, "expected_turnaround_minutes": expected}
+
+
+async def _reconcile_orphaned_dispatches():
+    """On boot, any dispatch left pending/running was orphaned when the prior
+    daemon stopped (its subprocess was a child of that process and is gone).
+    Mark them failed + notify, then flush queued notifications."""
+    try:
+        for status in ("running", "pending"):
+            for row in await _db_call(_list_dispatches_by_status_sync, status):
+                await _update_dispatch(
+                    row["id"], status="failed", error="daemon-restart-orphaned",
+                    completed_at=datetime.now().isoformat(),
+                )
+                if row.get("chat_id"):
+                    await _send_telegram(
+                        row["chat_id"],
+                        f"⚠️ Dispatch to {row['agent_name']} was interrupted by a "
+                        f"daemon restart and did not finish. Re-send if still needed."
+                    )
+        for row in await _db_call(_pop_pending_notifications_sync):
+            await _send_telegram(row["chat_id"], row["text"])
+    except Exception as exc:
+        logger.warning(f"Dispatch reconciliation failed: {exc}")
+
+
+# --- In-process MCP tool exposed to the cloud-tier model ---
+
+@tool(
+    "dispatch_subagent",
+    "Spawn a specialist subagent to do scoped work (research, scriptwriting, "
+    "thumbnail brief, sponsor outreach). Returns a dispatch_id immediately; the "
+    "deliverable is sent to Steve via Telegram when the subagent finishes. Use "
+    "for substantive work that takes minutes, not for quick answers.",
+    {
+        "agent_name": str,
+        "prompt": str,
+        "expected_turnaround_minutes": int,
+    },
+)
+async def _dispatch_subagent_tool(args):
+    agent_name = (args.get("agent_name") or "").strip()
+    prompt = (args.get("prompt") or "").strip()
+    expected = args.get("expected_turnaround_minutes")
+
+    if agent_name not in DISPATCH_ALLOWED_AGENTS:
+        return {
+            "content": [{"type": "text", "text": (
+                f"Error: '{agent_name}' is not an allowed subagent. "
+                f"Choose one of: {', '.join(DISPATCH_ALLOWED_AGENTS)}."
+            )}],
+            "is_error": True,
+        }
+    if not prompt:
+        return {
+            "content": [{"type": "text", "text":
+                "Error: prompt is required and must be non-empty."}],
+            "is_error": True,
+        }
+
+    default_to = DISPATCH_AGENTS[agent_name]["timeout_seconds"] // 60
+    if not isinstance(expected, int) or expected <= 0:
+        expected = default_to
+
+    chat_id = _current_dispatch_chat_id.get()
+    result = await _start_dispatch(agent_name, prompt, chat_id, expected)
+    payload = {
+        "dispatch_id": result["dispatch_id"],
+        "agent_name": agent_name,
+        "status": "queued" if result["queued"] else "dispatched",
+        "expected_turnaround_minutes": expected,
+        "note": (
+            "All dispatch slots busy; this starts when one frees up."
+            if result["queued"]
+            else "Running in the background. Tell Steve you'll ping him when it's done."
+        ),
+    }
+    return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+
+_DISPATCHER_MCP = create_sdk_mcp_server(
+    name="dispatcher",
+    version="0.7.0",
+    tools=[_dispatch_subagent_tool],
+)
 
 
 # ============================================================
@@ -995,7 +1556,14 @@ async def send_morning_briefing(bot, chat_id: int) -> None:
 
 async def _post_init(application) -> None:
     """Start the apscheduler once the bot is ready (called by Application post_init hook)."""
-    global _scheduler
+    global _scheduler, _telegram_bot, _dispatch_semaphore
+    # Phase 5: expose the bot to the dispatcher so background subagent tasks can
+    # deliver results, create the concurrency semaphore on this loop, and
+    # reconcile any dispatches orphaned by the previous daemon stop.
+    _telegram_bot = application.bot
+    if _dispatch_semaphore is None:
+        _dispatch_semaphore = asyncio.Semaphore(DISPATCH_MAX_CONCURRENT)
+    await _reconcile_orphaned_dispatches()
     if not ALLOWED_USER_IDS:
         logger.warning(
             "Scheduler not starting — no authorized users. Morning briefing disabled."
@@ -1351,13 +1919,19 @@ async def query_local_tier2(prompt: str, history: list[dict]) -> str:
 # Tier 3 — Claude Agent SDK via Max sub OAuth
 # ============================================================
 
-async def query_cloud(prompt: str, history: list[dict], timeout: float | None = None) -> str:
+async def query_cloud(prompt: str, history: list[dict], timeout: float | None = None,
+                      chat_id: str | None = None) -> str:
     """Call Agent SDK with OAuth auth and history-augmented system prompt.
 
     timeout: per-call override in seconds. Defaults to QUERY_TIMEOUT_SECONDS
     (60s) for typical chat. Long-output operations (DAILY_BRIEFING regen,
     ebook generation, etc.) should pass a longer timeout to avoid spurious
     timeout failures on multi-thousand-character generations.
+
+    chat_id: when set (interactive Telegram turns), the Phase 5 dispatcher MCP
+    is exposed so Iris can delegate to specialist subagents whose deliverables
+    are returned to this chat. Briefing/regen calls pass chat_id=None and must
+    NOT be able to dispatch.
     """
     effective_timeout = timeout if timeout is not None else QUERY_TIMEOUT_SECONDS
     system_prompt = load_system_prompt_cloud(history)
@@ -1365,16 +1939,19 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
     # The behavior prefix tells Iris to use these tools SPARINGLY — only when
     # Steve explicitly asks for research/lookup. Routine chat answers from
     # the loaded prompt context, no tool call.
+    mcp_servers = MCP_SERVERS
+    allowed_tools = ["WebSearch", "WebFetch", "mcp__obsidian", "mcp__google-workspace"]
+    # Phase 5 (P5-2): expose dispatch_subagent ONLY on interactive chat turns.
+    if chat_id is not None and _DISPATCHER_MCP is not None:
+        mcp_servers = {**MCP_SERVERS, "dispatcher": _DISPATCHER_MCP}
+        allowed_tools = allowed_tools + ["mcp__dispatcher"]
+        system_prompt = system_prompt + DISPATCHER_MODE_SUFFIX
+        _current_dispatch_chat_id.set(str(chat_id))
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=ANTHROPIC_MODEL,
-        mcp_servers=MCP_SERVERS,
-        allowed_tools=[
-            "WebSearch",
-            "WebFetch",
-            "mcp__obsidian",
-            "mcp__google-workspace",
-        ],
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
     )
 
     parts: list[str] = []
@@ -1504,7 +2081,7 @@ async def ask_iris(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
             if history and history[-1]["role"] == "user":
                 history = history[:-1]
 
-    text = await query_cloud(stripped, history)
+    text = await query_cloud(stripped, history, chat_id=chat_id)
     actual_tier = decided_tier if decided_tier == "cloud_fallback" else "cloud"
     await save_message(chat_id, user_id, "assistant", text, tier=actual_tier)
     await record_message_stat(actual_tier, cost_usd=0.0)
@@ -1587,6 +2164,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as exc:
             logger.exception("Manual DAILY_BRIEFING regen failed")
             await update.message.reply_text(f"Refresh failed: {exc}")
+        return
+
+    # Phase 5 (P5-2) — dispatcher debug commands. Bypass the model: spawn a
+    # subagent directly (or echo for a plumbing test) and list recent dispatches.
+    if stripped_text.lower().startswith(("/agent ", "!agent ")):
+        rest = stripped_text[len("/agent "):].strip()
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "Usage: /agent <agent_name> <prompt>\n"
+                f"Debug: echo. Real: {', '.join(DISPATCH_ALLOWED_AGENTS)}."
+            )
+            return
+        agent_name, agent_prompt = parts[0], parts[1]
+        if agent_name != DISPATCH_ECHO_AGENT and agent_name not in DISPATCH_ALLOWED_AGENTS:
+            await update.message.reply_text(
+                f"Unknown agent '{agent_name}'. Allowed: {DISPATCH_ECHO_AGENT}, "
+                f"{', '.join(DISPATCH_ALLOWED_AGENTS)}."
+            )
+            return
+        expected = (DISPATCH_AGENTS[agent_name]["timeout_seconds"] // 60
+                    if agent_name in DISPATCH_AGENTS else 1)
+        result = await _start_dispatch(agent_name, agent_prompt, chat_id, expected)
+        logger.info(f"From @{username} (/agent {agent_name}): dispatch {result['dispatch_id']}")
+        await update.message.reply_text(
+            f"Dispatched {agent_name} (id {result['dispatch_id']}). "
+            f"I'll send the result here when it's done."
+        )
+        return
+
+    if stripped_text.lower() in ("/dispatches", "!dispatches"):
+        rows = await _db_call(_list_recent_dispatches_sync, 10)
+        if not rows:
+            await update.message.reply_text("No dispatches yet.")
+            return
+        lines = ["Recent dispatches (newest first):"]
+        for r in rows:
+            lines.append(
+                f"• [{r['status']}] {r['agent_name']} ({r['id']}) → "
+                f"{_vault_rel(r.get('deliverable_path'))}"
+            )
+        await update.message.reply_text("\n".join(lines))
         return
 
     # Quick Capture bridge: if message starts with RECEIPT/DECISION/etc.,
@@ -1701,6 +2320,12 @@ def main() -> None:
         "Send '/briefing' for on-demand brief; '/refresh' to manually regenerate the file."
     )
     logger.info(f"Runtime date today: {_runtime_date_block()}")
+    logger.info(
+        f"Phase 5 dispatcher: ENABLED on interactive cloud turns. "
+        f"Allowed agents: {DISPATCH_ALLOWED_AGENTS}. Max concurrent: {DISPATCH_MAX_CONCURRENT}. "
+        f"claude CLI: {CLAUDE_CLI_PATH}. Debug via '/agent <name> <prompt>'; "
+        f"list via '/dispatches'."
+    )
     logger.info(
         f"Router v2 (hybrid): fast deterministic rules first; Haiku classifier "
         f"({ROUTER_CLASSIFIER_MODEL}, {ROUTER_CLASSIFIER_TIMEOUT_SECONDS}s timeout) "
