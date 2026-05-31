@@ -306,6 +306,62 @@ DISPATCH_AGENTS: dict[str, dict] = {
 }
 # Agent names the MODEL is allowed to dispatch (the dispatch_subagent enum).
 DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
+
+# Autonomous dispatch cadences — scheduled via APScheduler in _post_init. Each
+# entry fires through the same _start_dispatch path Steve's /agent and the cloud
+# model's dispatch_subagent MCP tool use, so per-agent timeouts + semaphore +
+# capture-on-timeout + Telegram notification all apply uniformly. The
+# `autonomous_label` propagates into the Telegram message as a `🤖 Autonomous:`
+# prefix so Steve can tell scheduled runs from his own / the model's dispatches.
+#
+# Adding a cadence: append an entry, daemon kickstart, done — no DB schema or
+# new infrastructure. If you need a goal-state idempotency check (skip-on-empty),
+# wire it into the entry's prompt with explicit short-circuit instructions
+# ("if no new X since last run, return 'no work, skipping' and exit").
+AUTONOMOUS_DISPATCHES: list[dict] = [
+    {
+        "name": "project-manager-daily",
+        "agent_name": "project-manager",
+        # daily 05:30 ET — lands a fresh status report 30 min before the 06:00 morning brief.
+        "trigger_kwargs": {"hour": 5, "minute": 30},
+        "prompt": (
+            "Daily autonomous status sweep. Read the canonical operation state — "
+            "the Build Queue, bridge file (latest 3 sessions), INBOX, today's daily "
+            "note, plus live `launchctl list | grep -E iris\\|claude` and "
+            "`git -C /Volumes/AI_Workspace/iris_studio log --since='24 hours ago'` — "
+            "and write a status report to "
+            "06_CEO/Status_Reports/[YYYY-MM-DD]_status.md. Cover: what shipped "
+            "since the last status report (verify against disk + git, do NOT trust "
+            "the queue markers blindly), what's in flight (owner + last movement), "
+            "what's blocked (categorize: Steve / dependency / stalled-no-excuse), "
+            "where contract and reality have drifted, and the ranked 3-5 actions "
+            "only Steve can do. Be honest — distinguish confirmed from unverified. "
+            "Return the headline 🧍 needs-Steve list on stdout (4-6 ranked lines)."
+        ),
+    },
+    {
+        "name": "market-researcher-monthly",
+        "agent_name": "market-researcher",
+        # monthly 1st @ 03:00 ET — between Claude Code's 02:00 nightly and Cowork's 03:05 pulse.
+        "trigger_kwargs": {"day": 1, "hour": 3, "minute": 0},
+        "prompt": (
+            "Monthly autonomous research sweep. Read "
+            "05_Research_and_Intelligence/Competitor_Analysis/_rotation.md — pick "
+            "the next ⚪ item from the Queue section. If the queue is empty (all "
+            "✅), return 'rotation exhausted, please refill' on stdout and exit "
+            "without burning a dispatch. Otherwise execute that one item, write "
+            "the deliverable to the appropriate vault path (teardowns → "
+            "05_Research_and_Intelligence/Competitor_Analysis/<name>_Teardown.md; "
+            "sponsor/newsletter cohorts → "
+            "04_Marketing_and_Sponsors/Sponsor_Prospects/[YYYY-MM-DD]_<topic>.md; "
+            "trend scans → "
+            "05_Research_and_Intelligence/Trend_Scans/[YYYY-MM-DD]_<topic>.md). "
+            "Then edit _rotation.md: move the executed item from Queue → Done with "
+            "today's date + a one-line result pointer. Return a 3-line summary on "
+            "stdout: what was scanned, top finding, next rotation item."
+        ),
+    },
+]
 # Max simultaneous subagent subprocesses (asyncio semaphore). A request beyond
 # this still gets a dispatch_id but waits for a free slot (reported as queued).
 DISPATCH_MAX_CONCURRENT = 3
@@ -1639,8 +1695,11 @@ def _save_partial_dispatch_output(d_id: str, agent_name: str, prompt: str,
 
 async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
                            returncode, stdout, stderr, timed_out,
-                           partial_path=None):
-    """Resolve terminal state, find the deliverable, persist, notify Steve."""
+                           partial_path=None, autonomous_label=None):
+    """Resolve terminal state, find the deliverable, persist, notify Steve.
+    autonomous_label, if set, prefixes the Telegram notification with
+    `🤖 Autonomous (<label>):` so scheduled fires are distinguishable from
+    user-initiated / model-initiated dispatches."""
     elapsed = max(0, int(_now_epoch() - started_epoch))
     elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
 
@@ -1682,8 +1741,12 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
     if not chat_id:
         return
 
+    # Prefix scheduled-fire notifications so Steve can tell them from his own /
+    # the model's dispatches at a glance. Empty string for normal dispatches.
+    prefix = f"🤖 Autonomous ({autonomous_label}) — " if autonomous_label else ""
+
     if status == "completed":
-        msg = f"📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
+        msg = f"{prefix}📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
         if deliverable:
             msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
         await _send_telegram(chat_id, msg)
@@ -1692,30 +1755,34 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
             partial_bytes = len(stdout or "")
             await _send_telegram(
                 chat_id,
-                f"⏱️ {agent_name} timed out after {elapsed_str}. Partial output "
-                f"captured ({partial_bytes} bytes) — open it and finish with "
-                f"Cowork, or retry with a tighter ask.\n\n"
+                f"{prefix}⏱️ {agent_name} timed out after {elapsed_str}. Partial "
+                f"output captured ({partial_bytes} bytes) — open it and finish "
+                f"with Cowork, or retry with a tighter ask.\n\n"
                 f"📂 Partial: {partial_path}"
             )
         else:
             await _send_telegram(
                 chat_id,
-                f"⏱️ {agent_name} timed out after {elapsed_str}. No partial "
-                f"output was captured (subagent produced nothing before the "
-                f"kill). Retry, simplify the ask, or hand it to Cowork."
+                f"{prefix}⏱️ {agent_name} timed out after {elapsed_str}. No "
+                f"partial output was captured (subagent produced nothing before "
+                f"the kill). Retry, simplify the ask, or hand it to Cowork."
             )
     else:
         tail = (stderr or stdout or "no output").strip()[-600:]
         await _send_telegram(
             chat_id,
-            f"⚠️ {agent_name} failed after {elapsed_str} (exit {returncode}).\n\n"
-            f"{tail}\n\nRetry, dispatch a different subagent, or hand to Cowork."
+            f"{prefix}⚠️ {agent_name} failed after {elapsed_str} (exit "
+            f"{returncode}).\n\n{tail}\n\nRetry, dispatch a different subagent, "
+            f"or hand to Cowork."
         )
 
 
-async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes):
+async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes,
+                        autonomous_label=None):
     """Background task: acquire a slot, spawn the subagent, wait with timeout,
-    detect the deliverable, notify Steve. Never raises (logs + notifies)."""
+    detect the deliverable, notify Steve. Never raises (logs + notifies).
+    autonomous_label, if set, is propagated to _finish_dispatch so the Telegram
+    notification gets a `🤖 Autonomous (<label>):` prefix."""
     global _dispatch_semaphore
     if _dispatch_semaphore is None:
         _dispatch_semaphore = asyncio.Semaphore(DISPATCH_MAX_CONCURRENT)
@@ -1728,7 +1795,8 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes):
             if agent_name == DISPATCH_ECHO_AGENT:
                 logger.info(f"Dispatch {d_id}: echo short-circuit")
                 await _finish_dispatch(
-                    d_id, agent_name, chat_id, started_epoch, 0, prompt, "", False
+                    d_id, agent_name, chat_id, started_epoch, 0, prompt, "", False,
+                    None, autonomous_label,
                 )
                 return
 
@@ -1774,6 +1842,7 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes):
             await _finish_dispatch(
                 d_id, agent_name, chat_id, started_epoch,
                 proc.returncode, out, err, timed_out, partial_path,
+                autonomous_label,
             )
     except Exception as exc:
         logger.exception(f"Dispatch {d_id} crashed: {exc}")
@@ -1784,9 +1853,13 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes):
         await _send_telegram(chat_id, f"⚠️ Dispatch to {agent_name} crashed: {exc}")
 
 
-async def _start_dispatch(agent_name, prompt, chat_id, expected) -> dict:
+async def _start_dispatch(agent_name, prompt, chat_id, expected, *,
+                          autonomous_label=None) -> dict:
     """Insert the row, spawn the background task, return a status payload.
-    Shared by the model-facing MCP tool and the /agent debug command."""
+    Shared by the model-facing MCP tool, the /agent debug command, and the
+    APScheduler-driven autonomous dispatches. autonomous_label is set only by
+    scheduled fires; it propagates to the Telegram notification as a
+    `🤖 Autonomous (<label>):` prefix so Steve can tell scheduled runs apart."""
     d_id = uuid.uuid4().hex[:12]
     chat_id_str = str(chat_id) if chat_id else None
     await _db_call(
@@ -1798,9 +1871,39 @@ async def _start_dispatch(agent_name, prompt, chat_id, expected) -> dict:
     # Fire-and-forget: the loop stays unblocked; the task captures the current
     # context (incl. chat_id) at creation.
     asyncio.create_task(
-        _run_dispatch(d_id, agent_name, prompt, chat_id_str, expected)
+        _run_dispatch(d_id, agent_name, prompt, chat_id_str, expected, autonomous_label)
     )
     return {"dispatch_id": d_id, "queued": queued, "expected_turnaround_minutes": expected}
+
+
+async def _fire_autonomous_dispatch(entry: dict, chat_id: int) -> None:
+    """APScheduler callable. Fires one entry from AUTONOMOUS_DISPATCHES through
+    the same _start_dispatch pipeline used by /agent and dispatch_subagent. The
+    autonomous_label propagates → Telegram message gets a `🤖 Autonomous:` prefix
+    so the user knows it wasn't requested. Never raises (logs + skips)."""
+    try:
+        cfg = DISPATCH_AGENTS.get(entry["agent_name"])
+        if cfg is None:
+            logger.warning(
+                f"Autonomous dispatch '{entry['name']}' skipped: agent "
+                f"'{entry['agent_name']}' is not in DISPATCH_AGENTS."
+            )
+            return
+        expected_min = cfg["timeout_seconds"] // 60
+        result = await _start_dispatch(
+            entry["agent_name"],
+            entry["prompt"],
+            chat_id,
+            expected_min,
+            autonomous_label=entry["name"],
+        )
+        logger.info(
+            f"Autonomous dispatch '{entry['name']}' fired: dispatch_id="
+            f"{result['dispatch_id']}, queued={result['queued']}, "
+            f"expected={expected_min}m."
+        )
+    except Exception as exc:
+        logger.exception(f"Autonomous dispatch '{entry['name']}' crashed: {exc}")
 
 
 async def _reconcile_orphaned_dispatches():
@@ -2089,6 +2192,16 @@ async def _post_init(application) -> None:
         id="expense_categorizer_sweep",
         replace_existing=True,
     )
+    # Phase 5 autonomous-dispatch cadences (project-manager daily, market-researcher
+    # monthly, ...). Each AUTONOMOUS_DISPATCHES entry becomes one APScheduler job.
+    for entry in AUTONOMOUS_DISPATCHES:
+        _scheduler.add_job(
+            _fire_autonomous_dispatch,
+            CronTrigger(timezone=TIMEZONE, **entry["trigger_kwargs"]),
+            kwargs={"entry": entry, "chat_id": target_chat_id},
+            id=f"autonomous_{entry['name']}",
+            replace_existing=True,
+        )
     _scheduler.start()
     job = _scheduler.get_job("morning_briefing")
     next_run = job.next_run_time if job else None
@@ -2107,6 +2220,16 @@ async def _post_init(application) -> None:
         f"Lookback: {EXPENSE_CATEGORIZER_LOOKBACK_DAYS} days. "
         "Reply `/approve <run-id>` after each draft lands."
     )
+    # Log each autonomous-dispatch entry with its next-fire time so boot logs
+    # immediately show what cadences are armed.
+    for entry in AUTONOMOUS_DISPATCHES:
+        a_job = _scheduler.get_job(f"autonomous_{entry['name']}")
+        a_next = a_job.next_run_time if a_job else None
+        logger.info(
+            f"Autonomous dispatch '{entry['name']}' ({entry['agent_name']}): "
+            f"trigger={entry['trigger_kwargs']}, next fire: "
+            f"{a_next.isoformat() if a_next else 'unknown'}."
+        )
 
 
 # ============================================================
