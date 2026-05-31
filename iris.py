@@ -287,6 +287,17 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 600,  # 10 min — reads vault state + writes status report
         "deliverable_dir": "06_CEO/Status_Reports",
     },
+    # --- Added 2026-05-31 (Session 17): YouTube channel intelligence ---
+    # youtube-researcher: continuously monitors the finance-creator YouTube
+    # landscape and writes 5 structured intelligence files to
+    # BRANDS/3SK_Finance/Channel_Intelligence/ that the channel content agents
+    # (scriptwriter, thumbnail-coordinator, video-description-writer,
+    # scene-image-prompt-generator) read at every dispatch. Distinct from
+    # market-researcher (business/sponsor scope) and researcher (general tech).
+    "youtube-researcher": {
+        "timeout_seconds": 1800,  # 30 min — multi-source web research + 5 file writes
+        "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence",
+    },
     # --- Added 2026-05-31 (Session 15, P5-12 dispatcher-side batch) ---
     # expense-categorizer: scans studio@ Gmail for receipts, drafts Expense_Tracker
     # rows with Schedule C categorization, surfaces a draft for Steve's /approve.
@@ -320,10 +331,13 @@ DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
 # ("if no new X since last run, return 'no work, skipping' and exit").
 AUTONOMOUS_DISPATCHES: list[dict] = [
     {
-        "name": "project-manager-daily",
+        "name": "project-manager-weekly",
         "agent_name": "project-manager",
-        # daily 05:30 ET — lands a fresh status report 30 min before the 06:00 morning brief.
-        "trigger_kwargs": {"hour": 5, "minute": 30},
+        # weekly Mondays 05:30 ET — lands a week-over-week status report 30 min
+        # before Monday's morning brief. (Was daily 05:30 from 5/30→5/31; flipped
+        # to weekly 5/31 because daily was overkill given the operation's actual
+        # change rate. Mid-week pulse can be added later if the signal density warrants.)
+        "trigger_kwargs": {"day_of_week": "mon", "hour": 5, "minute": 30},
         "prompt": (
             "Daily autonomous status sweep. Read the canonical operation state — "
             "the Build Queue, bridge file (latest 3 sessions), INBOX, today's daily "
@@ -337,6 +351,31 @@ AUTONOMOUS_DISPATCHES: list[dict] = [
             "where contract and reality have drifted, and the ranked 3-5 actions "
             "only Steve can do. Be honest — distinguish confirmed from unverified. "
             "Return the headline 🧍 needs-Steve list on stdout (4-6 ranked lines)."
+        ),
+    },
+    {
+        "name": "youtube-researcher-weekly",
+        "agent_name": "youtube-researcher",
+        # weekly Wednesdays 03:00 ET — fresh YT channel intelligence mid-week,
+        # before the typical Thu-Sun script production push. Feeds
+        # BRANDS/3SK_Finance/Channel_Intelligence/ which the channel content
+        # agents (scriptwriter, thumbnail-coordinator, video-description-writer,
+        # scene-image-prompt-generator) read at every dispatch as their
+        # freshness layer.
+        "trigger_kwargs": {"day_of_week": "wed", "hour": 3, "minute": 0},
+        "prompt": (
+            "Weekly autonomous YouTube channel intelligence sweep. Read existing "
+            "BRANDS/3SK_Finance/Channel_Intelligence/*.md to know what's already "
+            "captured (don't repeat — extend, refine, or replace stale claims). "
+            "Then run 2-4 targeted web searches per intelligence area and refresh "
+            "the 5 canonical files (hook_patterns / title_performance / "
+            "thumbnail_trends / algorithm_signals / viral_teardowns) + the "
+            "_index.md TOC with current last-updated dates. Cite every claim; "
+            "date-stamp anything that decays; keep each file ≤ 80 lines so the "
+            "content agents can skim fast (they have limited context). Return a "
+            "4-line stdout summary: top hook signal, top thumbnail signal, one "
+            "algorithm signal worth Steve's awareness, most useful viral teardown "
+            "for the upcoming production cycle."
         ),
     },
     {
@@ -389,6 +428,10 @@ Available subagents (agent_name -> what it does):
 - `researcher` — general technical/factual/comparative research (libraries, tools,
   prior art, how-X-works). Distinct from market-researcher (which is business/
   niche). Pair with engineering work when facts are missing. ~30 min.
+- `youtube-researcher` — YouTube channel intelligence specialist (hook/title/
+  thumbnail/algorithm patterns) that feeds the channel content agents'
+  freshness layer in BRANDS/3SK_Finance/Channel_Intelligence/. Runs weekly
+  autonomously; dispatch ad-hoc for focused deep-dives. ~30 min.
 - `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~20 min.
 - `scene-image-prompt-generator` — turns a script's scene blocks into paste-ready
   ChatGPT 5-field SCENE PROMPTs + verbatim Master Character Prompt v3. ~10 min.
@@ -1430,9 +1473,14 @@ def _replace_paste_ready_block(draft_text: str, csv_block: str, when_local: str)
 
 # --- Phase 5 (P5-12) — scheduled sweep + /approve handler ---
 
-EXPENSE_CATEGORIZER_HOUR = 9   # 09:00 ET — daily receipt sweep
+# Flipped 2026-05-31 (Session 17) from daily 09:00 → weekly Sunday 18:00 ET to
+# match actual receipt-flow cadence (Steve doesn't get 7 receipts/day — daily was
+# overkill). The 9-day lookback gives ~2 days overlap insurance if a Sunday fire
+# misfires; the dedup table (`expense_categorizer_processed_msg_ids`) handles repeats.
+EXPENSE_CATEGORIZER_DAY_OF_WEEK = "sun"
+EXPENSE_CATEGORIZER_HOUR = 18   # 18:00 ET — weekly Sunday evening receipt sweep
 EXPENSE_CATEGORIZER_MINUTE = 0
-EXPENSE_CATEGORIZER_LOOKBACK_DAYS = 7  # generous since-window; dedup table handles overlap
+EXPENSE_CATEGORIZER_LOOKBACK_DAYS = 9  # was 7 (daily); bumped for weekly cadence margin
 
 
 async def fire_expense_categorizer_sweep(chat_id: int) -> None:
@@ -2184,6 +2232,7 @@ async def _post_init(application) -> None:
     _scheduler.add_job(
         fire_expense_categorizer_sweep,
         CronTrigger(
+            day_of_week=EXPENSE_CATEGORIZER_DAY_OF_WEEK,
             hour=EXPENSE_CATEGORIZER_HOUR,
             minute=EXPENSE_CATEGORIZER_MINUTE,
             timezone=TIMEZONE,
@@ -2214,7 +2263,8 @@ async def _post_init(application) -> None:
         f"(target chat_id={target_chat_id})."
     )
     logger.info(
-        f"Phase 5 (P5-12) expense-categorizer sweep: daily at "
+        f"Phase 5 (P5-12) expense-categorizer sweep: weekly "
+        f"{EXPENSE_CATEGORIZER_DAY_OF_WEEK} at "
         f"{EXPENSE_CATEGORIZER_HOUR:02d}:{EXPENSE_CATEGORIZER_MINUTE:02d} {TIMEZONE}. "
         f"Next fire: {expense_next.isoformat() if expense_next else 'unknown'}. "
         f"Lookback: {EXPENSE_CATEGORIZER_LOOKBACK_DAYS} days. "
