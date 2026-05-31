@@ -1473,12 +1473,13 @@ def _replace_paste_ready_block(draft_text: str, csv_block: str, when_local: str)
 
 # --- Phase 5 (P5-12) — scheduled sweep + /approve handler ---
 
-# Flipped 2026-05-31 (Session 17) from daily 09:00 → weekly Sunday 18:00 ET to
-# match actual receipt-flow cadence (Steve doesn't get 7 receipts/day — daily was
-# overkill). The 9-day lookback gives ~2 days overlap insurance if a Sunday fire
-# misfires; the dedup table (`expense_categorizer_processed_msg_ids`) handles repeats.
+# Flipped 2026-05-31 (Session 17) from daily 09:00 → weekly Sunday; then moved
+# 2026-05-31 (Session 19) from Sun 18:00 → Sun 04:00 per Steve's "all autonomous
+# fires between 12am and 6am" directive. 9-day lookback gives ~2 days overlap
+# insurance if a Sunday fire misfires; the dedup table
+# (`expense_categorizer_processed_msg_ids`) handles repeats.
 EXPENSE_CATEGORIZER_DAY_OF_WEEK = "sun"
-EXPENSE_CATEGORIZER_HOUR = 18   # 18:00 ET — weekly Sunday evening receipt sweep
+EXPENSE_CATEGORIZER_HOUR = 4   # 04:00 ET — weekly Sunday early-morning receipt sweep
 EXPENSE_CATEGORIZER_MINUTE = 0
 EXPENSE_CATEGORIZER_LOOKBACK_DAYS = 9  # was 7 (daily); bumped for weekly cadence margin
 
