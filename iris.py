@@ -110,7 +110,7 @@ import re
 import shutil
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -287,6 +287,15 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 600,  # 10 min — reads vault state + writes status report
         "deliverable_dir": "06_CEO/Status_Reports",
     },
+    # --- Added 2026-05-31 (Session 15, P5-12 dispatcher-side batch) ---
+    # expense-categorizer: scans studio@ Gmail for receipts, drafts Expense_Tracker
+    # rows with Schedule C categorization, surfaces a draft for Steve's /approve.
+    # NEVER writes to Expense_Tracker.xlsx directly (draft-only contract). Paired
+    # with the scheduled-sweep job (09:00 ET) + /approve handler below.
+    "expense-categorizer": {
+        "timeout_seconds": 600,  # 10 min — Gmail scan + categorize + draft write
+        "deliverable_dir": "02_Finance/Expense_Tracker_Drafts",
+    },
     # The 4 engineering agents (senior-systems-architect, senior-engineer,
     # skeptical-code-reviewer, performance-optimizer) are deliberately NOT in this
     # enum yet — their target is a codebase (typically /Volumes/AI_Workspace/iris_studio/),
@@ -294,11 +303,6 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # once a per-agent working_dir override is wired (the dispatch spawn block uses
     # WORKSPACE_DIR in two places; parameterize via cfg.get("working_dir", ...)).
     # They remain fully usable via interactive Claude Code's Task tool.
-    #
-    # expense-categorizer is similarly held back — it needs the post-P5-2 iris.py
-    # batch (SQLite migration for expense_categorizer_processed_msg_ids, a 09:00 ET
-    # scheduled-job entry, and the /approve <run-id> Telegram handler) before it's
-    # actually useful when dispatched.
 }
 # Agent names the MODEL is allowed to dispatch (the dispatch_subagent enum).
 DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
@@ -339,6 +343,10 @@ Available subagents (agent_name -> what it does):
 - `sponsor-outreach-drafter` — drafts a personalized cold sponsor email. ~15 min.
 - `project-manager` — honest status read on the whole operation (what shipped,
   what's blocked, what needs Steve, where contract & reality drift). ~10 min.
+- `expense-categorizer` — scans studio@ Gmail for receipt-shaped emails, drafts
+  Expense_Tracker rows with Schedule C categorization (draft only — Steve approves
+  via `/approve <run-id>`). Runs daily 09:00 ET automatically; dispatch on demand
+  for backfills with a `since` date. ~10 min.
 
 When you dispatch:
 1. Call `dispatch_subagent` with agent_name, a clear self-contained prompt, and
@@ -909,6 +917,43 @@ def _init_db_sync() -> None:
             )
             """
         )
+        # === Phase 5 (P5-12) — expense-categorizer state machine ===
+        # One row per scheduled or on-demand sweep. status in
+        # {pending, drafted, approved, rejected, failed}. draft_path is the
+        # Expense_Tracker_Drafts/*.md the subagent wrote; candidate_count is
+        # filled by the post-completion ingest hook + by /approve.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS expense_categorizer_runs (
+                id TEXT PRIMARY KEY,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                since_date TEXT,
+                until_date TEXT,
+                draft_path TEXT,
+                candidate_count INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_expense_runs_status "
+            "ON expense_categorizer_runs(status)"
+        )
+        # Per-Gmail-msg dedup. Populated by the post-completion ingest hook
+        # (status='drafted') when a draft is parsed; flipped to 'approved' or
+        # 'rejected' by /approve / /reject. The subagent must filter against
+        # this table so it never re-drafts a previously processed message.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS expense_categorizer_processed_msg_ids (
+                msg_id TEXT PRIMARY KEY,
+                run_id TEXT,
+                status TEXT NOT NULL DEFAULT 'drafted',
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
 async def _ensure_db() -> None:
@@ -1140,6 +1185,350 @@ async def _db_call(fn, *args):
     return await loop.run_in_executor(None, lambda: fn(*args))
 
 
+# --- Phase 5 (P5-12) — expense-categorizer SQLite helpers ---
+
+def _insert_expense_run_sync(run_id: str, since_date: str, until_date: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO expense_categorizer_runs "
+            "(id, since_date, until_date, status) VALUES (?, ?, ?, 'pending')",
+            (run_id, since_date, until_date),
+        )
+
+
+def _update_expense_run_sync(run_id: str, fields: dict) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [run_id]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            f"UPDATE expense_categorizer_runs SET {cols} WHERE id = ?", vals
+        )
+
+
+def _get_expense_run_sync(run_id: str) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM expense_categorizer_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _get_last_expense_run_until_sync() -> str | None:
+    """Most recent run's until_date (any status). Used to pick the next since."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT until_date FROM expense_categorizer_runs "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else None
+
+
+def _list_processed_msg_ids_sync(limit: int = 500) -> list[str]:
+    """Most recent processed msg_ids (any status). Passed to the agent so it
+    can dedup against prior runs. Capped to keep the brief tractable."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT msg_id FROM expense_categorizer_processed_msg_ids "
+            "ORDER BY processed_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+
+def _upsert_processed_msg_id_sync(msg_id: str, run_id: str, status: str) -> None:
+    """Insert or update a msg_id row. Idempotent: re-running the ingest or
+    /approve on the same msg_id flips status without duplicating."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO expense_categorizer_processed_msg_ids "
+            "(msg_id, run_id, status) VALUES (?, ?, ?) "
+            "ON CONFLICT(msg_id) DO UPDATE SET "
+            "run_id = excluded.run_id, status = excluded.status, "
+            "processed_at = CURRENT_TIMESTAMP",
+            (msg_id, run_id, status),
+        )
+
+
+# --- Phase 5 (P5-12) — draft parser + CSV emit ---
+
+# Pulls Gmail message ids out of the agent's draft. The agent emits them as
+# `msg-id <id>` in the Receipt source column; tolerate either backtick/quote
+# wrapping or none. ids in our experience are 16-hex-ish but Gmail's API uses
+# variable-length tokens — keep the character class permissive but anchored.
+_MSG_ID_RE = re.compile(
+    r"msg-id\s*[`'\"]?([A-Za-z0-9_-]{6,})[`'\"]?",
+    re.IGNORECASE,
+)
+
+# Pulls one candidate row out of a markdown pipe table. The agent's contract
+# is exactly 7 columns: Date | Vendor | Amount | Category | Card | Confidence
+# | Receipt source. The header + separator row are skipped by header-match.
+_TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
+
+
+def _parse_candidate_rows(draft_text: str) -> tuple[list[list[str]], list[str]]:
+    """Extract candidate rows + every msg_id referenced anywhere in the draft.
+
+    Rows are returned as 7-column lists in the order they appear under the
+    `## Candidate Rows` section, stopping at the next `##` header or EOF.
+    msg_ids are deduped + lowercase-normalized.
+    """
+    rows: list[list[str]] = []
+    in_section = False
+    seen_header = False
+    for raw_line in draft_text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip().lower()
+        if stripped.startswith("## "):
+            if "candidate rows" in stripped:
+                in_section = True
+                seen_header = False
+                continue
+            if in_section:
+                break  # exited the section
+            continue
+        if not in_section:
+            continue
+        m = _TABLE_ROW_RE.match(line)
+        if not m:
+            continue
+        cells = [c.strip() for c in m.group(1).split("|")]
+        if not seen_header:
+            # The first matched row is the header (Date | Vendor | ...).
+            # The next row is the markdown separator (|---|---|...). Skip both.
+            seen_header = True
+            continue
+        if all(set(c) <= set("-: ") for c in cells):
+            # Separator row (|---|---|---|).
+            continue
+        if len(cells) < 7:
+            # Pad to 7 columns so downstream CSV emit doesn't IndexError.
+            cells = cells + [""] * (7 - len(cells))
+        rows.append(cells[:7])
+    msg_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for m in _MSG_ID_RE.finditer(draft_text):
+        mid = m.group(1).strip()
+        if mid and mid.lower() not in seen_ids:
+            seen_ids.add(mid.lower())
+            msg_ids.append(mid)
+    return rows, msg_ids
+
+
+def _csv_escape(field: str) -> str:
+    """RFC-4180 CSV escape: quote if the field contains comma, quote, or newline."""
+    f = field or ""
+    if any(c in f for c in (",", '"', "\n", "\r")):
+        return '"' + f.replace('"', '""') + '"'
+    return f
+
+
+def _build_paste_ready_csv(rows: list[list[str]]) -> str:
+    """Emit the CSV block (header + N rows) that gets dropped into the draft."""
+    header = ["Date", "Vendor", "Amount", "Category", "Card", "Confidence", "Receipt source"]
+    lines = [",".join(_csv_escape(c) for c in header)]
+    for r in rows:
+        lines.append(",".join(_csv_escape(c) for c in r))
+    return "\n".join(lines)
+
+
+def _replace_paste_ready_block(draft_text: str, csv_block: str, when_local: str) -> str:
+    """Replace the draft's `## Paste-ready CSV` section with a filled CSV.
+
+    Matches the section header (any suffix in parens) and overwrites the body
+    up to the next `##` header or EOF. If no such section exists, append one.
+    """
+    lines = draft_text.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    replaced = False
+    new_body = [
+        f"## Paste-ready CSV (filled {when_local})",
+        "",
+        "```csv",
+        csv_block,
+        "```",
+        "",
+    ]
+    while i < n:
+        line = lines[i]
+        if line.lstrip().lower().startswith("## paste-ready csv"):
+            out.extend(new_body)
+            i += 1
+            while i < n and not lines[i].lstrip().startswith("## "):
+                i += 1
+            replaced = True
+            continue
+        out.append(line)
+        i += 1
+    if not replaced:
+        if out and out[-1].strip():
+            out.append("")
+        out.extend(new_body)
+    return "\n".join(out) + ("\n" if not draft_text.endswith("\n") else "")
+
+
+# --- Phase 5 (P5-12) — scheduled sweep + /approve handler ---
+
+EXPENSE_CATEGORIZER_HOUR = 9   # 09:00 ET — daily receipt sweep
+EXPENSE_CATEGORIZER_MINUTE = 0
+EXPENSE_CATEGORIZER_LOOKBACK_DAYS = 7  # generous since-window; dedup table handles overlap
+
+
+async def fire_expense_categorizer_sweep(chat_id: int) -> None:
+    """Daily 09:00 ET job: kick the expense-categorizer subagent in scheduled mode.
+
+    Inserts a new run row, builds a brief naming run_id/since/until + the
+    processed-msg_id dedup list, dispatches the agent via the standard
+    dispatcher path. The deliverable notification + draft-parse + msg_id
+    ingest happen in _finish_dispatch's post-completion hook.
+    """
+    try:
+        run_id = uuid.uuid4().hex[:8]
+        now_local = datetime.now(TIMEZONE)
+        until_iso = now_local.strftime("%Y-%m-%d")
+        since_iso = (now_local - timedelta(days=EXPENSE_CATEGORIZER_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        await _db_call(_insert_expense_run_sync, run_id, since_iso, until_iso)
+        processed_ids = await _db_call(_list_processed_msg_ids_sync, 500)
+        processed_sample = ", ".join(processed_ids[:200])
+        if len(processed_ids) > 200:
+            processed_sample += f" ... (+{len(processed_ids) - 200} more)"
+        brief = (
+            f"Scheduled sweep. Operate in your **Scheduled mode** per your agent file.\n\n"
+            f"run_id: {run_id}\n"
+            f"since: {since_iso}\n"
+            f"until: {until_iso}\n"
+            f"already_processed_msg_ids ({len(processed_ids)} total — these MUST be skipped):\n"
+            f"{processed_sample or '(none yet — first scheduled run)'}\n\n"
+            "Write your draft to "
+            f"`02_Finance/Expense_Tracker_Drafts/{until_iso}_{run_id}.md` "
+            "per your Deliverable contract. After writing, return a one-sentence "
+            "stdout summary (the daemon parses your draft to ingest msg_ids and "
+            "ping Steve)."
+        )
+        result = await _start_dispatch(
+            "expense-categorizer", brief, str(chat_id), expected=10
+        )
+        logger.info(
+            f"Expense categorizer sweep fired: run_id={run_id}, "
+            f"since={since_iso}, until={until_iso}, "
+            f"dispatch_id={result['dispatch_id']}, "
+            f"processed_dedup_count={len(processed_ids)}"
+        )
+    except Exception as exc:
+        logger.exception(f"Expense categorizer sweep failed to fire: {exc}")
+
+
+async def _ingest_expense_draft(d_id: str, deliverable_path: str | None) -> None:
+    """Post-completion hook for expense-categorizer dispatches.
+
+    Reads the draft, parses candidate rows + msg_ids, inserts msg_ids into the
+    dedup table with status='drafted', and updates the run row with
+    candidate_count + status='drafted' + draft_path. Best-effort: a parse
+    failure here is logged but doesn't break the standard dispatch path.
+    """
+    if not deliverable_path:
+        return
+    try:
+        text = Path(deliverable_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        logger.warning(f"P5-12 ingest: could not read draft {deliverable_path}: {exc}")
+        return
+    # Pull run_id out of the draft's frontmatter; fall back to filename.
+    run_id_match = re.search(r"^run_id:\s*(\S+)\s*$", text, re.MULTILINE)
+    run_id = run_id_match.group(1).strip() if run_id_match else None
+    if not run_id:
+        stem = Path(deliverable_path).stem
+        # Filename convention: <until_iso>_<run_id>.md → last underscore-segment
+        if "_" in stem:
+            run_id = stem.rsplit("_", 1)[-1]
+    rows, msg_ids = _parse_candidate_rows(text)
+    if run_id:
+        await _db_call(_update_expense_run_sync, run_id, {
+            "draft_path": deliverable_path,
+            "candidate_count": len(rows),
+            "status": "drafted",
+            "finished_at": datetime.now().isoformat(),
+        })
+    for msg_id in msg_ids:
+        await _db_call(
+            _upsert_processed_msg_id_sync, msg_id, run_id or "unknown", "drafted"
+        )
+    logger.info(
+        f"P5-12 ingest: dispatch={d_id} run_id={run_id} "
+        f"rows={len(rows)} new/updated msg_ids={len(msg_ids)} "
+        f"draft={deliverable_path}"
+    )
+
+
+async def _handle_approve_command(update, chat_id: str, run_id: str) -> None:
+    """Handle `/approve <run-id>`: fill the draft's Paste-ready CSV block,
+    mark msg_ids as approved, mark the run as approved, ack to Steve.
+
+    Idempotent — running /approve twice just re-fills the CSV with the same
+    rows. The draft remains the source of truth; Steve still pastes manually
+    into Expense_Tracker.xlsx (v1 design — no programmatic xlsx write).
+    """
+    drafts_dir = WORKSPACE_DIR / "02_Finance/Expense_Tracker_Drafts"
+    if not drafts_dir.exists():
+        await update.message.reply_text(
+            f"No drafts dir at `{_vault_rel(str(drafts_dir))}`. "
+            "Has expense-categorizer ever run?"
+        )
+        return
+    candidates = list(drafts_dir.glob(f"*_{run_id}.md"))
+    if not candidates:
+        await update.message.reply_text(
+            f"No draft found for run-id `{run_id}`. "
+            f"Drafts live under `{_vault_rel(str(drafts_dir))}` — "
+            f"send /dispatches to see recent runs."
+        )
+        return
+    if len(candidates) > 1:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    draft_path = candidates[0]
+    try:
+        text = draft_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        await update.message.reply_text(f"Could not read draft `{draft_path.name}`: {exc}")
+        return
+    rows, msg_ids = _parse_candidate_rows(text)
+    if not rows:
+        await update.message.reply_text(
+            f"No candidate rows parsed from `{draft_path.name}`. "
+            "Open the draft and check the `## Candidate Rows` table is well-formed."
+        )
+        return
+    csv_block = _build_paste_ready_csv(rows)
+    when_local = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M ET")
+    new_text = _replace_paste_ready_block(text, csv_block, when_local)
+    try:
+        draft_path.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        await update.message.reply_text(f"Could not write draft `{draft_path.name}`: {exc}")
+        return
+    for msg_id in msg_ids:
+        await _db_call(
+            _upsert_processed_msg_id_sync, msg_id, run_id, "approved"
+        )
+    await _db_call(_update_expense_run_sync, run_id, {
+        "status": "approved",
+        "finished_at": datetime.now().isoformat(),
+        "candidate_count": len(rows),
+    })
+    await update.message.reply_text(
+        f"✅ Approved {len(rows)} row{'s' if len(rows) != 1 else ''} from run `{run_id}` "
+        f"({len(msg_ids)} msg_id{'s' if len(msg_ids) != 1 else ''} marked approved).\n\n"
+        f"📂 CSV filled at: `{_vault_rel(str(draft_path))}`\n\n"
+        "Open the draft, copy the block under `## Paste-ready CSV`, paste into "
+        "the Expense_Tracker.xlsx Receipts tab, save."
+    )
+
+
 async def _update_dispatch(d_id, **fields):
     await _db_call(_update_dispatch_sync, d_id, fields)
 
@@ -1280,6 +1669,15 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         f"Dispatch {d_id}: {status} after {elapsed_str} "
         f"(rc={returncode}, deliverable={deliverable})"
     )
+
+    # Phase 5 (P5-12) — agent-specific post-completion hook: parse the
+    # expense-categorizer draft + ingest msg_ids into the dedup table so
+    # the next scheduled sweep skips them. Best-effort — never raises.
+    if status == "completed" and agent_name == "expense-categorizer":
+        try:
+            await _ingest_expense_draft(d_id, deliverable)
+        except Exception as exc:
+            logger.warning(f"P5-12 ingest failed for dispatch {d_id}: {exc}")
 
     if not chat_id:
         return
@@ -1676,14 +2074,38 @@ async def _post_init(application) -> None:
         id="morning_briefing",
         replace_existing=True,
     )
+    # Phase 5 (P5-12) — daily expense-categorizer sweep at 09:00 ET. Fires
+    # the subagent in scheduled mode; the deliverable notification flows via
+    # the standard dispatch path; Steve replies `/approve <run-id>` to fill
+    # the draft's Paste-ready CSV block and mark msg_ids approved.
+    _scheduler.add_job(
+        fire_expense_categorizer_sweep,
+        CronTrigger(
+            hour=EXPENSE_CATEGORIZER_HOUR,
+            minute=EXPENSE_CATEGORIZER_MINUTE,
+            timezone=TIMEZONE,
+        ),
+        kwargs={"chat_id": target_chat_id},
+        id="expense_categorizer_sweep",
+        replace_existing=True,
+    )
     _scheduler.start()
     job = _scheduler.get_job("morning_briefing")
     next_run = job.next_run_time if job else None
+    expense_job = _scheduler.get_job("expense_categorizer_sweep")
+    expense_next = expense_job.next_run_time if expense_job else None
     logger.info(
         f"Scheduler started. Morning briefing: daily at "
         f"{MORNING_BRIEFING_HOUR:02d}:{MORNING_BRIEFING_MINUTE:02d} {TIMEZONE}. "
         f"Next fire: {next_run.isoformat() if next_run else 'unknown'} "
         f"(target chat_id={target_chat_id})."
+    )
+    logger.info(
+        f"Phase 5 (P5-12) expense-categorizer sweep: daily at "
+        f"{EXPENSE_CATEGORIZER_HOUR:02d}:{EXPENSE_CATEGORIZER_MINUTE:02d} {TIMEZONE}. "
+        f"Next fire: {expense_next.isoformat() if expense_next else 'unknown'}. "
+        f"Lookback: {EXPENSE_CATEGORIZER_LOOKBACK_DAYS} days. "
+        "Reply `/approve <run-id>` after each draft lands."
     )
 
 
@@ -2298,6 +2720,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"{_vault_rel(r.get('deliverable_path'))}"
             )
         await update.message.reply_text("\n".join(lines))
+        return
+
+    # Phase 5 (P5-12) — `/approve <run-id>` fills the expense-categorizer
+    # draft's Paste-ready CSV block, marks msg_ids approved, marks the run
+    # approved. Steve still pastes the CSV into Expense_Tracker.xlsx manually
+    # (v1 design — no programmatic xlsx write).
+    if stripped_text.lower().startswith(("/approve ", "!approve ")):
+        rest = stripped_text[len("/approve "):].strip()
+        if not rest:
+            await update.message.reply_text(
+                "Usage: /approve <run-id>\n"
+                "Look up recent run-ids via /dispatches (the expense-categorizer "
+                "rows show the dispatch id; the run-id is the 8-char suffix on "
+                "the draft filename `02_Finance/Expense_Tracker_Drafts/...`)."
+            )
+            return
+        run_id = rest.split(None, 1)[0]
+        logger.info(f"From @{username} (/approve {run_id}): filling Paste-ready CSV")
+        await _handle_approve_command(update, chat_id, run_id)
         return
 
     # Quick Capture bridge: if message starts with RECEIPT/DECISION/etc.,
