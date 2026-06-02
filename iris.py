@@ -2214,7 +2214,17 @@ async def _post_init(application) -> None:
     # In private chats, chat_id == user_id. ALLOWED_USER_IDS is keyed by
     # Telegram user IDs; use the first authorized user as the briefing target.
     target_chat_id = next(iter(ALLOWED_USER_IDS))
-    _scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    # APScheduler defaults: tolerate up to 6 hours of missed-fire window (Mac
+    # sleep / App Nap / kernel-recovery wake delay) and coalesce duplicate
+    # missed runs into one. Without these, the default misfire_grace_time=1s
+    # silently SKIPS jobs the instant the scheduler resumes — which is what
+    # cost us the 2026-06-01 03:00 market-researcher-monthly + 05:30
+    # project-manager-weekly + 06:00 morning-brief fires (APScheduler logged
+    # "missed by 7:54:35" warnings then advanced next_run, never executing).
+    _scheduler = AsyncIOScheduler(
+        timezone=TIMEZONE,
+        job_defaults={"misfire_grace_time": 21600, "coalesce": True},
+    )
     _scheduler.add_job(
         send_morning_briefing,
         CronTrigger(
@@ -2225,6 +2235,10 @@ async def _post_init(application) -> None:
         kwargs={"bot": application.bot, "chat_id": target_chat_id},
         id="morning_briefing",
         replace_existing=True,
+        # Morning brief is time-sensitive (it's Steve's wake-up artifact); a
+        # 2-hour grace is the right tradeoff — brief at 08:00 is still useful,
+        # but a brief at noon would clobber the morning-fresh framing.
+        misfire_grace_time=7200,
     )
     # Phase 5 (P5-12) — daily expense-categorizer sweep at 09:00 ET. Fires
     # the subagent in scheduled mode; the deliverable notification flows via
