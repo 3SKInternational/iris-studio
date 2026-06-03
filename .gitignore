@@ -25,3 +25,7 @@ STEVE_CONTEXT.md
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Daily SQLite dumps from scripts/dump-iris-db.sh (A-6) — same privacy
+# concern as the live .db; mirror the SQL form of conversation history.
+backups/
