@@ -8,6 +8,7 @@ Perform these four passes:
 
 1. **Backlog re-evaluation.** For each ⚪ pending item: has state changed (deps shipped, priority rationale obsolete, effort estimate updated, item now blocked or unblocked)? Update inline. For each 🟡 in-progress item: still moving or stuck? Promote/demote priority tags accordingly.
    - **Verify status against LIVE state, don't trust the row.** A backlog row's status can lag reality — an item marked ⚪ pending may already be shipped. Before re-ranking, spot-check ⚪ items against the actual system: `grep` iris.py for the proposed change, check whether the target file/dir/script already exists, check `git log`/`git status` in `/Volumes/AI_Workspace/iris_studio/`. (Reading/grep only — the hard build-ban still holds.) Lesson from the 2026-05-28 first run: A-8 was marked ⚪ but had shipped on 2026-05-27; only a grep of iris.py caught it.
+   - **Watch the 60-min nightly→scan window.** This routine fires at 03:00 ET; the autonomous engineering routine (`com.iris.claude-code-nightly`) fires at 02:00 ET daily. **Items shipped by the nightly between 02:00-03:00 will be on disk before THIS scan runs** — and need explicit reconciliation, NOT promotion as new. Also re-verify ANY new candidate you draft this run against on-disk state before adding the row: drafted at 03:01 may already be shipped by 03:02. Lesson from the 2026-06-01 second run: A-19 (.docx→.md) was drafted as a new 🔥 candidate, then the on-disk file-date check found Session 20 had shipped it at 02:58 ET — 2 min before the scan fired. Adding a fresh "verify candidate is not already shipped" check before each new-candidate row averts the repeat.
 
 2. **New candidate discovery.** Re-read:
    - INBOX.md (any items added since last scan)
@@ -24,14 +25,15 @@ Perform these four passes:
 
    Add each as a new candidate row in `Automation_Backlog.md` with: manual-today, proposed automation, saves, effort, dependencies, priority tag.
 
-3. **Promote top picks to INBOX.** Pick the 1-2 highest-leverage 🔥 items where deps are met and effort is under 2 hours. Add (or update) a subsection under INBOX `## 🤖 Iris-recommended automations` with one-liner + backlog link. Don't repeat items already promoted in the past 2 weeks unless Steve still hasn't acted — then re-surface with a higher urgency note.
+3. **Promote top picks to INBOX.** Pick the 1-2 highest-leverage 🔥 items where deps are met and effort is under 2 hours. Add (or update) a subsection under INBOX `## 🤖 Iris-recommended automations` with one-liner + backlog link. Don't repeat items already promoted in the past 2 weeks unless Steve still hasn't acted — then re-surface with a higher urgency note AND apply the auto-build-eligible escalation below.
+   - **Escalation rule for stale promotions (added 2026-06-01):** If a promoted ⚪ item has aged past 4 days without Steve's ✅ or 🔴, AND the item meets the **safe-for-autonomous** criteria (no creds touched, no public listeners added, no Steve-only OAuth required, pure-defense or pure-content), tag the backlog row with `auto-build-eligible: true` and explicitly note in the INBOX re-surface that the item will ship on the next nightly engineering fire unless 🔴-declined. This preserves THIS routine's surface-only mandate while not letting good resilience work die in the queue. Items NOT qualifying for safe-for-autonomous (anything touching creds, public listeners, daemon dispatch loop, sponsor-facing outputs, money flows) stay un-tagged and require explicit Steve ✅.
 
 4. **Meta-improvement on the routine itself.** Reflect: did last week's promoted candidates get Steve's action? If not, why? Was the framing wrong, the effort estimate off, the dependency unclear? Update this prompt file (the one you are reading) if a process change is warranted. This is the "improve the improvement loop" pass.
 
 **Output expectations:**
-- `06_CEO/Automation_Backlog.md` updated in place (priority shifts, new rows, deduplicated).
-- INBOX.md may get a new `## 🤖 Iris-recommended automations` subsection (or its existing one updated).
+- `06_CEO/Automation_Backlog.md` updated in place (priority shifts, new rows, deduplicated). Stale promotions re-surfaced with their `auto-build-eligible: true` tag where applicable.
+- INBOX.md may get a new `## 🤖 Iris-recommended automations` subsection (or its existing one updated). Stale items called out by day-count; the escalation rule's "fires next nightly unless 🔴" framing made explicit.
 - New session digest at `_Iris_Memory/Sessions/YYYY-MM-DD_automation-scan.md` with frontmatter (`type: session`, `agent: claude-code`, `routine: automation-scan`) + four-pass summary + which items were promoted to INBOX.
 - Append one line to today's daily note under `## 🤖 Claude Code intra-day log`. Format: `HH:MM — automation scan: N new, M promoted → Sessions/...`.
 
-**Hard ban on building.** This routine surfaces + ranks only. No code changes, no plist deploys, no daemon edits. Builds happen in the nightly engineering routine after Steve ✅s a candidate via Telegram or in-session.
+**Hard ban on building.** This routine surfaces + ranks only. No code changes, no plist deploys, no daemon edits. Builds happen in the nightly engineering routine — either after Steve ✅s a candidate via Telegram or in-session, OR (per the 2026-06-01 escalation rule) when an `auto-build-eligible: true` tagged item ages past 4 days without 🔴.
