@@ -8,7 +8,7 @@ Perform these 10 health checks and write findings into INBOX.md as a single "�
 
 2. **MCP health.** Run: `claude mcp list 2>&1`. Surface any MCP showing `✗ Failed to connect`.
 
-3. **iris.err.log scan.** Run: `tail -500 /Users/steve/iris_studio/logs/iris.err.log | grep -iE "error|exception|traceback|fatal" | grep -v "OAuth-aware error reply"`. Summarize anything new since yesterday's sweep — group by error class, count occurrences.
+3. **iris.err.log scan.** Run: `tail -500 /Users/steve/iris_studio/logs/iris.err.log | grep -iE "error|exception|traceback|fatal" | grep -v "OAuth-aware error reply" | grep -v "Telegram transient:"`. Summarize anything new since yesterday's sweep — group by error class, count occurrences. `Telegram transient:` is a Session 24 benign-blip prefix from the `_on_telegram_error` handler (NetworkError / TimedOut / RetryAfter); excluded because python-telegram-bot's retry loop self-recovers.
 
 4. **Disk space.** Run: `df -h /` and `df -h /Volumes/AI_Workspace 2>/dev/null`. Flag if either > 85% used.
 

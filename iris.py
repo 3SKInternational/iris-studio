@@ -118,6 +118,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 PROJECT_DIR = Path(__file__).parent
@@ -2989,6 +2990,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ============================================================
+# Telegram error handler
+# ============================================================
+
+async def _on_telegram_error(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    err = context.error
+    # Transient network blips from Telegram's Bouncer / upstream — python-telegram-bot's
+    # retry loop recovers on its own. Without a handler these surface as ERROR-level
+    # stack traces in iris.err.log and trip the pre-brief Pass 3 `error|exception|traceback`
+    # grep (Session 24 fix).
+    if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
+        logger.warning(f"Telegram transient: {type(err).__name__}: {err}")
+        return
+    logger.exception("Unhandled Telegram error", exc_info=err)
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -3064,6 +3083,7 @@ def main() -> None:
     )
     # filters.TEXT | filters.COMMAND lets slash-prefixed messages flow through too.
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_message))
+    app.add_error_handler(_on_telegram_error)
     logger.info(
         "Iris (Telegram daemon — Tier 1 local Llama 3.1 8B + Tier 3 cloud Haiku 4.5 via Max OAuth + "
         "SQLite memory + runtime date, allowlist enforced) starting. Ctrl+C to stop."
