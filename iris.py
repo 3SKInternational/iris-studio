@@ -124,6 +124,15 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 PROJECT_DIR = Path(__file__).parent
 load_dotenv(PROJECT_DIR / ".env")
 
+# A-23 — agent output linter. Loaded via importlib so the scripts/ dir doesn't
+# need to be on sys.path (keeps the loader local + side-effect-free).
+import importlib.util as _importlib_util  # noqa: E402
+_lint_spec = _importlib_util.spec_from_file_location(
+    "_agent_output_lint", PROJECT_DIR / "scripts" / "agent_output_lint.py"
+)
+_agent_output_lint = _importlib_util.module_from_spec(_lint_spec)
+_lint_spec.loader.exec_module(_agent_output_lint)
+
 # Force Agent SDK to use the claude CLI OAuth (Max sub).
 ANTHROPIC_API_KEY_FALLBACK = os.environ.pop("ANTHROPIC_API_KEY", None)
 
@@ -1788,6 +1797,30 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         except Exception as exc:
             logger.warning(f"P5-12 ingest failed for dispatch {d_id}: {exc}")
 
+    # A-23 — post-dispatch output lint: banned-vocab grep + monetary overview.
+    # Read-only; writes a `<deliverable>_lint.md` report next to the deliverable
+    # when worth reporting; returns a result the caller can use to extend the
+    # Telegram notification. Skip echo (no deliverable) and expense-categorizer
+    # (already has its own draft-parse hook above; the structured CSV is the
+    # source of truth, not text patterns). Best-effort — never raises.
+    lint_result = None
+    if (status == "completed" and deliverable
+            and agent_name not in (DISPATCH_ECHO_AGENT, "expense-categorizer")):
+        try:
+            loop = asyncio.get_event_loop()
+            lint_result = await loop.run_in_executor(
+                None, lambda: _agent_output_lint.lint_and_report(Path(deliverable))
+            )
+            if lint_result and lint_result.get("should_alert"):
+                banned_n = len(lint_result.get("banned", []))
+                logger.info(
+                    f"A-23 lint flagged dispatch {d_id} ({agent_name}): "
+                    f"{banned_n} banned-vocab occurrence(s). "
+                    f"Report: {lint_result.get('report_path')}"
+                )
+        except Exception as exc:
+            logger.warning(f"A-23 lint failed for dispatch {d_id}: {exc}")
+
     if not chat_id:
         return
 
@@ -1799,6 +1832,13 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         msg = f"{prefix}📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
         if deliverable:
             msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
+        if lint_result and lint_result.get("should_alert"):
+            banned_n = len(lint_result.get("banned", []))
+            report = lint_result.get("report_path")
+            msg += (
+                f"\n\n⚠️ Lint: {banned_n} banned-vocab occurrence(s). "
+                f"Report: {_vault_rel(report) if report else '(in-memory)'}"
+            )
         await _send_telegram(chat_id, msg)
     elif status == "timed_out":
         if partial_path:
