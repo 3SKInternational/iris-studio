@@ -16,12 +16,14 @@ Perform these four passes:
    - The last 7 `_Iris_Memory/Daily/YYYY-MM-DD.md` notes
    - The 3 most recent `_Iris_Memory/Sessions/*_Nightly_Value_Pulse.md` digests (if present)
    - The 3 most recent `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` bridge entries
+   - **`_Iris_Memory/Projects/Pitch_Log.md` — last 7 days of entries.** Cowork-Iris's nightly pulses log pitches there; pitches explicitly framed for Claude Code's lane (text patterns: "Engineering — Claude Code's lane", "iris.py hook", "multi-file build", "will surface in the digest so the automation-scan picks it up") are direct backlog candidates. Lesson from the 2026-06-04 third run: Pitch #20 (agent output-linter, logged 2026-06-03) was framed by Cowork as "Engineering — Claude Code's lane (multi-file / iris.py hook); logging here + will surface in the digest so the automation-scan picks it up" — this routine then absorbed it as A-23. Codify the cross-agent surface so future Cowork pitches in Claude Code's lane don't go un-absorbed for weeks.
 
    Look for:
    - Manual processes Steve mentioned doing (text patterns: "I do X every", "I forgot to", "I have to remember")
    - Pain points (text patterns: "this is annoying", "wish I didn't have to", "manually")
    - Iris-stack drift: duplicate scripts, routines firing but invisible to Steve, files growing unbounded, manual steps Steve takes between Iris-runs
    - New tech additions that could be auto-monitored or auto-maintained
+   - Cowork pitches in Claude Code's lane (per the Pitch_Log read above)
 
    Add each as a new candidate row in `Automation_Backlog.md` with: manual-today, proposed automation, saves, effort, dependencies, priority tag.
 
