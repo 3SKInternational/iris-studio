@@ -1538,6 +1538,48 @@ async def fire_expense_categorizer_sweep(chat_id: int) -> None:
         logger.exception(f"Expense categorizer sweep failed to fire: {exc}")
 
 
+def _read_deliverable_status(deliverable_path: str | None) -> dict:
+    """V1 status contract (2026-06-10): parse the `status:` YAML frontmatter
+    field from an agent deliverable. Synchronous, best-effort, never raises.
+
+    Returns a dict with keys `category` and `raw`:
+      - category="ok"             — status starts with "ok" / any non-block/partial value
+      - category="blocked"        — status starts with "blocked"
+      - category="partial"        — status starts with "partial"
+      - category="missing"        — frontmatter present but no status: field
+      - category="no-frontmatter" — file does not open with a YAML `---` block
+      - category="unreadable"     — file could not be read (raw=exception text)
+
+    Caller surfaces `blocked` / `partial` / `missing` / `no-frontmatter` as a
+    Telegram warning so dispatch-mechanical success cannot mask semantic
+    failure (root cause of the 2026-06-07 expense-categorizer silent miss).
+    """
+    if not deliverable_path:
+        return {"category": "unreadable", "raw": "no path"}
+    try:
+        text = Path(deliverable_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"category": "unreadable", "raw": str(exc)}
+    head = text.lstrip()
+    if not head.startswith("---"):
+        return {"category": "no-frontmatter", "raw": None}
+    body = head[3:]
+    end_idx = body.find("\n---")
+    if end_idx == -1:
+        return {"category": "no-frontmatter", "raw": None}
+    fm = body[:end_idx]
+    m = re.search(r"(?mi)^status:\s*(.+?)\s*$", fm)
+    if not m:
+        return {"category": "missing", "raw": None}
+    raw = m.group(1).strip().strip('"').strip("'")
+    low = raw.lower()
+    if low.startswith("blocked"):
+        return {"category": "blocked", "raw": raw}
+    if low.startswith("partial"):
+        return {"category": "partial", "raw": raw}
+    return {"category": "ok", "raw": raw}
+
+
 async def _ingest_expense_draft(d_id: str, deliverable_path: str | None) -> None:
     """Post-completion hook for expense-categorizer dispatches.
 
@@ -1562,6 +1604,19 @@ async def _ingest_expense_draft(d_id: str, deliverable_path: str | None) -> None
         if "_" in stem:
             run_id = stem.rsplit("_", 1)[-1]
     rows, msg_ids = _parse_candidate_rows(text)
+    # A-26 (2026-06-10): if the agent reports a `blocked-*` semantic status in
+    # the draft frontmatter, log a WARNING so the failure is visible in the
+    # log digest even before the Telegram surface (V1 hook in _finish_dispatch)
+    # catches it. The 6/7 incident: rows=1 came from the empty-table template,
+    # not real receipts; status: blocked-gmail-oauth was the only honest signal.
+    status_info = _read_deliverable_status(deliverable_path)
+    if status_info.get("category") == "blocked":
+        logger.warning(
+            f"P5-12 ingest: draft reports blocked status "
+            f"{status_info.get('raw')!r} — rows={len(rows)} may be a "
+            f"blocker-template artifact, not real receipts. "
+            f"draft={deliverable_path}"
+        )
     if run_id:
         await _db_call(_update_expense_run_sync, run_id, {
             "draft_path": deliverable_path,
@@ -1797,6 +1852,36 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         except Exception as exc:
             logger.warning(f"P5-12 ingest failed for dispatch {d_id}: {exc}")
 
+    # V1 — Semantic-status contract (2026-06-10): read the deliverable's
+    # `status:` YAML frontmatter for ALL agents that produced a file.
+    # blocked-*/partial-*/missing fields surface a Telegram warning so
+    # dispatch-mechanical success (rc=0 + file exists + parse) cannot mask
+    # semantic failure. Root cause: 2026-06-07 expense-categorizer blocked
+    # by OAuth, dispatch reported "clean," Sessions 27+28 blessed it. The
+    # only honest signal was the draft's `status: blocked-gmail-oauth`.
+    draft_status_info = None
+    if (status == "completed" and deliverable
+            and agent_name != DISPATCH_ECHO_AGENT):
+        try:
+            loop = asyncio.get_event_loop()
+            draft_status_info = await loop.run_in_executor(
+                None, lambda: _read_deliverable_status(deliverable)
+            )
+            cat = draft_status_info.get("category")
+            if cat == "blocked":
+                logger.warning(
+                    f"V1 status hook: dispatch {d_id} ({agent_name}) "
+                    f"reports status={draft_status_info.get('raw')!r}. "
+                    f"Deliverable: {deliverable}"
+                )
+            elif cat in ("partial", "missing", "no-frontmatter"):
+                logger.info(
+                    f"V1 status hook: dispatch {d_id} ({agent_name}) "
+                    f"status category={cat} raw={draft_status_info.get('raw')!r}"
+                )
+        except Exception as exc:
+            logger.warning(f"V1 status hook failed for dispatch {d_id}: {exc}")
+
     # A-23 — post-dispatch output lint: banned-vocab grep + monetary overview.
     # Read-only; writes a `<deliverable>_lint.md` report next to the deliverable
     # when worth reporting; returns a result the caller can use to extend the
@@ -1832,6 +1917,17 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         msg = f"{prefix}📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
         if deliverable:
             msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
+        if draft_status_info:
+            sc = draft_status_info.get("category")
+            sr = draft_status_info.get("raw")
+            if sc == "blocked":
+                msg += f"\n\n⚠️ Draft status: {sr} — agent reports it could not complete. Read the deliverable for the remediation note."
+            elif sc == "partial":
+                msg += f"\n\n⚠️ Draft status: {sr} — agent reports partial output."
+            elif sc == "missing":
+                msg += "\n\n⚠️ Deliverable frontmatter has no `status:` field (V1 contract — agent file may predate the 2026-06-10 update)."
+            elif sc == "no-frontmatter":
+                msg += "\n\n⚠️ Deliverable has no YAML frontmatter (V1 contract — cannot verify semantic status)."
         if lint_result and lint_result.get("should_alert"):
             banned_n = len(lint_result.get("banned", []))
             report = lint_result.get("report_path")
