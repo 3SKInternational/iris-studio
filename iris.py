@@ -2263,6 +2263,45 @@ async def generate_morning_briefing() -> str:
     return await query_cloud(MORNING_BRIEFING_PROMPT, history=[])
 
 
+def _preserve_evening_addendum() -> str | None:
+    """Brain-audit fix #9 (2026-06-11): before DAILY_BRIEFING.md is overwritten
+    by the morning regen, extract any `## 🌆 Evening addendum` section and
+    append it to yesterday's daily note. Returns a short status line for the
+    log, or None if nothing to preserve. Best-effort — never raises."""
+    try:
+        if not DAILY_BRIEFING_FILE.exists():
+            return None
+        text = DAILY_BRIEFING_FILE.read_text(encoding="utf-8", errors="replace")
+        # Match "## 🌆 Evening addendum ..." up to the next "## " heading or EOF
+        m = re.search(
+            r"^##\s+🌆\s+Evening addendum.*?(?=^##\s|\Z)",
+            text,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not m:
+            return None
+        addendum = m.group(0).rstrip() + "\n"
+        # Yesterday's daily note
+        yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+        daily_path = WORKSPACE_DIR / "_Iris_Memory" / "Daily" / f"{yesterday}.md"
+        if not daily_path.exists():
+            logger.warning(
+                f"Evening addendum found in DAILY_BRIEFING but yesterday's daily note "
+                f"({daily_path.name}) does not exist — skipping preservation."
+            )
+            return None
+        header = (
+            f"\n\n## 🌆 Evening addendum (carried from DAILY_BRIEFING on regen "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n"
+        )
+        with daily_path.open("a", encoding="utf-8") as f:
+            f.write(header + addendum)
+        return f"preserved evening addendum to {daily_path.name} ({len(addendum)} chars)"
+    except Exception as exc:
+        logger.exception(f"_preserve_evening_addendum failed (non-fatal): {exc}")
+        return None
+
+
 async def regenerate_daily_briefing_file() -> bool:
     """Regenerate DAILY_BRIEFING.md from current workspace state.
 
@@ -2286,6 +2325,10 @@ async def regenerate_daily_briefing_file() -> bool:
                 "skipping save to preserve the existing file."
             )
             return False
+        # Brain-audit fix #9: rescue any evening addendum BEFORE we rename/overwrite.
+        preserved = _preserve_evening_addendum()
+        if preserved:
+            logger.info(preserved)
         # Back up existing file with timestamp
         if DAILY_BRIEFING_FILE.exists():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
