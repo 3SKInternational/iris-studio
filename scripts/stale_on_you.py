@@ -33,10 +33,22 @@ from pathlib import Path
 
 VAULT = Path("/Users/steve/Documents/3SK/outputs")
 DECISION_QUEUE = VAULT / "06_CEO" / "Decision_Queue.md"
+DECISIONS_LOG = VAULT / "06_CEO" / "Decisions_Log"
 INBOX = VAULT / "INBOX.md"
 
 STATE_DIR = Path("/Users/steve/iris_studio/state")
 STATE_FILE = STATE_DIR / "stale_on_you_seen.tsv"
+
+# Decisions_Log lookup defaults (Night 4 fix — DQ-10 false-alarm root cause).
+DECISIONS_LOG_LOOKBACK_DAYS = 30
+DECISIONS_LOG_MIN_TOKEN_LEN = 4
+DECISIONS_LOG_MIN_HITS = 2
+DECISIONS_LOG_STOPWORDS = {
+    "that", "this", "with", "from", "have", "will", "into", "your",
+    "their", "these", "those", "should", "must", "would", "could",
+    "make", "give", "need", "want", "when", "what", "where", "while",
+    "been", "than", "then", "they", "them", "also", "such",
+}
 
 
 def _today_iso() -> str:
@@ -85,6 +97,85 @@ def _days_between(iso_a: str, iso_b: str) -> int:
         return (b - a).days
     except Exception:
         return 0
+
+
+def load_recent_decisions(
+    days: int = DECISIONS_LOG_LOOKBACK_DAYS,
+) -> list[tuple[str, str, str]]:
+    """Return [(filename_stem, title_lower, body_lower)] for decisions logged
+    in the last `days` days. Filename convention: `YYYY-MM-DD_<topic>.md`.
+
+    Used by the Decisions_Log lookup that prevents a re-decided item from
+    appearing as awaiting-Steve. Root cause for the Night 3 false alarm:
+    Tier-2 packet "pass all" was decided 2026-06-09 and logged at
+    `Decisions_Log/2026-06-09_Tier2_Calibration_Pass_All.md`, but the C2
+    stale-tracker had no awareness of the decisions log and surfaced the
+    item anyway (DQ-10). This lookup closes that gap.
+    """
+    if not DECISIONS_LOG.exists():
+        return []
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+    out: list[tuple[str, str, str]] = []
+    for p in sorted(DECISIONS_LOG.glob("*.md")):
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})_", p.name)
+        if not m:
+            continue
+        try:
+            d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        if d < cutoff:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        h1_match = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+        title = h1_match.group(1).strip() if h1_match else p.stem
+        out.append((p.stem, title.lower(), text.lower()))
+    return out
+
+
+def _significant_tokens(text: str) -> list[str]:
+    raw = re.findall(r"[a-z0-9]+", text.lower())
+    return [
+        t for t in raw
+        if len(t) >= DECISIONS_LOG_MIN_TOKEN_LEN
+        and t not in DECISIONS_LOG_STOPWORDS
+    ]
+
+
+def resolved_by_recent_decision(
+    item: dict[str, str],
+    decisions: list[tuple[str, str, str]],
+) -> bool:
+    """True iff the item's text or DQ id strongly overlaps a recent decision.
+
+    Heuristic:
+      (a) If the item carries a DQ-N id and that exact id appears anywhere in
+          any recent decision body → resolved.
+      (b) Otherwise, extract significant tokens (len >= 4, non-stopword) from
+          the item text. If at least MIN_HITS distinct tokens appear in any
+          decision title → resolved.
+
+    Body matches are intentionally NOT used for token overlap — decision
+    bodies tend to mention many topics by reference, which would
+    over-match. Title overlap is the precise signal.
+    """
+    if not decisions:
+        return False
+    item_id = (item.get("id") or "").lower().strip()
+    item_text = (item.get("text") or "").lower()
+    tokens = _significant_tokens(item_text)
+    for _stem, title, body in decisions:
+        if item_id and item_id in body:
+            return True
+        if len(tokens) < DECISIONS_LOG_MIN_HITS:
+            continue
+        hits = {t for t in tokens if t in title}
+        if len(hits) >= DECISIONS_LOG_MIN_HITS:
+            return True
+    return False
 
 
 def parse_decision_queue() -> list[dict[str, str]]:
@@ -305,8 +396,25 @@ def main() -> int:
     inbox_items = parse_inbox_steve_items()
     inbox_rows = _update_seen_and_compute_days(inbox_items, seen, today)
 
-    # Persist the updated first-seen ledger.
+    # Persist the updated first-seen ledger BEFORE the decisions-log filter so
+    # an item that gets correctly excluded still has its first_seen ledger row,
+    # which keeps day-counts honest if the decision later proves stale and the
+    # item re-emerges.
     _save_seen(seen)
+
+    # Night 4 fix — exclude items that already have a recent decision logged
+    # (the DQ-10 false-alarm class). Title-token overlap + DQ-id body grep,
+    # window = last 30 days.
+    decisions = load_recent_decisions()
+    pre_count = len(dq_rows) + len(inbox_rows)
+    dq_rows = [r for r in dq_rows if not resolved_by_recent_decision(r, decisions)]
+    inbox_rows = [r for r in inbox_rows if not resolved_by_recent_decision(r, decisions)]
+    dropped = pre_count - len(dq_rows) - len(inbox_rows)
+    if dropped:
+        sys.stderr.write(
+            f"stale_on_you: excluded {dropped} item(s) with recent decisions "
+            f"in {DECISIONS_LOG.name}/ ({DECISIONS_LOG_LOOKBACK_DAYS}-day window)\n"
+        )
 
     section = render_section(dq_rows + inbox_rows, today)
 

@@ -1580,6 +1580,65 @@ def _read_deliverable_status(deliverable_path: str | None) -> dict:
     return {"category": "ok", "raw": raw}
 
 
+# A2 — Lint-gated calibration auto-pass (Workflow Autonomy Redesign Night 3,
+# 2026-06-12). Spec: 06_CEO/Designs/2026-06-09_Workflow_Autonomy_Redesign.md.
+# When an AUTONOMOUS dispatch completes with lint clean + status:ok + a
+# recurring (not first-of-its-kind) deliverable, suppress the full-content
+# Telegram surface — Steve gets a short audit line + path. 3-vids/wk agent
+# throughput sustainable inside the 10-20 hr/wk budget depends on this. Steve's
+# own dispatches always get the full surface (auto-pass only fires for
+# autonomous_label is not None).
+A2_STATE_FILE = Path("/Users/steve/iris_studio/state/a2_seen_kinds.tsv")
+
+
+def _a2_compute_kind(agent_name: str, deliverable_path: str | None) -> str | None:
+    """`kind` = agent_name + ':' + parent-dir of the deliverable.
+
+    Most agents ship one kind (scriptwriter → Production_Scripts/); a few
+    differentiate by subdir (scene-image-prompt-generator → Scene_Image_Prompts/,
+    video-description-writer → Video_Descriptions/). Parent-dir is the stable
+    discriminator that doesn't force per-agent config.
+    """
+    if not deliverable_path:
+        return None
+    try:
+        parent = Path(deliverable_path).parent.name
+    except Exception:
+        return None
+    return f"{agent_name}:{parent}"
+
+
+def _a2_seen_kind(kind: str) -> bool:
+    if not kind or not A2_STATE_FILE.exists():
+        return False
+    try:
+        for line in A2_STATE_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if cols and cols[0] == kind:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _a2_register_kind(kind: str, deliverable_path: str) -> None:
+    if not kind:
+        return
+    try:
+        A2_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not A2_STATE_FILE.exists()
+        today_iso = datetime.now().date().isoformat()
+        with open(A2_STATE_FILE, "a", encoding="utf-8") as f:
+            if is_new:
+                f.write("# kind\tfirst_seen\tfirst_path\n")
+            f.write(f"{kind}\t{today_iso}\t{deliverable_path}\n")
+    except OSError as exc:
+        logger.warning(f"A2 register failed for {kind!r}: {exc}")
+
+
 async def _ingest_expense_draft(d_id: str, deliverable_path: str | None) -> None:
     """Post-completion hook for expense-categorizer dispatches.
 
@@ -1906,6 +1965,35 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         except Exception as exc:
             logger.warning(f"A-23 lint failed for dispatch {d_id}: {exc}")
 
+    # A2 — Lint-gated calibration auto-pass (Redesign Night 3, 2026-06-12).
+    # AUTONOMOUS fire + lint clean + status:ok + NOT first-of-kind → suppress
+    # the full content surface; Steve sees a short audit line. Steve's own
+    # dispatches (autonomous_label is None) ALWAYS get the full surface.
+    # First-of-kind is registered (so subsequent fires auto-pass) but the
+    # current fire still surfaces fully so Steve sees the baseline output.
+    auto_pass = False
+    if (status == "completed"
+            and autonomous_label is not None
+            and deliverable
+            and agent_name not in (DISPATCH_ECHO_AGENT, "expense-categorizer")):
+        lint_clean = not (lint_result and lint_result.get("should_alert"))
+        status_cat = draft_status_info.get("category") if draft_status_info else None
+        status_ok = status_cat == "ok"
+        if lint_clean and status_ok:
+            kind = _a2_compute_kind(agent_name, deliverable)
+            if kind and _a2_seen_kind(kind):
+                auto_pass = True
+                logger.info(
+                    f"A2 auto-pass: dispatch {d_id} ({agent_name}) — "
+                    f"lint clean + status:ok + kind '{kind}' previously seen."
+                )
+            elif kind:
+                _a2_register_kind(kind, deliverable)
+                logger.info(
+                    f"A2 first-of-kind: dispatch {d_id} ({agent_name}) — "
+                    f"kind '{kind}' registered; Steve sees full surface."
+                )
+
     if not chat_id:
         return
 
@@ -1914,28 +2002,37 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
     prefix = f"🤖 Autonomous ({autonomous_label}) — " if autonomous_label else ""
 
     if status == "completed":
-        msg = f"{prefix}📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
-        if deliverable:
-            msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
-        if draft_status_info:
-            sc = draft_status_info.get("category")
-            sr = draft_status_info.get("raw")
-            if sc == "blocked":
-                msg += f"\n\n⚠️ Draft status: {sr} — agent reports it could not complete. Read the deliverable for the remediation note."
-            elif sc == "partial":
-                msg += f"\n\n⚠️ Draft status: {sr} — agent reports partial output."
-            elif sc == "missing":
-                msg += "\n\n⚠️ Deliverable frontmatter has no `status:` field (V1 contract — agent file may predate the 2026-06-10 update)."
-            elif sc == "no-frontmatter":
-                msg += "\n\n⚠️ Deliverable has no YAML frontmatter (V1 contract — cannot verify semantic status)."
-        if lint_result and lint_result.get("should_alert"):
-            banned_n = len(lint_result.get("banned", []))
-            report = lint_result.get("report_path")
-            msg += (
-                f"\n\n⚠️ Lint: {banned_n} banned-vocab occurrence(s). "
-                f"Report: {_vault_rel(report) if report else '(in-memory)'}"
+        if auto_pass:
+            msg = (
+                f"{prefix}✅ {agent_name} auto-passed ({elapsed_str}) — "
+                f"lint clean + status:ok + recurring kind. Filed."
             )
-        await _send_telegram(chat_id, msg)
+            if deliverable:
+                msg += f"\n\n📂 {_vault_rel(deliverable)}"
+            await _send_telegram(chat_id, msg)
+        else:
+            msg = f"{prefix}📦 {agent_name} done after {elapsed_str}:\n\n{_synthesize(stdout, deliverable)}"
+            if deliverable:
+                msg += f"\n\n📂 Saved to: {_vault_rel(deliverable)}"
+            if draft_status_info:
+                sc = draft_status_info.get("category")
+                sr = draft_status_info.get("raw")
+                if sc == "blocked":
+                    msg += f"\n\n⚠️ Draft status: {sr} — agent reports it could not complete. Read the deliverable for the remediation note."
+                elif sc == "partial":
+                    msg += f"\n\n⚠️ Draft status: {sr} — agent reports partial output."
+                elif sc == "missing":
+                    msg += "\n\n⚠️ Deliverable frontmatter has no `status:` field (V1 contract — agent file may predate the 2026-06-10 update)."
+                elif sc == "no-frontmatter":
+                    msg += "\n\n⚠️ Deliverable has no YAML frontmatter (V1 contract — cannot verify semantic status)."
+            if lint_result and lint_result.get("should_alert"):
+                banned_n = len(lint_result.get("banned", []))
+                report = lint_result.get("report_path")
+                msg += (
+                    f"\n\n⚠️ Lint: {banned_n} banned-vocab occurrence(s). "
+                    f"Report: {_vault_rel(report) if report else '(in-memory)'}"
+                )
+            await _send_telegram(chat_id, msg)
     elif status == "timed_out":
         if partial_path:
             partial_bytes = len(stdout or "")

@@ -7,6 +7,7 @@ Perform these 7 grooming passes. Write all findings into a single new design doc
 1. **iris.py type check.** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/pyright iris.py 2>&1 | tail -30` (or `which pyright` then full path). If pyright not installed, suggest `.venv/bin/pip install pyright` and skip this pass. Flag any reported type errors but do NOT auto-fix (Steve approves changes).
 
 2. **Git status + recent commit review.** Run: `cd /Volumes/AI_Workspace/iris_studio && git status && git log --oneline -10 && git diff --stat HEAD~10 HEAD 2>/dev/null`. Summarize: any uncommitted changes? Commits this week? Lines-of-code drift trend?
+   - **C2 cross-cadence rule (Redesign Night 4, 2026-06-12):** if unpushed commits or uncommitted-work concerns surface a Steve-action item, check first whether the C2 stale-on-you block (between `<!-- C2_STALE_ON_YOU:BEGIN -->` markers in `INBOX.md`) already lists the same surface (e.g., a `git push` reminder or DQ row). If it does, REFERENCE the C2 block in your hygiene report — do NOT re-list with a fresh day-count in your own voice. The C2 surface is the single canonical "awaiting Steve" board; individual cadences referencing it (rather than triple-flagging) is what kills the A-11-style re-flag noise.
 
 3. **.bak file cleanup candidates.** Run: `ls -la /Volumes/AI_Workspace/iris_studio/iris.py.bak* 2>/dev/null` + `ls -la ~ | grep .OLD-`. List any .bak* or .OLD-* files older than 7 days. Do NOT delete — flag candidates in the hygiene doc for Steve's approval.
 
