@@ -1,0 +1,55 @@
+Sunday Drive gardener at ~03:45 AM ET, weekly — runs AFTER the 02:30 rclone backup. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
+
+Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` (latest entry) for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
+
+## Two Drive folders — know the difference (CRITICAL)
+
+- **`gdrive:3SK International`** (WITH a space) = the **curated, human-facing** layer. THIS is the only folder you organize.
+- **`gdrive:3SK_International`** (WITH an underscore) = the **automated raw backup mirror**, overwritten weekly by `rclone sync`. **NEVER move, rename, delete, or write anything here.** You may only READ it (size/listing) for the health check. Hand-editing it is forbidden — the sync clobbers it anyway.
+
+rclone is at `/opt/homebrew/bin/rclone`, authed as studio@3skinternational.com. Deletions/moves go to Drive trash (30-day recovery), so actions are reversible — but be conservative anyway.
+
+## Canonical curated structure (`gdrive:3SK International/`)
+
+```
+Company & Legal/        ← incorporation, registration, legal, UPS Store, foundation/roadmap docs, Correspondence/
+Operating/              ← CEO cadence, weekly action packs, hiring, SOPs, Templates/
+Finance/                ← Expense_Tracker, tax docs, invoices, financial reports
+3SK Finance (Brand)/    ← Brand Bible, video catalog, scripts, references for the YouTube brand
+_Reference/             ← file maps, READMEs, indexes
+```
+
+## Four passes — do them in order
+
+### Pass 1 — File stray root files
+Run `/opt/homebrew/bin/rclone lsf "gdrive:3SK International" --files-only` (top-level files only, not `-R`). Any file sitting loose at the curated root that belongs in one of the 5 folders above → move it server-side with `/opt/homebrew/bin/rclone moveto "gdrive:3SK International/FILE" "gdrive:3SK International/FOLDER/FILE"`. Filing rules:
+- legal / incorporation / UPS / correspondence / foundation / roadmap → **Company & Legal/**
+- CEO cadence / action pack / hiring / SOP / template / checklist → **Operating/**
+- expense / tax / invoice / financial → **Finance/**
+- brand bible / video / script / thumbnail / 3SK Finance brand asset → **3SK Finance (Brand)/**
+- file map / README / index → **_Reference/**
+- **If a file's destination is genuinely ambiguous, LEAVE IT and flag it in the report — do not guess.**
+
+### Pass 2 — Verify backup health (READ-ONLY on the mirror)
+1. `tail -6 /Users/steve/iris_studio/logs/drive-sync.stdout.log` — confirm the most-recent block has BOTH a `start` and a matching `done` line (done = clean exit), and the timestamp is within the last 8 days. A `start` with no `done`, or an `ERROR`/`Aborting` line, = a failed/stalled backup → flag it.
+2. `launchctl list | grep drive-sync` — middle column is last exit status; expect `0`.
+3. Size parity: `/opt/homebrew/bin/rclone size "gdrive:3SK_International"` vs the local vault `du -sh /Users/steve/Documents/3SK/outputs` (the mirror is smaller — excludes strip `.git`, `.venv`, etc.; a rough order-of-magnitude match ~35–60 MB is healthy). Flag a drastic shrink (e.g. mirror near-empty) as a possible broken sync.
+   - If the backup looks unhealthy AND a `git push`/backup item is already on the C2 stale-on-you board in `INBOX.md` (between `<!-- C2_STALE_ON_YOU:BEGIN -->` markers), REFERENCE it rather than re-flagging in your own voice.
+
+### Pass 3 — Flag stale curated exports (list only, NO auto-refresh)
+The curated docs are point-in-time exports and drift from the live vault. Spot-check a few high-value ones (e.g. `Finance/Expense_Tracker.xlsx`, `3SK Finance (Brand)/Brand_Bible.docx`, `Company & Legal/` foundation docs) — compare the Drive copy's mod time (`/opt/homebrew/bin/rclone lsl "gdrive:3SK International/PATH"`) against the live vault equivalent's mtime. List any curated doc that is materially older than its live source as a "stale export — consider re-exporting" item. **Do NOT regenerate or upload anything** — refreshing exports is a separate, human-triggered job.
+
+### Pass 4 — Prune reappearing cruft
+Look for: empty folders, `.DS_Store`, zero-byte or placeholder README stubs that serve no purpose, accidental duplicates (`* (1).docx`). Run `/opt/homebrew/bin/rclone lsf "gdrive:3SK International" -R --files-only` to scan. Delete clear cruft with `/opt/homebrew/bin/rclone deletefile "gdrive:3SK International/PATH"` (goes to trash). Remove empty dirs with `/opt/homebrew/bin/rclone rmdir`. **`_Reference/README.md` and `3SK Finance (Brand)/Reference_Manifest.md` are intentional — keep them.** When unsure whether something is cruft, LEAVE it and flag instead.
+
+## Output
+
+- **Always** append ONE bullet to today's daily note `_Iris_Memory/Daily/YYYY-MM-DD.md` under `## 🤖 Claude Code intra-day log`. Format: `HH:MM — Drive gardener: [N filed, M pruned, backup OK/FLAGGED, K stale exports] → [report path or "clean"]`. If the daily note doesn't exist, create it from `01_Operating_Docs/Templates/Daily_Note_Template.md`. Do NOT touch Cowork's section.
+- **If you took action OR flagged anything**, write a short report at `06_CEO/Designs/YYYY-MM-DD_Drive_Gardener.md` with frontmatter (`date`, `type: drive-gardener-report`, `status: complete`, `tags: [gardener/drive]`): what you moved, what you pruned, backup-health verdict, stale-export list, anything left flagged for Steve. A fully clean sweep skips the report (daily-note bullet only).
+- **Append a bridge-file entry** (`_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md`) ONLY if you took a non-trivial action or found a backup-health problem. Clean tidy-only sweeps skip the bridge.
+
+## Hard bans
+- Never write to `gdrive:3SK_International` (the underscore mirror).
+- Never regenerate/upload curated exports (Pass 3 is list-only).
+- Never delete anything outside the curated `3SK International` folder.
+- When in doubt on filing or pruning, FLAG don't guess.
