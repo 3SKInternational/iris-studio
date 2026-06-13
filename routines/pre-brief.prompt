@@ -20,7 +20,15 @@ Perform these health checks and write findings into INBOX.md as a single "🌅 P
 
 8. **SSH login log.** Run: `log show --predicate 'process == "sshd" AND eventMessage CONTAINS "Accepted"' --last 24h 2>/dev/null | tail -10`. Note any SSH session from an unfamiliar source IP (Steve's tailnet IPs and his Air's local IP are expected; anything else flag).
 
-9. **INBOX completed-items archival (A-3).** Open INBOX.md. Find every `[x]` task that has been completed for 7+ days (look for date markers in the line or in the surrounding subsection). Cut them, append to `INBOX_Archive.md` under a `## YYYY-MM-DD pre-brief archival` heading. Keep the most-recent week of completions visible in INBOX so Steve can still see fresh wins. If nothing qualifies, skip silently. Note in the sweep summary: `Archived N completed items → INBOX_Archive.md`.
+9. **INBOX completed-items archival (A-3) + dated-section archival (C3, Redesign Night 4, 2026-06-13).** Open INBOX.md. Two passes:
+
+   **(a) `[x]` task archival (original Pass 9 behavior).** Find every `[x]` task that has been completed for 7+ days (look for date markers in the line or in the surrounding subsection). Cut them, append to `INBOX_Archive.md` under a `## YYYY-MM-DD pre-brief archival` heading. Keep the most-recent week of completions visible in INBOX so Steve can still see fresh wins.
+
+   **(b) Dated-subsection archival (NEW C3 extension).** Scan INBOX.md for subsections whose heading carries an ISO date in parens — pattern `^###\s+.*\(\d{4}-\d{2}-\d{2}\)\s*$` (e.g. `### 🌅 Pre-brief sweep (2026-06-12)`, `### Overnight wins (2026-06-04)`). If the parsed date is ≥ 7 days before today (computed from runtime date, not hard-coded), cut the entire subsection block (from its `###` line to the next `##`/`###` or EOF) and append under the same `## YYYY-MM-DD pre-brief archival` heading in `INBOX_Archive.md`. **Exclusion: skip TODAY's own pre-brief sweep subsection** (the one Pass 1 self-overwrites — would race with this archival step on the same morning). Sanity check: do not remove subsections inside the C2 fenced block (`<!-- C2_STALE_ON_YOU:BEGIN -->` / `END`) — Pass 15 owns that block.
+
+   If nothing qualifies in either pass, skip silently. Note in the sweep summary: `Archived N completed items + M dated subsections → INBOX_Archive.md` (omit the zero parts on partial fires; omit the line entirely on clean sweeps).
+
+   **Why C3:** the blueprint says INBOX caps ~7 items + ~150 lines. Without section-block archival, dated digest subsections accumulate (the 5/28→6/4 "Pre-brief sweep" growth + 6/3 "Overnight wins" subsections from Cowork's pulse). Pass 9b closes that loop — Pass 1's daily self-overwrite handles tomorrow's pre-brief, Pass 9b handles every other dated block over a week old.
 
 10. **Vault file-count tripwire (A-18).** Early-warning for catastrophic-deletion events like the 2026-05-27 Syncthing scare. Run:
     ```bash

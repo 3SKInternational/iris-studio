@@ -198,6 +198,31 @@ QUICK_CAPTURE_PREFIXES = (
     "MILESTONE:", "STATEMENT:", "IDEA:", "QUESTION:", "FEEDBACK:",
 )
 
+# A4 (Redesign Night 4, 2026-06-13) — Telegram receipt-photo auto-routing.
+# When Steve sends a photo on Telegram with a `RECEIPT:` caption, the daemon
+# (a) downloads the photo to `02_Finance/Receipts/` for the audit trail,
+# (b) parses the caption for amount + vendor + date,
+# (c) writes a single-row draft into `02_Finance/Expense_Tracker_Drafts/`
+#     with the same format the expense-categorizer agent produces, so
+# (d) the existing `/approve <run-id>` Telegram handler fills the
+#     Paste-ready CSV block exactly as it does for the Sunday Gmail sweep.
+# Reuses the SQLite expense_categorizer_runs + processed_msg_ids tables;
+# the msg_id for a Telegram photo is `tg-photo-<telegram_message_id>`
+# (won't collide with Gmail ids, which are 16-hex-ish, and stays inside
+# the same dedup namespace so a re-send of the same Telegram photo is a
+# no-op).
+RECEIPTS_DIR = WORKSPACE_DIR / "02_Finance" / "Receipts"
+EXPENSE_DRAFTS_DIR = WORKSPACE_DIR / "02_Finance" / "Expense_Tracker_Drafts"
+# Caption amount regex: matches "$7.23", "$1,234.56", "$10". Captures the
+# numeric portion sans dollar sign. First match wins (receipts usually have
+# a single dollar amount).
+_RECEIPT_AMOUNT_RE = re.compile(r"\$([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
+# Optional date: M/D, M/D/YY, M/D/YYYY, or YYYY-MM-DD anywhere in the caption.
+_RECEIPT_DATE_RE = re.compile(
+    r"(?P<iso>\d{4}-\d{1,2}-\d{1,2})"
+    r"|(?P<us>\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
+)
+
 # === Cloud (Tier 3) config ===
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 QUERY_TIMEOUT_SECONDS = 60.0
@@ -1479,6 +1504,266 @@ def _replace_paste_ready_block(draft_text: str, csv_block: str, when_local: str)
             out.append("")
         out.extend(new_body)
     return "\n".join(out) + ("\n" if not draft_text.endswith("\n") else "")
+
+
+# --- A4 (Redesign Night 4) — Telegram receipt-photo capture helpers ---
+#
+# Compounds with expense-categorizer: the Sunday sweep handles studio@ Gmail
+# receipts; this handles the last manual leg — receipts paid in-person where
+# the only artifact is a phone-camera photo. Both feed the same draft +
+# /approve workflow, so Steve's mental model is one paste-ready CSV per run
+# regardless of channel.
+
+def _parse_receipt_caption(caption: str, now: datetime) -> dict:
+    """Extract amount + date + vendor-ish description from a `RECEIPT:` caption.
+    Best-effort: empty / unparseable strings get sane fallbacks so the draft
+    table is never broken (Steve fills in via /approve review)."""
+    raw = caption.strip()
+    # Strip the leading RECEIPT: prefix (case-insensitive, optional whitespace).
+    if raw.upper().startswith("RECEIPT:"):
+        raw = raw[len("RECEIPT:"):].strip()
+    amount = ""
+    m = _RECEIPT_AMOUNT_RE.search(raw)
+    if m:
+        amount = "$" + m.group(1)
+    date_str = now.strftime("%Y-%m-%d")  # fallback = today
+    dm = _RECEIPT_DATE_RE.search(raw)
+    if dm:
+        # Both branches must validate the result via datetime construction —
+        # the regex matches the SHAPE (digits + separators) but does not bound
+        # month ∈ [1,12] or day ∈ [1,28..31]. A garbage match like "13/45/26"
+        # would propagate "2026-13-45" into the YAML frontmatter (which PyYAML
+        # rejects) AND the draft filename. Falling back to `now` keeps the
+        # downstream pipeline honest. (Skeptical-review finding #1, 2026-06-13.)
+        if dm.group("iso"):
+            try:
+                parts = dm.group("iso").split("-")
+                if len(parts) == 3 and len(parts[0]) == 4:
+                    y, mo, d = int(parts[0]), int(parts[1]), int(parts[2])
+                    datetime(y, mo, d)  # validates calendar range
+                    date_str = f"{y:04d}-{mo:02d}-{d:02d}"
+            except (ValueError, IndexError):
+                pass
+        elif dm.group("us"):
+            try:
+                bits = dm.group("us").split("/")
+                month = int(bits[0])
+                day = int(bits[1])
+                if len(bits) == 3:
+                    year_raw = bits[2]
+                    if len(year_raw) == 2:
+                        year = 2000 + int(year_raw)
+                    else:
+                        year = int(year_raw)
+                else:
+                    year = now.year
+                datetime(year, month, day)  # validates calendar range
+                date_str = f"{year:04d}-{month:02d}-{day:02d}"
+            except (ValueError, IndexError):
+                pass
+    # Strip recognized amount + date substrings from raw to get vendor-ish text.
+    vendor = raw
+    if m:
+        vendor = vendor.replace(m.group(0), " ").strip()
+    if dm:
+        vendor = vendor.replace(dm.group(0), " ").strip()
+    vendor = re.sub(r"\s+", " ", vendor).strip(" ,.-")
+    if not vendor:
+        vendor = "[VERIFY]"
+    return {
+        "amount": amount or "[VERIFY]",
+        "date": date_str,
+        "vendor": vendor[:80],
+    }
+
+
+def _write_telegram_receipt_draft_sync(
+    run_id: str,
+    parsed: dict,
+    msg_id: str,
+    photo_rel_path: str,
+    caption_raw: str,
+    username: str,
+    now: datetime,
+) -> Path:
+    """Write the single-row draft into Expense_Tracker_Drafts/ in the same
+    format expense-categorizer produces, so the existing /approve handler
+    consumes it without code changes."""
+    EXPENSE_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    draft_path = EXPENSE_DRAFTS_DIR / f"{parsed['date']}_{run_id}.md"
+    when_str = now.strftime("%Y-%m-%d %H:%M ET")
+    body = (
+        "---\n"
+        f"date: {parsed['date']}\n"
+        "type: expense-draft\n"
+        "status: ok\n"
+        f"run_id: {run_id}\n"
+        f"since: {parsed['date']}\n"
+        f"until: {parsed['date']}\n"
+        "source: telegram-photo\n"
+        "candidate_count: 1\n"
+        "tags:\n"
+        "  - finance/expense-draft\n"
+        "  - source/telegram-receipt-photo\n"
+        "---\n\n"
+        f"# Expense Tracker Draft — Telegram receipt {run_id} ({when_str})\n\n"
+        f"_From @{username}'s Telegram photo capture. Receipt image saved at "
+        f"`{photo_rel_path}`. Single-row draft — run `/approve {run_id}` after "
+        "verifying the row's fields below to fill the Paste-ready CSV block._\n\n"
+        "## Candidate Rows\n\n"
+        "| Date | Vendor | Amount | Category | Card | Confidence | Receipt source |\n"
+        "|---|---|---|---|---|---|---|\n"
+        f"| {parsed['date']} | {parsed['vendor']} | {parsed['amount']} | "
+        "[VERIFY] | [VERIFY] | Low (telegram-photo caption parse) | "
+        f"msg-id `{msg_id}`, photo `{photo_rel_path}` |\n\n"
+        "## Categorization rationale\n\n"
+        "_Single-row Telegram capture — category was not auto-inferred. Steve "
+        "fills the Category + Card columns from the photo + memory before "
+        "`/approve`._\n\n"
+        "## Original caption\n\n"
+        f"```\n{caption_raw.strip()}\n```\n\n"
+        "## Paste-ready CSV (filled after `/approve`)\n\n"
+        f"_Empty until Steve runs `/approve {run_id}` from Telegram._\n\n"
+        "## Run metadata\n\n"
+        "| Field | Value |\n"
+        "|---|---|\n"
+        f"| Run ID | {run_id} |\n"
+        f"| Dispatched | Telegram photo capture ({username}) |\n"
+        f"| Since | {parsed['date']} |\n"
+        f"| Until | {parsed['date']} |\n"
+        f"| Source | telegram-photo |\n"
+        f"| Receipt photo | `{photo_rel_path}` |\n"
+        f"| Candidate rows | 1 |\n"
+        f"| Draft written | `02_Finance/Expense_Tracker_Drafts/{draft_path.name}` |\n"
+    )
+    draft_path.write_text(body, encoding="utf-8")
+    return draft_path
+
+
+async def _handle_receipt_photo(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE,
+                                caption: str) -> None:
+    """End-to-end: download photo → save → write draft → SQLite row →
+    Telegram ack with the /approve hint. Best-effort throughout; any
+    individual failure is logged and surfaced to Steve as a soft warning
+    (the photo + caption are still in Telegram, so nothing is lost)."""
+    user_id = update.effective_user.id
+    chat_id = str(update.effective_chat.id)
+    username = update.effective_user.username or update.effective_user.first_name
+    message = update.message
+    now = datetime.now()
+    # Idempotency key: Telegram's per-chat message id is monotonically
+    # increasing and globally unique within the chat scope. Suffix it with
+    # `tg-photo-` so it's distinguishable from Gmail ids (which are
+    # 16-hex-ish) in the shared dedup table.
+    telegram_msg_id = str(message.message_id)
+    msg_id = f"tg-photo-{telegram_msg_id}"
+    # Short run_id derived from msg_id so two re-sends of the same Telegram
+    # photo produce the same run_id (and the second attempt is a no-op when
+    # the existing draft is found below).
+    run_id = uuid.uuid5(uuid.NAMESPACE_URL, msg_id).hex[:8]
+    # If a draft for this msg_id already exists (re-send), do nothing
+    # destructive — just reply with the existing /approve hint.
+    existing = await _db_call(
+        _telegram_receipt_existing_sync, msg_id
+    )
+    if existing:
+        await update.message.reply_text(
+            f"Already drafted run `{existing['run_id']}` for this photo. "
+            f"Run `/approve {existing['run_id']}` to fill the CSV block, "
+            f"or re-send a NEW photo (different image) for a fresh draft."
+        )
+        return
+    # 1. Pick the largest PhotoSize variant (last in the list) and download.
+    if not message.photo:
+        logger.warning(
+            f"A4 receipt-photo handler invoked with no .photo attribute "
+            f"(message_id={telegram_msg_id}); ignoring."
+        )
+        return
+    largest = message.photo[-1]
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    photo_path = RECEIPTS_DIR / f"{now.strftime('%Y-%m-%d_%H%M%S')}_{run_id}.jpg"
+    try:
+        file_obj = await context.bot.get_file(largest.file_id)
+        await file_obj.download_to_drive(custom_path=str(photo_path))
+    except Exception as exc:
+        logger.warning(
+            f"A4 receipt-photo download failed (msg_id={msg_id}): {exc}"
+        )
+        await update.message.reply_text(
+            f"I saved your RECEIPT caption but the photo download failed: "
+            f"{exc}\n\nResend the photo and I'll try again."
+        )
+        return
+    photo_rel = str(photo_path.relative_to(WORKSPACE_DIR))
+    # 2. Parse the caption for amount/vendor/date.
+    parsed = _parse_receipt_caption(caption, now)
+    # 3. Write the draft + insert SQLite rows so /approve works.
+    try:
+        loop = asyncio.get_event_loop()
+        draft_path = await loop.run_in_executor(
+            None,
+            lambda: _write_telegram_receipt_draft_sync(
+                run_id, parsed, msg_id, photo_rel, caption, username, now,
+            ),
+        )
+        await _db_call(
+            _insert_expense_run_sync, run_id, parsed["date"], parsed["date"],
+        )
+        await _db_call(
+            _update_expense_run_sync, run_id, {
+                "draft_path": str(draft_path),
+                "candidate_count": 1,
+                "status": "drafted",
+                "finished_at": now.isoformat(),
+            },
+        )
+        await _db_call(
+            _upsert_processed_msg_id_sync, msg_id, run_id, "drafted",
+        )
+    except Exception as exc:
+        logger.exception(f"A4 receipt-photo draft write failed: {exc}")
+        await update.message.reply_text(
+            f"Photo saved at `{photo_rel}`, but the draft write failed: "
+            f"{exc}\n\nThe photo is on disk — Cowork-Iris can file manually."
+        )
+        return
+    # 4. NO TELEGRAM_CAPTURE.md append for photo receipts. The text-only
+    # RECEIPT: path appends because Cowork-Iris routes those rows by hand
+    # into Expense_Tracker.xlsx at her next desk session — but A4 has ALREADY
+    # routed this one (draft + SQLite rows + /approve fills the CSV block).
+    # An audit append here would risk Cowork double-filing the same receipt.
+    # The draft markdown IS the audit trail; the SQLite expense_categorizer_runs
+    # row is the run-state record. Skeptical-review finding #2 (2026-06-13).
+    # 5. Ack with the next-step hint Steve already knows from the Sunday sweep.
+    await update.message.reply_text(
+        f"📸 Receipt logged.\n"
+        f"• Photo: `{photo_rel}`\n"
+        f"• Parsed: {parsed['date']} | {parsed['vendor']} | {parsed['amount']}\n"
+        f"• Draft: `02_Finance/Expense_Tracker_Drafts/{draft_path.name}`\n\n"
+        f"Run `/approve {run_id}` after eyeballing the parsed row "
+        "(amount + vendor + date) — same flow as the Sunday Gmail sweep."
+    )
+    logger.info(
+        f"A4 receipt-photo drafted: run_id={run_id} msg_id={msg_id} "
+        f"photo={photo_rel} draft={draft_path}"
+    )
+
+
+def _telegram_receipt_existing_sync(msg_id: str) -> dict | None:
+    """Look up whether this msg_id already has a drafted/approved row.
+    Used for idempotency on a Telegram photo re-send (the user clicks the
+    same photo again — common UX). Returns the matching processed_msg_id
+    row's `run_id` + `status`, or None if unseen."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT msg_id, run_id, status FROM "
+            "expense_categorizer_processed_msg_ids WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 # --- Phase 5 (P5-12) — scheduled sweep + /approve handler ---
@@ -3071,6 +3356,48 @@ async def ask_iris(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
 # Telegram handlers
 # ============================================================
 
+async def handle_photo_message(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A4 (Redesign Night 4, 2026-06-13). Telegram photo handler — when the
+    caption starts with `RECEIPT:`, route the photo through the receipt
+    draft pipeline. Non-RECEIPT photo captions get a soft hint reply and
+    are otherwise ignored (the daemon doesn't have a general image-routing
+    path — photos without RECEIPT: are operator slips, not workflow)."""
+    user_id = update.effective_user.id
+    username = (update.effective_user.username
+                or update.effective_user.first_name)
+    if user_id not in ALLOWED_USER_IDS:
+        logger.warning(
+            f"BLOCKED unauthorized photo: user_id={user_id} @{username}"
+        )
+        return
+    caption = (update.message.caption or "").strip()
+    if not caption.upper().startswith("RECEIPT:"):
+        logger.info(
+            f"A4: photo from @{username} without RECEIPT: caption ignored "
+            f"(caption preview: {caption[:60]!r})"
+        )
+        await update.message.reply_text(
+            "📸 Got a photo, but no `RECEIPT:` caption — I only auto-route "
+            "receipt photos right now. Add a caption like "
+            "`RECEIPT: $7.23 UPS fax service` and resend, or describe what "
+            "you want me to do with it in a text message."
+        )
+        return
+    logger.info(
+        f"From @{username} (photo): RECEIPT capture, caption={caption!r}"
+    )
+    try:
+        await _handle_receipt_photo(update, context, caption)
+    except Exception as exc:
+        logger.exception(f"A4 receipt-photo handler crashed: {exc}")
+        await update.message.reply_text(
+            f"Receipt-photo handler hit an error: {exc}\n"
+            "Your photo is still in this Telegram chat — Cowork-Iris can "
+            "file it from there if needed."
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward a Telegram message to the router and reply with the response."""
     user_id = update.effective_user.id
@@ -3322,6 +3649,12 @@ def main() -> None:
         f"Quick Capture bridge: ENABLED. Prefixes {QUICK_CAPTURE_PREFIXES} append to {QUICK_CAPTURE_FILE} for Cowork-Iris routing."
     )
     logger.info(
+        f"A4 receipt-photo capture: ENABLED. Photos with a `RECEIPT:` "
+        f"caption → photo saved to {RECEIPTS_DIR.relative_to(WORKSPACE_DIR)}/ "
+        f"+ single-row draft into {EXPENSE_DRAFTS_DIR.relative_to(WORKSPACE_DIR)}/ "
+        f"+ /approve <run-id> fills CSV. Reuses expense-categorizer schema."
+    )
+    logger.info(
         "OAuth-aware error reply: ENABLED. Auth failures surface a 'run claude login' hint to Steve via Telegram."
     )
     logger.info(
@@ -3359,6 +3692,10 @@ def main() -> None:
     )
     # filters.TEXT | filters.COMMAND lets slash-prefixed messages flow through too.
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_message))
+    # A4 (Redesign Night 4, 2026-06-13): photos with `RECEIPT:` captions
+    # route through handle_photo_message → _handle_receipt_photo → draft +
+    # /approve. Non-RECEIPT photos get a soft hint and are ignored.
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_error_handler(_on_telegram_error)
     logger.info(
         "Iris (Telegram daemon — Tier 1 local Llama 3.1 8B + Tier 3 cloud Haiku 4.5 via Max OAuth + "
