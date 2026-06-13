@@ -1,4 +1,4 @@
-Sunday Drive gardener at ~03:45 AM ET, weekly — runs AFTER the 02:30 rclone backup. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
+Sunday Drive gardener at 03:00 AM ET, weekly — runs AFTER the 02:30 rclone backup (which completes in ~10 min) and well BEFORE the 04:30 hygiene job. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
 
 Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` (latest entry) for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
 
@@ -31,9 +31,17 @@ Run `/opt/homebrew/bin/rclone lsf "gdrive:3SK International" --files-only` (top-
 - **If a file's destination is genuinely ambiguous, LEAVE IT and flag it in the report — do not guess.**
 
 ### Pass 2 — Verify backup health (READ-ONLY on the mirror)
-1. `tail -6 /Users/steve/iris_studio/logs/drive-sync.stdout.log` — confirm the most-recent block has BOTH a `start` and a matching `done` line (done = clean exit), and the timestamp is within the last 8 days. A `start` with no `done`, or an `ERROR`/`Aborting` line, = a failed/stalled backup → flag it.
-2. `launchctl list | grep drive-sync` — middle column is last exit status; expect `0`.
-3. Size parity: `/opt/homebrew/bin/rclone size "gdrive:3SK_International"` vs the local vault `du -sh /Users/steve/Documents/3SK/outputs` (the mirror is smaller — excludes strip `.git`, `.venv`, etc.; a rough order-of-magnitude match ~35–60 MB is healthy). Flag a drastic shrink (e.g. mirror near-empty) as a possible broken sync.
+The scheduled backup (`com.iris.drive-sync`) fires Sun 02:30 — ~30 min before you run — so a healthy week leaves a fresh, COMPLETED entry from earlier this morning.
+1. `tail -20 /Users/steve/iris_studio/logs/drive-sync.stdout.log`. Find the **LAST** `=== drive-sync start … ===` line and judge ONLY that most-recent run (do NOT accept "some earlier block has a done"). Health requires ALL three:
+   - its timestamp is within the last ~26 hours — i.e. today's 02:30 run actually fired. An older latest-start means the scheduled job didn't run at all → **FLAG**.
+   - it is followed by a matching `=== drive-sync done … ===` line. A trailing `start` with NO `done` after it = a stalled/aborted run → **FLAG**.
+   - there is NO `ERROR` / `Aborting` line after that last `start`.
+   (Failure signature for reference: the 5/31 + 6/7 scheduled runs each logged `start` then `ERROR … Aborting` with no `done`. That exact shape = broken backup, even though a later manual run looks clean.)
+2. `launchctl list | grep drive-sync` — the middle column is the LAST exit status. Treat `0` as necessary-but-NOT-sufficient: it reflects only the most recent invocation and can stay `0` across some failure modes. The Step-1 log check is the authoritative signal, not this.
+3. Size parity — apples-to-apples, BOTH sides measured with the same excludes:
+   - mirror: `/opt/homebrew/bin/rclone size "gdrive:3SK_International"`
+   - live vault: `/opt/homebrew/bin/rclone size /Users/steve/Documents/3SK/outputs --exclude-from /Volumes/AI_Workspace/iris_studio/scripts/drive-sync.excludes`
+   These two totals should be **nearly equal** (both omit `.git`, `.venv`, etc.). A mirror materially smaller than the excluded-vault total = an incomplete/broken sync → **FLAG**. Do NOT use a raw `du -sh` of the vault — it counts the `.git`/`.venv` the mirror omits and will false-flag every week.
    - If the backup looks unhealthy AND a `git push`/backup item is already on the C2 stale-on-you board in `INBOX.md` (between `<!-- C2_STALE_ON_YOU:BEGIN -->` markers), REFERENCE it rather than re-flagging in your own voice.
 
 ### Pass 3 — Flag stale curated exports (list only, NO auto-refresh)
