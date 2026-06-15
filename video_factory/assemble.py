@@ -41,6 +41,23 @@ CANVAS_W, CANVAS_H = 7680, 4320
 VIDEO_CODEC = ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
                "-pix_fmt", "yuv420p"]
 AUDIO_CODEC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+
+
+def _resolve_bin(name: str) -> str:
+    # Prefer an explicit override, then Homebrew's keg-only ffmpeg-full (it
+    # carries the libfreetype `drawtext` filter the lean `ffmpeg` formula drops
+    # -> onscreen_label burn-in works), then whatever is on PATH.
+    env = os.environ.get(name.upper())
+    if env:
+        return env
+    keg = f"/opt/homebrew/opt/ffmpeg-full/bin/{name}"
+    if os.path.exists(keg):
+        return keg
+    return name
+
+
+FFMPEG = _resolve_bin("ffmpeg")
+FFPROBE = _resolve_bin("ffprobe")
 FONT_CANDIDATES = [
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
@@ -73,7 +90,7 @@ def run(cmd: list[str], desc: str) -> None:
 
 def ffprobe_duration(path: Path) -> float:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
          "-of", "csv=p=0", str(path)],
         capture_output=True, text=True)
     if out.returncode != 0 or not out.stdout.strip():
@@ -92,7 +109,7 @@ def pick_font() -> str | None:
 
 
 def has_drawtext() -> bool:
-    out = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+    out = subprocess.run([FFMPEG, "-hide_banner", "-filters"],
                          capture_output=True, text=True)
     return bool(re.search(r"^\s*\S+\s+drawtext\b", out.stdout, re.MULTILINE))
 
@@ -249,7 +266,7 @@ def compose_filter(shot: Shot, font: str | None, draw_ok: bool) -> str:
 def render_shot(shot: Shot, font: str | None, draw_ok: bool,
                 out_path: Path) -> None:
     seg_dur = shot.seg_dur
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(shot.image)]
+    cmd = [FFMPEG, "-y", "-loop", "1", "-i", str(shot.image)]
     if shot.audio is not None:
         cmd += ["-ss", f"{shot.audio_start:.6f}", "-i", str(shot.audio)]
         audio_map = "1:a"
@@ -365,7 +382,7 @@ def concat_shots(shot_files: list[Path], out_path: Path, tmp: Path) -> None:
     listfile = tmp / "concat.txt"
     listfile.write_text(
         "".join(f"file '{p.as_posix()}'\n" for p in shot_files))
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile),
+    cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(listfile),
            "-c", "copy", "-movflags", "+faststart", str(out_path)]
     run(cmd, "concat")
 
@@ -378,9 +395,9 @@ def main() -> None:
                     help="keep the per-shot temp files for inspection")
     args = ap.parse_args()
 
-    for tool in ("ffmpeg", "ffprobe"):
-        if shutil.which(tool) is None:
-            die(f"{tool} not on PATH (brew install ffmpeg)")
+    for tool in (FFMPEG, FFPROBE):
+        if not (os.path.isabs(tool) and os.path.exists(tool)) and shutil.which(tool) is None:
+            die(f"{tool} not found (brew install ffmpeg, or ffmpeg-full for drawtext)")
 
     manifest_path = Path(args.manifest).resolve()
     if not manifest_path.exists():
