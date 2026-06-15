@@ -63,13 +63,15 @@ whose PNG already exists** (resumable) unless `--force`.
 | `reference_dir` | no | manifest dir | Base dir for relative `reference_images`. `~` expanded. |
 | `reference_images` | no | `[]` | Character/style anchors re-sent with every ref-anchored image. |
 | `style_preamble` | no | `""` | Prepended to every image's prompt (the stateless-API "paste once"). |
-| `defaults` | no | `{}` | `model`, `quality`, `size` — see below. |
+| `defaults` | no | `{}` | `model`, `quality`, `size`, `input_fidelity` — see below. |
 | `images` | yes | — | Ordered list of image objects. |
 
-`defaults` keys: `model` (default `gpt-image-2`), `quality`
-(`low`|`medium`|`high`|`auto`, default `medium`), `size`
+`defaults` keys: `model` (default `gpt-image-1` — see *Model choice* below),
+`quality` (`low`|`medium`|`high`|`auto`, default `medium`), `size`
 (`1024x1024`|`1536x1024`|`1024x1536`|`auto`, default `1536x1024` — 3:2 landscape
-that feeds the 1920×1080 video render).
+that feeds the 1920×1080 video render), `input_fidelity` (`low`|`high`, default
+`high` — only applies to gpt-image-1's edits endpoint; silently skipped on
+models that don't support it).
 
 ## Image fields
 
@@ -88,6 +90,7 @@ that feeds the 1920×1080 video render).
 | `--provider` | `openai` \| `flux`. |
 | `--model` | Model id — a config value, so a deprecation is a one-flag change. |
 | `--quality` / `--size` | Apply to the whole batch. |
+| `--input-fidelity` | `low` \| `high`. Reference fidelity (gpt-image-1 edits only). |
 | `--output` | Override `output_dir`. |
 | `--limit N` | Generate at most N images (smoke test). |
 | `--force` | Re-render images whose PNG already exists. |
@@ -114,11 +117,30 @@ and the rest of the pipeline stay identical. Local generation was benchmarked on
 the M4 Mini (2026-06-15) and shelved as a *someday*: ~10–11 min/image at
 dev-quality, not viable for production yet.
 
+## Model choice (settled by a live A/B on 2026-06-15)
+
+Counter-intuitively, the **deprecated** model is the right one for now:
+
+- **gpt-image-1 + `input_fidelity: high` — the production config through launch.**
+  In a same-prompt A/B on Scene 01, this was the only config that **held the
+  character**: solid black dot-eyes, chibi proportions, flat 2D style — matching
+  the locked reference. `input_fidelity: high` strictly preserves the look of the
+  reference PNGs. Cost ~$0.33/image at `medium`. Caveat: gpt-image-1 **sunsets
+  2026-12-01**, ~2 months past the Oct launch — so this is a *bridge*, not the end
+  state.
+- **gpt-image-2 — rejected for character work.** It does **not** support
+  `input_fidelity` (returns a 400), and without it the same prompt drifted off
+  model: realistic eyes instead of dots, normal instead of chibi proportions.
+  Cheaper (~$0.13) but it loses "Three." Fine only for character-free frames.
+- **Local Flux + "Three" LoRA — the permanent endgame.** A character LoRA locks
+  the look independent of OpenAI's model churn (which the gpt-image-1 sunset makes
+  a concrete risk). The Dec-2026 sunset is the natural deadline to have it built.
+
+The lesson that held: keep the model id (and now `input_fidelity`) as config
+values — this whole pivot was a manifest edit, not a code rewrite.
+
 ## Design notes
 
-- **gpt-image-2, not gpt-image-1.** gpt-image-1 was deprecated 2026-06-02 and
-  sunsets 2026-12-01. Same ChatGPT image lineage Steve prompts by hand, so the
-  character look carries over. Keeping the id in config is the lesson learned.
 - **Resumable by default.** A failed image doesn't kill the batch (per-image
   try/except); re-run to fill the gaps, `--force` to redo.
 - **Atomic writes.** Each PNG is written to a temp file and `os.replace`d into

@@ -40,11 +40,22 @@ from pathlib import Path
 VALID_PROVIDERS = ("openai", "flux")
 VALID_QUALITIES = ("low", "medium", "high", "auto")
 VALID_SIZES = ("1024x1024", "1536x1024", "1024x1536", "auto")
+VALID_FIDELITY = ("low", "high")
 
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-image-2"  # NOT gpt-image-1 (deprecated 2026-06-02, sunset 2026-12-01)
 DEFAULT_QUALITY = "medium"
 DEFAULT_SIZE = "1536x1024"  # 3:2 landscape, feeds the 1920x1080 video render
+# Reference fidelity for the edits endpoint. "high" preserves the character's
+# face/features/style from the reference PNGs far more strictly than the "low"
+# default — required to hold "Three"'s dot-eyes + chibi proportions. Costs more
+# image-input tokens. Ignored by the no-reference generate path.
+DEFAULT_INPUT_FIDELITY = "high"
+# input_fidelity is a gpt-image-1 parameter; gpt-image-2 rejects it with a 400
+# (verified live 2026-06-15). gpt-image-1 + high fidelity is the only config
+# tested that holds the character — but gpt-image-1 sunsets 2026-12-01, so this
+# is a launch bridge; the permanent answer is the local Flux + LoRA provider.
+MODELS_WITH_INPUT_FIDELITY = ("gpt-image-1",)
 
 # gpt-image token pricing, USD per 1M tokens. Approximate — verify against
 # OpenAI's pricing page. Kept here so a price change is a one-line edit.
@@ -124,10 +135,12 @@ def actual_cost(model: str, usage) -> float | None:
 # --- Provider: OpenAI gpt-image ---------------------------------------------
 
 
-def generate_openai(client, *, model, prompt, size, quality, ref_paths):
+def generate_openai(client, *, model, prompt, size, quality, ref_paths, input_fidelity):
     """Return (png_bytes, usage). Uses the edits endpoint when refs are given."""
     kwargs = dict(model=model, prompt=prompt, size=size, quality=quality, n=1)
     if ref_paths:
+        if model in MODELS_WITH_INPUT_FIDELITY:
+            kwargs["input_fidelity"] = input_fidelity
         handles = [open(p, "rb") for p in ref_paths]
         try:
             result = client.images.edit(image=handles, **kwargs)
@@ -163,6 +176,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", help="Override the model id (config value).")
     p.add_argument("--quality", choices=VALID_QUALITIES, help="Override quality for the whole batch.")
     p.add_argument("--size", choices=VALID_SIZES, help="Override size for the whole batch.")
+    p.add_argument("--input-fidelity", choices=VALID_FIDELITY, help="Reference fidelity (edits endpoint). 'high' holds the character.")
     p.add_argument("--output", help="Override the manifest's output_dir.")
     p.add_argument("--limit", type=int, help="Generate at most N images (smoke test).")
     p.add_argument("--force", action="store_true", help="Re-render images whose PNG already exists.")
@@ -190,6 +204,11 @@ def main() -> None:
     model = args.model or defaults.get("model", DEFAULT_MODEL)
     b_quality = args.quality or defaults.get("quality", DEFAULT_QUALITY)
     b_size = args.size or defaults.get("size", DEFAULT_SIZE)
+    b_fidelity = args.input_fidelity or defaults.get("input_fidelity", DEFAULT_INPUT_FIDELITY)
+    fidelity_active = model in MODELS_WITH_INPUT_FIDELITY
+    if b_fidelity == "high" and not fidelity_active:
+        print(f"note: {model} does not support input_fidelity — references will be "
+              f"loose hints, expect character drift (gpt-image-1 holds it).", file=sys.stderr)
 
     images = manifest.get("images")
     if not images:
@@ -213,7 +232,7 @@ def main() -> None:
         images = images[: args.limit]
 
     print(f"manifest : {manifest_path.name}  ({manifest.get('project', 'untitled')})")
-    print(f"provider : {provider}   model: {model}   quality: {b_quality}   size: {b_size}")
+    print(f"provider : {provider}   model: {model}   quality: {b_quality}   size: {b_size}   fidelity: {b_fidelity}")
     print(f"output   : {out_dir}")
     print(f"refs     : {len(ref_paths)} reference image(s)")
     print(f"images   : {len(images)}{'  (DRY RUN)' if args.dry_run else ''}\n")
@@ -265,7 +284,8 @@ def main() -> None:
             skipped += 1
             continue
 
-        tag = f"{quality}/{size}" + (f"/{len(these_refs)}ref" if these_refs else "/no-ref")
+        ref_tag = f"/{len(these_refs)}ref:{b_fidelity}" if fidelity_active else f"/{len(these_refs)}ref"
+        tag = f"{quality}/{size}" + (ref_tag if these_refs else "/no-ref")
         if args.dry_run:
             print(f"  + {name}  [{tag}]  ~${est:.3f}")
             continue
@@ -278,6 +298,7 @@ def main() -> None:
                 size=size,
                 quality=quality,
                 ref_paths=these_refs,
+                input_fidelity=b_fidelity,
             )
             fd, tmp = tempfile.mkstemp(suffix=".png", dir=out_dir)
             try:
