@@ -1,0 +1,33 @@
+{
+  "video": "Video_01_proof_30s",
+  "asset_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance",
+  "output_dir": "/tmp/3sk_proof",
+  "output_name": "Video_01_proof_30s",
+  "defaults": { "zoom": 1.10, "fit": "cover" },
+  "shots": [
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_01.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_01.mp3",
+      "start": 0.0, "end": 11.36,
+      "motion": "zoom_in",
+      "onscreen_label": "4 AM",
+      "caption_text": "It's 4 AM. You can't sleep. You open your bank app. The number is wrong. You make $74,000 a year. You should not be looking at $312."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_03.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_03.mp3",
+      "start": 0.0, "end": 10.0,
+      "motion": "pan_right",
+      "onscreen_label": "25",
+      "caption_text": "Meet Marcus. He's 25. Just landed his first real job — $74,000 a year as an operations analyst."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_08.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_08.mp3",
+      "start": 0.0, "end": 9.0,
+      "motion": "zoom_out",
+      "onscreen_label": "55",
+      "caption_text": "Year 30. They're 55. Salaries peaked around $215,000. The careers were, by any honest measure, identical."
+    }
+  ]
+}

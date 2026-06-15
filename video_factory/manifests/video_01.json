@@ -1,0 +1,89 @@
+{
+  "video": "Video_01_v2 (pilot, 12-image high-fidelity recut)",
+  "asset_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance",
+  "output_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Footage_and_Edits",
+  "output_name": "Video_01_v2",
+  "defaults": { "zoom": 1.10, "fit": "cover" },
+  "shots": [
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_01.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_01.mp3",
+      "motion": "zoom_in",
+      "onscreen_label": "4 AM",
+      "caption_text": "It's 4 AM. You can't sleep. You open your bank app. The number is wrong. You make $74,000 a year. You should not be looking at $312."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_02.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_02.mp3",
+      "motion": "pan_right",
+      "caption_text": "By the end of this video, you're going to see two versions of your life laid out side by side. Same salary. Same job. Same coffee shop you go to on Saturdays. The only difference between them is one number — what percentage of your paycheck you kept. Not earned. Kept. And I'll be straight with you up front: nothing in this video requires a raise, a side hustle, or luck. Just one decision, made once, and left alone."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_03.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_03.mp3",
+      "motion": "zoom_out",
+      "onscreen_label": "25",
+      "caption_text": "Meet Marcus. He's 25. Just landed his first real job — $74,000 a year as an operations analyst. After taxes, about $4,400 a month hits his checking account. First payday, he does the responsible thing. He opens his bank app and sets up an automatic transfer: 10% of his paycheck into savings. $440 a month, every month, without thinking about it. That's more than most people do. By the numbers, Marcus is ahead of half the country. Now meet Daniel. Same age. Same job, two floors up. Same apartment building. Same takeout spots on Friday night. On his first payday, he opens the same bank app. But he sets the transfer to 50%. $2,200 a month. Now — before you close this video — yes, that's extreme. Living on $2,200 a month means a smaller apartment, a used car, and a different relationship with restaurants. We'll get to whether it's worth it. That's the entire point of the next thirty years. Because from this day forward, neither of them ever touches that setting again. Two identical lives. One number different. Watch what it does."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_04.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_04.mp3",
+      "motion": "pan_left",
+      "onscreen_label": "26",
+      "caption_text": "Fast forward one year. Both are 26 now. Marcus has $5,280 in savings. Twelve months, $440 a month, exactly on schedule. He's got the couch he wanted, the car lease, takeout twice a week. His apartment looks like the one in the furniture catalog. Life is comfortable. Daniel has $26,400. His apartment is smaller. His car is a 2014 with a scratch on the bumper he never bothered to fix. He cooks most nights — got pretty good at it, actually. His friends give him a hard time about all of it. On the surface, this is the only year that looks how you'd expect. Daniel is winning by exactly the amount he sacrificed. Marcus is barely behind, and living better. If you stopped the clock right now, you'd pick Marcus's life. Most people do. But here's what's already happening that neither of them can see. Daniel's $26,400 didn't sit in a savings account. It went into an index fund — a single investment that buys a tiny slice of the five hundred biggest companies in America. No stock picking. No timing the market. Just the whole market, on autopilot. Pay attention to this year. It's the last year the math looks this simple."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_05.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_05.mp3",
+      "motion": "zoom_in",
+      "onscreen_label": "30",
+      "caption_text": "Year 5. Both are 30. Both got the same promotions, the same raises — they each make $96,000 now. Marcus has $32,000 saved. And credit where it's due — he even opened a Roth IRA last year. That's a retirement account where you pay taxes on the money now, so it grows and comes out completely tax-free later. He puts a little in when he remembers. He's proud of it. He should be. Again — ahead of most of the country. Daniel has $158,000. Let that sit for a second. Same job. Same raises. Five years. One of them has five times the other's money. But the gap in dollars isn't the real story. The real story is what happened inside Daniel's account this year. The market returned about 8%. Eight percent of $158,000 is roughly $12,600 — money his money made while he slept. For the first time, his investments earned more in a year than the average American saves in one. This is the line almost nobody notices themselves crossing: the day your money's earnings start to rival your own contributions. Before that line, you're the engine. After it, you have a second engine — and it never gets tired, never takes a sick day, and never asks for a raise. Daniel just got his. Marcus doesn't know the line exists."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_06.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_06.mp3",
+      "motion": "pan_right",
+      "onscreen_label": "35",
+      "caption_text": "Year 10. Both are 35. Both make $128,000 — they've stayed neck and neck at work this entire time. Same title. Same reviews. If you met them at a conference, you couldn't tell them apart. Marcus has $76,000 saved. And honestly? His life looks like success. A house in the suburbs — with a $410,000 mortgage. Two cars — one with a payment. Two kids he loves more than anything. Daycare that costs more than his college did. He's not broke. Let's be clear about that. He's not failing. He's just... tight. Every single month. The paycheck comes in, the paycheck goes out, and the gap between those two events keeps getting shorter. There's a specific kind of tired that comes from making good money and still feeling like you can't breathe. Marcus is that kind of tired. Daniel has $612,000 invested. This year, he paid cash for a modest two-bedroom condo. No mortgage. No car payment — same car, by the way, nine years running. And here's the number that changes the story: his investments now generate about $49,000 a year on their own. Forty-nine thousand dollars — a second income — and nobody works for it. When his daughter was born this spring, he dropped to four days a week. Didn't ask a budget for permission. Just did it. Same paycheck as Marcus, ten straight years. But Marcus's money buys things — and the things keep needing more money. Daniel's money buys freedom — and the freedom keeps paying him back. Ten years ago they were identical. Today, one of them owns his Fridays. That's not a metaphor. It's his calendar."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_07.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_07.mp3",
+      "motion": "zoom_out",
+      "onscreen_label": "45",
+      "caption_text": "Year 20. They're 45 now. Salaries have climbed to $180,000 each. Senior roles. Twenty years of showing up. Marcus has $194,000 saved. And on paper that sounds fine — until you do the retirement math. To retire at 65 on anything like his current lifestyle, Marcus needs north of a million and a half. At his pace, he won't get there. He's done the math on the back of an envelope twice, and stopped both times before the end. There are 13 years left on the mortgage. His oldest starts college in the fall — they're figuring out the loans this summer. Retirement isn't a plan anymore. It's a hope with a question mark on it. He's 45, exhausted on a Tuesday, sitting in a 2 PM meeting that could have been an email, doing a job he's good at and stopped feeling years ago — because the job is no longer optional. That's the part nobody warns you about. It's not the work that wears you down. It's the not having a choice. Daniel has $1.4 million. He works part-time. By choice — and that distinction is the entire video. He kept the parts of the job he liked — a consulting project here and there, the problems he finds interesting — and quietly dropped everything else. He walks his dog through the park in the middle of Tuesday afternoon, while the world is at work. Here's what's strange about seeing them side by side now: Daniel doesn't look rich. No watch. Same condo. He just looks... unhurried. That's the tell. Past a certain point, money stops showing up as stuff and starts showing up as calm. Twenty years ago, the only difference between these two men was a number in a banking app. One of them is now afraid of his sixties. The other one is planning them. And remember — Marcus did everything right by normal standards. Saved 10%. Opened the Roth. Never missed a payment on anything. Normal isn't broken because people are lazy. Normal is broken because nobody shows you this math at 25."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_08.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_08.mp3",
+      "motion": "pan_left",
+      "onscreen_label": "55",
+      "caption_text": "Year 30. They're 55. Salaries peaked around $215,000. The careers were, by any honest measure, identical. Marcus has $487,000. That's real money. It's also not enough — and he knows the number now, precisely, because he can't stop running it. To retire comfortably, he needs about $1.6 million. He has less than a third of that, ten working years left, and a body that's starting to vote against the commute. He's not retiring at 65. Maybe not at 70. Tonight he's at the kitchen table with a calculator and a stack of statements, doing the math again — as if the answer might be different this time. The number on his phone at 4 AM, thirty years ago, was $312. The feeling tonight is exactly the same. The balance has more digits now. The dread didn't move. Daniel has $3.2 million. He hasn't worked a full-time job in eight years. His money generates more in a typical year than his salary ever did. Tonight he's standing on a penthouse balcony — he finally did buy the view, once it cost him nothing he'd miss — watching the city at sunset, deciding between Portugal in September and Japan in October. That's the hardest decision on his calendar this month. Same salary, every single year, for thirty years. Same starting apartment. Same raises, same economy, same everything. The difference between these two balconies was never income. It was one automatic transfer, set up on one payday, by a 25-year-old who couldn't have told you what the S&P 500 was a month earlier. Thirty years of one decision. Now — the obvious objection. I can't save 50%. You're right. Hold that thought, because the next two minutes are the only part of this video that's actually about you."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_09.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_09.mp3",
+      "motion": "zoom_in",
+      "caption_text": "Here's the part nobody wants to hear — and it matters more than everything you just watched. You probably can't save 50% of your income right now. Most people can't. Rent is real. Kids are real. The grocery bill did not watch this video. But 50% was never the assignment. It's the edge of the map — it shows you what the territory looks like. The actual finding is this: every single percentage point you move your savings rate up buys back years of your future. Not months. Years. The difference between saving 10% and 15% of your income is the better part of a decade of working life. The gap between Marcus and Daniel was never fifty versus ten. It was the willingness to move the number at all."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_10.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_10.mp3",
+      "motion": "pan_right",
+      "caption_text": "So... this Sunday... not someday... Sunday... do one thing. Open your bank app. Find your automatic transfer. If you don't have one, you're about to be ahead of most people: set one up. Then move it one percent. That's it. If you save nothing, start at 5%. If you save 10%, make it 11. On a $74,000 salary, one percent is about $62 a month. You will not feel $62. I'm asking you to not feel it on purpose. Then put a reminder on your calendar for 60 days from today — and do it again. That's the whole system. The ladder, one rung at a time."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_11.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_11.mp3",
+      "motion": "zoom_in",
+      "fit": "contain",
+      "caption_text": "If you want the worksheet I built for this — it shows your real savings rate, and exactly how many years each 1% bump shaves off your timeline — it's free, in the description. No email needed for the basic version. If you want the full system — the bump schedule, the autopilot setup, the version Daniel would have handed his younger brother — drop your email and it's yours. Also free."
+    },
+    {
+      "image": "Raw_Assets/Video_01/Video_01_Scene_12.png",
+      "vo_clip": "Voice_Files/Video_01/Video_01_VO_Scene_12.mp3",
+      "motion": "zoom_out",
+      "caption_text": "Next video: same two lives — one twist. Daniel stops investing at 35. Not one more dollar. He just lets it ride. What that money does over the next twenty years broke me when I ran the numbers. Subscribe so you see it."
+    }
+  ]
+}

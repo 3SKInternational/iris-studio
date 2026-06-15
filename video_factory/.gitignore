@@ -1,0 +1,5 @@
+# Renders + caption sidecars never belong in the repo (they go to the vault /
+# Drive). Keep the engine, schema, and manifests tracked; ignore outputs.
+*.mp4
+*.mov
+*.srt
