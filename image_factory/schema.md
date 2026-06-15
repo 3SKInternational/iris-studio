@@ -1,0 +1,127 @@
+---
+date: 2026-06-15
+type: engineering-spec
+status: active
+component: Image Factory (scene-image batch generator)
+related:
+  - "[[schema]]"
+  - "[[2026-06-15_Video_Production_Pipeline]]"
+tags:
+  - engineering/video-factory
+---
+
+# Image-Manifest Schema + Generator Runbook
+
+The **image manifest** is the upstream sibling of the video factory's edit
+manifest. It decouples *prompts* (reviewable, diffable, regenerable) from
+*generation*: a human authors the manifest, `generate_images.py` renders one PNG
+per entry deterministically-ish through a swappable provider, and those PNGs
+become the `image` inputs the video factory's `assemble.py` then animates.
+
+One manifest = one video's still set. One **image** entry = one scene PNG.
+
+## Why a manifest (and not just the ChatGPT chat)
+
+Steve's hand workflow uploads the six "Three" reference PNGs into a fresh chat,
+pastes a style preamble once, then pastes each scene block. That works because a
+*chat* has memory. The image **API is stateless** — every call is independent —
+so the manifest re-supplies the memory on every call:
+
+- `style_preamble` is prepended to every image's prompt.
+- `reference_images` are re-sent with every reference-anchored image (via the
+  edits endpoint).
+
+That is what holds the character consistent across a batch without a human in
+the loop. This is the bridge to the V2 Flux + character-LoRA workflow, where the
+reference becomes a true programmatic input instead of a chat upload.
+
+## Running a batch
+
+```bash
+cd /Volumes/AI_Workspace/iris_studio/image_factory
+pip install -r requirements.txt                 # one-time: the openai client
+cp .env.example .env && chmod 600 .env          # one-time: add your OPENAI_API_KEY
+
+python3 generate_images.py manifests/video_01_images.json --dry-run   # plan + cost, no calls
+python3 generate_images.py manifests/video_01_images.json             # generate
+python3 generate_images.py manifests/video_01_images.json --limit 1   # smoke-test one
+python3 generate_images.py manifests/video_01_images.json --quality high --force
+```
+
+The API key is read from `OPENAI_API_KEY` (environment first, then a `.env` file
+next to the script). **Never put the key in the vault** — it's git-tracked +
+synced. Output: `<output_dir>/<name>.png` per image. Re-running **skips images
+whose PNG already exists** (resumable) unless `--force`.
+
+## Top-level fields
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `project` | no | `untitled` | Label, for humans. |
+| `output_dir` | no | manifest dir | Where PNGs are written. `~` expanded. |
+| `provider` | no | `openai` | Generation backend. `openai` (live) or `flux` (stub). |
+| `reference_dir` | no | manifest dir | Base dir for relative `reference_images`. `~` expanded. |
+| `reference_images` | no | `[]` | Character/style anchors re-sent with every ref-anchored image. |
+| `style_preamble` | no | `""` | Prepended to every image's prompt (the stateless-API "paste once"). |
+| `defaults` | no | `{}` | `model`, `quality`, `size` — see below. |
+| `images` | yes | — | Ordered list of image objects. |
+
+`defaults` keys: `model` (default `gpt-image-2`), `quality`
+(`low`|`medium`|`high`|`auto`, default `medium`), `size`
+(`1024x1024`|`1536x1024`|`1024x1536`|`auto`, default `1536x1024` — 3:2 landscape
+that feeds the 1920×1080 video render).
+
+## Image fields
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `name` | yes | — | Output basename (no extension). Match the video manifest's `image` names. |
+| `prompt` | yes | — | Scene description. `style_preamble` is prepended automatically. |
+| `quality` | no | `defaults.quality` | Per-image override. |
+| `size` | no | `defaults.size` | Per-image override. |
+| `use_references` | no | `true` | Set `false` for character-free scenes (e.g. a CTA card). |
+
+## CLI flags (all override the manifest)
+
+| Flag | Effect |
+|---|---|
+| `--provider` | `openai` \| `flux`. |
+| `--model` | Model id — a config value, so a deprecation is a one-flag change. |
+| `--quality` / `--size` | Apply to the whole batch. |
+| `--output` | Override `output_dir`. |
+| `--limit N` | Generate at most N images (smoke test). |
+| `--force` | Re-render images whose PNG already exists. |
+| `--dry-run` | Print the plan + a cost estimate; no API calls, no writes. |
+
+## Cost
+
+gpt-image is **token-priced** (text input + image input + image output tokens).
+`--dry-run` prints a rough estimate from a per-quality token table; a live run
+reads the **actual** cost back from each call's `usage` field and reports the
+billed total. Order-of-magnitude for the 12-shot Video 01 at `medium` + 5
+references: a few dollars. Drivers, biggest first: **quality** (`high` is ~4×
+`medium` output tokens), then the **per-image reference inputs**. The price table
+lives at the top of `generate_images.py` — a price change is a one-line edit.
+
+## Swapping providers
+
+`model`, `quality`, `size`, and `provider` are all config values; provider
+backends are functions in a `PROVIDERS` dict. The `flux` entry is a deliberate
+`NotImplementedError` stub. The planned swap — local Flux + a "Three" character
+LoRA for locked consistency, once channel revenue funds the GPU time — adds a
+`generate_flux()` body and (optionally) a new default model; the manifest format
+and the rest of the pipeline stay identical. Local generation was benchmarked on
+the M4 Mini (2026-06-15) and shelved as a *someday*: ~10–11 min/image at
+dev-quality, not viable for production yet.
+
+## Design notes
+
+- **gpt-image-2, not gpt-image-1.** gpt-image-1 was deprecated 2026-06-02 and
+  sunsets 2026-12-01. Same ChatGPT image lineage Steve prompts by hand, so the
+  character look carries over. Keeping the id in config is the lesson learned.
+- **Resumable by default.** A failed image doesn't kill the batch (per-image
+  try/except); re-run to fill the gaps, `--force` to redo.
+- **Atomic writes.** Each PNG is written to a temp file and `os.replace`d into
+  place, so an interrupted run never leaves a half-written image that the
+  skip-if-exists check would later trust.
+- **No vault secrets.** Key in `image_factory/.env` (chmod 600, gitignored).

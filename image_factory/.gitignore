@@ -1,0 +1,13 @@
+# Generated scene images go to the vault / Drive, never the repo.
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Secrets live here (chmod 600), never committed. The parent .gitignore already
+# ignores .env / .env.* — re-include the safe template so it stays tracked.
+!.env.example
+
+# Real manifests reference real output paths; keep only the example tracked.
+manifests/*.json
+!manifests/*.example.json

@@ -1,0 +1,69 @@
+{
+  "project": "Video_01",
+  "output_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Raw_Assets/Video_01",
+  "reference_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Character_Reference",
+  "reference_images": [
+    "Three_Reference_Sheet.png",
+    "Three_Age_Variations.png",
+    "Three_Wardrobe_Variations.png",
+    "Three_Formality_Variations.png",
+    "Three_Expressions.png"
+  ],
+  "style_preamble": "The attached images are the locked visual reference for a character named Three. The character MUST match these references exactly: same face, solid black dot eyes only (no iris, no whites, no highlights), same chibi proportions (oversized round head about one-third of total height, small compact torso, short stubby limbs), same flat 2D explainer-cartoon style — clean outlines, solid color fills, minimal flat shading. Do not drift toward realism, 3D, soft rendering, Pixar style, or detailed texture. Keep backgrounds to simple flat shapes with no surface texture or clutter. Hair is a smooth brushy cap, short and dark brown, no individual curls. Clean-shaven, no watch, no jewelry unless specified. Use the wardrobe, age, expression, and setting described below; keep everything else identical to the reference.",
+  "defaults": {
+    "model": "gpt-image-2",
+    "quality": "medium",
+    "size": "1536x1024"
+  },
+  "images": [
+    {
+      "name": "Video_01_Scene_01",
+      "prompt": "Three, age 25, sitting up in bed at 4:00 AM in a small apartment bedroom, plain fitted t-shirt, holding a phone close to his face looking at his bank app, expression of dread and stress. Lighting: flat stylized only. Cool blue glow from the phone on his face, warm glow from one nightstand lamp behind. Graphic, NOT realistic. Environment: simple flat shapes — bed, pillow, blanket, small nightstand with lamp. No clutter. Camera: low angle, slightly up from the foot of the bed. Hold the reference: dot eyes, chibi proportions, flat 2D. Minimal graphic shadows, no soft blur."
+    },
+    {
+      "name": "Video_01_Scene_02",
+      "prompt": "Three standing in the same dim bedroom, phone lowered, neutral. Flanked by two translucent ghostly versions of himself: LEFT in a gray hoodie looking tired; RIGHT in a charcoal suit with red tie looking confident. Render the ghosts as flat reduced-opacity silhouettes of the same chibi character. Lighting: flat stylized only. Cool blue ambient, faint warm edge on the suit figure. Graphic, NOT realistic. Environment: same bedroom, clean simple composition. Camera: medium, eye level, ghosts slightly behind and to each side. Hold the reference on ALL THREE figures: solid black dot eyes only (no whites), chibi proportions, flat 2D. Minimal graphic shadows."
+    },
+    {
+      "name": "Video_01_Scene_03",
+      "prompt": "Split-screen, identical on both sides. Three, age 25, casual t-shirt and jeans, standing in an apartment doorway looking at a phone showing a simple banking-app transfer screen. LEFT and RIGHT are the same character in the same pose and outfit — interchangeable. Lighting: flat stylized only. Neutral daylight from an offscreen window on both sides. Graphic, NOT realistic. Environment: two identical apartment doorways side by side, muted wallpaper, doormat, one wall light. Simple flat shapes. Camera: eye level, symmetrical split-screen. Hold the reference: identical face both sides, dot eyes, chibi proportions, flat 2D."
+    },
+    {
+      "name": "Video_01_Scene_04",
+      "prompt": "Split-screen. LEFT: Three, 26, relaxed and happy on a new matching couch in a furniture-catalog-looking apartment, eating takeout from a container, TV showing abstract color blocks. RIGHT: same Three, 26, calm and focused at a small dining table in a sparser apartment, eating a home-cooked plate, reading a paperback. Lighting: flat stylized only. Warm lamp glow left, neutral daylight right. Graphic. Environment: LEFT — couch, coffee table, TV, takeout, everything matching like a catalog. RIGHT — small table, single plate, book, mug, and a window showing a simple 2014-era car with a small bumper scratch outside. Simple flat shapes. Camera: symmetrical split-screen, eye level, medium-wide. On-screen age label: display the number 26 as a clean flat graphic in the top corner of each panel. Hold the reference: same chibi character both sides, dot eyes, flat 2D, no texture."
+    },
+    {
+      "name": "Video_01_Scene_05",
+      "prompt": "Split-screen. LEFT: Three, 30, at a noisy bar with friends shown only as faceless flat silhouettes, holding a beer, laughing, slightly distracted. RIGHT: same Three, 30, at a small home-office desk, smart-casual, laptop showing a rising green chart, calm and focused, small desk lamp. Lighting: flat stylized only. LEFT dim bar glow with flat neon accents; RIGHT warm desk lamp + cool screen light. Graphic, NOT realistic. Environment: LEFT bar counter, bottles as simple shapes, booth silhouettes. RIGHT desk, laptop, lamp, one plant. Simple flat shapes. Camera: medium-close each side, split-screen. On-screen age label: display the number 30 as a clean flat graphic in the top corner of each panel. Hold the reference: same chibi character both sides, dot eyes, flat 2D."
+    },
+    {
+      "name": "Video_01_Scene_06",
+      "prompt": "Split-screen. LEFT: Three, 35, casual home clothes, in a suburban kitchen holding a coffee mug, mild stress on his face. RIGHT: same Three, 35, business-casual dress shirt open collar, in a modest minimalist condo with a city view through a big window, reading on a couch with a simple bassinet beside him, relaxed weekday-off posture. Lighting: flat stylized only. LEFT warm overhead kitchen light; RIGHT cool morning daylight from the window, clean and bright. Graphic. Environment: keep backgrounds nearly empty. LEFT only a fridge, counter, mug — flat shapes, NO laundry basket, toys, or magnets. RIGHT only a couch, bassinet, window, one plant — flat shapes. Camera: medium-wide, symmetrical split-screen. On-screen age label: display the number 35 as a clean flat graphic in the top corner of each panel. Hold the reference STRICTLY: chibi proportions (keep the oversized head and compact body), solid black dot eyes on BOTH figures including the older one, flat 2D, no surface texture."
+    },
+    {
+      "name": "Video_01_Scene_07",
+      "prompt": "Split-screen. LEFT: Three, 45, slight gray at the temples, in a fluorescent-lit corporate cubicle looking at a laptop showing a video call as abstract tiles with no faces, exhausted, head in hand. RIGHT: same Three, 45, smart-casual button-up, walking his dog along a park path on a weekday afternoon, leash in hand, bare wrist (no watch), relaxed and unhurried. Lighting: flat stylized only. LEFT harsh flat fluorescent, cool blue tint; RIGHT warm afternoon daylight, flat cream and green. Graphic. Environment: keep backgrounds nearly empty. LEFT laptop, coffee cup, one low partition wall — flat shapes, no paper stacks. RIGHT a simple path, two or three flat tree shapes, and the dog as a SINGLE flat solid-color silhouette with simple dot eyes and NO fur texture. Camera: medium, eye level, split-screen. On-screen age label: display the number 45 as a clean flat graphic in the top corner of each panel. Hold the reference: chibi proportions both sides, dot eyes (dog too), flat 2D, no fur/fabric/surface texture."
+    },
+    {
+      "name": "Video_01_Scene_08",
+      "prompt": "Split-screen. LEFT: Three, 55, gray sprinkled through hair, in a modest kitchen at night, at a table with a calculator and a single stack of statements, quiet anxiety. RIGHT: same Three, 55, charcoal suit no tie, on a glass penthouse balcony at golden hour, back partially to camera, looking at a simplified skyline, holding a tablet showing two simple travel destination cards. Lighting: flat stylized only. LEFT single dim overhead kitchen light, cool desaturated; RIGHT warm amber sunset flat color wash. Graphic, NOT realistic. Environment: keep backgrounds nearly empty. LEFT table, calculator, ONE flat rectangular block for the statements (not individual papers), mug, one hanging lamp. RIGHT balcony railing, flat geometric skyline silhouette, tablet with two plain travel cards. Camera: medium-close each side. On-screen age label: display the number 55 as a clean flat graphic in the top corner of each panel. Hold the reference: chibi proportions both sides, dot eyes, flat 2D. Paper and money are plain flat blocks with no printed detail. No surface texture."
+    },
+    {
+      "name": "Video_01_Scene_09",
+      "prompt": "Three, 30s, casual, facing the camera directly, neutral expression, arms relaxed. Behind him a symbolic split: two flat cartoon paths — one leading to a small simple house shape, one leading to a glowing skyline shape. Lighting: flat stylized only. Neutral front key light on Three, muted tint left and warm tint right behind him. Graphic. Environment: Three centered, the fork rendered as flat simple shapes. Camera: medium-close, front-facing, eye level. Hold the reference: dot eyes, chibi proportions, flat 2D."
+    },
+    {
+      "name": "Video_01_Scene_10",
+      "prompt": "Three, current age, casual gray t-shirt, at a clean kitchen table on a sunny Sunday morning, laptop open, calm and focused, coffee mug beside him. Laptop screen shows a simplified banking-app UI with a transfer schedule. A phone propped beside it shows a simple 60-day calendar reminder notification. Lighting: flat stylized only. Warm morning daylight from an offscreen window. Clean and simple. Environment: single mug, laptop, phone with calendar reminder, one plant, window with a simple sunlight shape. Minimal. Camera: medium-wide, slight over-the-shoulder showing the laptop screen. Hold the reference: dot eyes, chibi proportions, flat 2D."
+    },
+    {
+      "name": "Video_01_Scene_11",
+      "use_references": false,
+      "prompt": "No character. A clean PDF mockup floating on a neutral dark-to-medium background, title \"The 50% Saver Worksheet\", showing a simple table of savings-rate scenarios, with a flat brand-red accent corner. Lighting: flat stylized only, simple flat glow around the mockup. Camera: straight-on, centered. Keep it flat 2D, clean and simplified, no realistic shading."
+    },
+    {
+      "name": "Video_01_Scene_12",
+      "prompt": "Three, 55, charcoal suit, on the penthouse balcony at sunset, back partially turned to camera, looking at a simplified skyline, calm contemplative posture. Compose so the right third of the frame is empty for an end-screen card. Lighting: flat stylized only. Warm amber flat wash, simple golden tones. Graphic, NOT realistic. Environment: balcony railing, simple flat skyline shapes, right third left clear. Camera: medium-wide, slight low angle from behind. Hold the reference: chibi proportions (keep the head-to-body ratio even from behind), flat 2D."
+    }
+  ]
+}
