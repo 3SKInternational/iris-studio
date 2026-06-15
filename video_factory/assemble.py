@@ -32,9 +32,12 @@ from pathlib import Path
 # ---- Fixed render constants (the locked template) -------------------------
 FPS = 30
 OUT_W, OUT_H = 1920, 1080
-# Ken Burns works on a high-res canvas so zoompan's integer stepping is
-# sub-pixel relative to the 1080p output -> smooth, jitter-free motion.
-CANVAS_W, CANVAS_H = 3840, 2160
+# Ken Burns works on a high-res canvas so zoompan's whole-pixel crop stepping is
+# sub-pixel relative to the 1080p output -> smooth, jitter-free motion. At 4x
+# output (7680) each 1px crop step is ~0.25 output px, below perceptible judder
+# even for very slow moves (the gentle 4% Ken Burns that exposed zoompan jitter
+# at 2x). Higher = smoother but slower; 4x is the sweet spot.
+CANVAS_W, CANVAS_H = 7680, 4320
 VIDEO_CODEC = ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
                "-pix_fmt", "yuv420p"]
 AUDIO_CODEC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
