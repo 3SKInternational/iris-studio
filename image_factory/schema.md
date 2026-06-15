@@ -139,6 +139,18 @@ Counter-intuitively, the **deprecated** model is the right one for now:
 The lesson that held: keep the model id (and now `input_fidelity`) as config
 values — this whole pivot was a manifest edit, not a code rewrite.
 
+## Cowork-Iris access (author-side bridge)
+
+Cowork-Iris can't see or run this tool — her filesystem connector is scoped to
+the vault and she has no shell. The division of labor: **Cowork authors a
+manifest** in the vault drop-folder
+`BRANDS/3SK_Finance/Raw_Assets/Image_Factory/manifests/`, **Claude Code (or
+Steve) runs** `generate_images.py <that-manifest>`, and the PNGs land back in
+the manifest's vault `output_dir` so Cowork can review them. The Cowork-facing
+guide + a `_TEMPLATE.json` + a copy of the example manifest live in that
+`Image_Factory/` folder. Execution is deliberately **kept manual** (not a
+watch-folder auto-runner) so every billed batch has a human cost gate.
+
 ## Design notes
 
 - **Resumable by default.** A failed image doesn't kill the batch (per-image
