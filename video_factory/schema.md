@@ -29,10 +29,18 @@ python3 assemble.py manifests/video_01.json --output /tmp/test.mp4
 python3 assemble.py manifests/proof_30s.json --keep-temp   # keep per-shot files
 ```
 
-Requires `ffmpeg` + `ffprobe` on PATH (`brew install ffmpeg`). No Python deps
-beyond the stdlib. Output: `<output_name>.mp4` (H.264 1080p, AAC stereo) plus a
-soft-CC `<output_name>.srt` sidecar next to it. Re-running on the same manifest
-produces the same video (deterministic).
+Requires `ffmpeg` + `ffprobe` (`brew install ffmpeg`). No Python deps beyond the
+stdlib. Output: `<output_name>.mp4` (H.264 1080p, AAC stereo) plus a soft-CC
+`<output_name>.srt` sidecar next to it. Re-running on the same manifest produces
+the same video (deterministic).
+
+**Binary resolution:** the engine picks its ffmpeg/ffprobe in this order —
+`$FFMPEG`/`$FFPROBE` env override → keg-only `/opt/homebrew/opt/ffmpeg-full/bin`
+→ PATH. The lean homebrew `ffmpeg` formula has **no `drawtext` filter** (it
+dropped libfreetype), so `onscreen_label` burn-in needs the fuller build:
+`brew install ffmpeg-full` (keg-only — does not shadow the PATH `ffmpeg`). The
+engine auto-prefers it. Without a drawtext-capable build, labels are skipped
+with a warning (captions are unaffected).
 
 ## Top-level fields
 
