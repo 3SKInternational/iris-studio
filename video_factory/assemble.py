@@ -123,7 +123,7 @@ def resolve_asset(asset_dir: Path, name: str, kind: str) -> Path:
 
 def build_shots(manifest: dict, asset_dir: Path) -> list[Shot]:
     defaults = manifest.get("defaults", {})
-    def_zoom = float(defaults.get("zoom", 1.10))
+    def_zoom = float(defaults.get("zoom", 1.04))
     def_fit = defaults.get("fit", "cover")
     shots_in = manifest.get("shots")
     if not shots_in:

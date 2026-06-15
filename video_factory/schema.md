@@ -45,8 +45,9 @@ produces the same video (deterministic).
 | `defaults` | no | `{}` | Per-shot defaults — see below. |
 | `shots` | yes | — | Ordered list of shot objects. Render order = list order. |
 
-`defaults` keys: `zoom` (float, default `1.10`), `fit` (`cover`|`contain`,
-default `cover`). Any shot can override.
+`defaults` keys: `zoom` (float, default `1.04` — a gentle ~4% move; raise for
+more dramatic Ken Burns), `fit` (`cover`|`contain`, default `cover`). Any shot
+can override.
 
 ## Shot fields
 
@@ -58,7 +59,7 @@ default `cover`). Any shot can override.
 | `end` | no | clip length | Seconds into `vo_clip` to stop (trim tail). |
 | `duration` | one of vo_clip / duration | — | For a **silent** shot (no VO): shot length in seconds. |
 | `motion` | no | `zoom_in` | Ken Burns move — see table. |
-| `zoom` | no | `defaults.zoom` | Zoom factor (e.g. `1.10` = 10%). Also the pan headroom. |
+| `zoom` | no | `defaults.zoom` | Zoom factor (e.g. `1.04` = 4%). Also the pan headroom — a pan glides across this much of the frame. |
 | `fit` | no | `defaults.fit` | `cover` (fill+crop) or `contain` (fit + blurred-fill bg). |
 | `caption_text` | no | `""` | Narration for this shot. Auto-chunked into soft SRT cues. SSML `<break/>` tags are stripped. |
 | `onscreen_label` | no | `""` | Short burned-in label (e.g. an age `"35"`). Requires a freetype/drawtext-enabled ffmpeg; skipped with a warning if unavailable. Captions are unaffected. |
@@ -94,7 +95,7 @@ move is sub-pixel smooth.
   "asset_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance",
   "output_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Footage_and_Edits",
   "output_name": "Video_01_v2",
-  "defaults": { "zoom": 1.10, "fit": "cover" },
+  "defaults": { "zoom": 1.04, "fit": "cover" },
   "shots": [
     {
       "image": "Raw_Assets/Video_01/Video_01_Scene_01.png",

@@ -3,7 +3,7 @@
   "asset_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance",
   "output_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Footage_and_Edits",
   "output_name": "Video_01_v2",
-  "defaults": { "zoom": 1.10, "fit": "cover" },
+  "defaults": { "zoom": 1.04, "fit": "cover" },
   "shots": [
     {
       "image": "Raw_Assets/Video_01/Video_01_Scene_01.png",
