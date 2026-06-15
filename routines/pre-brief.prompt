@@ -57,6 +57,23 @@ Perform these health checks and write findings into INBOX.md as a single "🌅 P
 
 15. **C2 consolidated "Stale on you" surface (Redesign Night 3 second half, added 2026-06-11).** Run: `python3 /Volumes/AI_Workspace/iris_studio/scripts/stale_on_you.py --write-inbox`. The script reads Decision_Queue open rows + INBOX TODAY/THIS WEEK list items, computes day-counts (using `/Users/steve/iris_studio/state/stale_on_you_seen.tsv` as the first-seen ledger), and idempotently rewrites the consolidated section between `<!-- C2_STALE_ON_YOU:BEGIN -->` / `<!-- C2_STALE_ON_YOU:END -->` markers at the top of INBOX.md (placed after the leading `---` separator, before `## 📌 TODAY`). Always runs, even on clean sweeps — the daily refresh IS the surface. Per the C2 spec, individual cadences (nightly + hygiene + automation-scan + the bridge file's per-session "Blocked on Steve / carried" list) should LINK to this section rather than re-flag the same items in their own voices — that's how the A-11-style triple-flagging gets killed. v1 limitations to be aware of (do NOT auto-fix here; flag for INBOX surgery via the next vault gardener fire): (a) the script captures all list items under `## 📌 TODAY` + `## 🧍 THIS WEEK` regardless of per-line 🧍 markers, so non-action items like "Beehiiv: free-plan scope DONE 6/11" (informational, past tense) and "Keep Cowork OPEN on the Mini" (standing) appear in the table — fix by moving them out of TODAY/THIS WEEK or prefixing with ✅/🔁; (b) closed-by-DQ items still in INBOX (e.g. "ElevenLabs voice test" — DQ-6 closed) appear — fix by INBOX cleanup at the next gardener pass. Read-only over Decision_Queue; only writes to INBOX (between markers) + the state TSV.
 
+16. **Cowork-liveness check via empty 4:10 gardener section (added 2026-06-15, pickup `06_CEO/Code_Pickups/2026-06-14_pre-brief-gardener-empty-alarm.md`).** Cowork's overnight jobs (nightly pulse 03:05 + vault gardener 04:10) only fire when the Cowork app is open on the Mini; scheduled fires queue silently when it's closed. The gardener is the load-bearing 04:10 ET signal — by 05:00 ET pre-brief, its section in today's daily note should be populated. If it's still empty/placeholder-only, Cowork was almost certainly closed overnight. Witnessed misses: 6/7, 6/8, 6/14. Run:
+    ```bash
+    DAILY="/Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/$(date +%F).md"
+    if [ -f "$DAILY" ]; then
+      GARDENER_BODY=$(awk '
+        /^## 🌿 Vault gardener/ { in_section=1; next }
+        in_section && /^## / { exit }
+        in_section { print }
+      ' "$DAILY" \
+        | grep -v '^_Written by the nightly' \
+        | grep -v '^[[:space:]]*$' \
+        | grep -v '^-[[:space:]]*$')
+      if [ -z "$GARDENER_BODY" ]; then echo "GARDENER_EMPTY"; fi
+    fi
+    ```
+    If the output is `GARDENER_EMPTY`, include exactly one line in today's INBOX pre-brief sweep subsection body (the one Pass 1 regenerates daily — fold this in, don't post-append): `⚠️ COWORK LIKELY CLOSED ON MINI OVERNIGHT — vault gardener (4:10 AM) did not fire; relaunch Cowork on the Mini and leave it open. Gardener catches up next 4:10 fire.` If the output is empty (gardener populated), note nothing — silent on clean nights. Read-only: never edit the daily note, never restart anything, never touch the gardener section itself. Strip discipline: only strip the standing italic placeholder line that starts `_Written by the nightly` (so a real gardener bullet that happens to contain the word "Written" still counts as content); strip blank lines and bare `-` bullets (the template seeds a bare bullet under the section). Anything else surviving in the section body counts as content, even if thin — the corroborating "overnight rollup" and "Cowork intra-day log" sections are NOT consulted (gardener-only per the pickup contract).
+
 **Output expectations:**
 - Write findings to INBOX.md. ONE subsection per sweep, dated.
 - If you find something fixable inline (e.g., MCP needs a re-add via `claude mcp add`), fix it and note "Auto-fixed: <thing>" in the findings.
