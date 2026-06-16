@@ -26,10 +26,19 @@ Usage:
   python3 build_video.py Video_01 --images        # author + generate images (billed)
   python3 build_video.py Video_01 --run           # all three stages, each skip-if-exists
   python3 build_video.py Video_01 --vo-source Voice_Files/Video_01  # assemble off an existing VO set
+  python3 build_video.py Video_01 --assemble --image-set Raw_Assets/Video_01_HD --vo-source Voice_Files/Video_01
 
 Billed stages (images, VO) NEVER run without their explicit flag (or --run);
 the default is a free dry plan. Each stage is independently runnable and
 resumable (skip-if-output-exists). Same inputs -> same manifests -> same video.
+
+Image-set names follow the shot list: each shot's frame is `<vid>_Shot_<id>.png`
+in the chosen image dir (`--image-set`, default `Raw_Assets/<vid>_gen`). Only when
+an explicit `--image-set` is given (a curated set where gaps are intentional) does
+a missing shot frame fall back — with a logged ⚠ note — to the locked north-star
+scene frame `Raw_Assets/<vid>/<vid>_Scene_NN.png` (e.g. the HD set reuses the north
+star for shot 01a). In the default `_gen` flow there is NO fallback: a missing
+frame hard-fails at assembly so a failed render can't silently become stills.
 """
 from __future__ import annotations
 
@@ -202,16 +211,48 @@ def author_image_manifest(shots: list[dict], vid: str, images_out: Path) -> dict
 _MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left", "pan_up", "pan_down"]
 
 
+def _resolve_image(asset_dir: Path, images_rel: str, vid: str,
+                   scene: int, sid: str, allow_fallback: bool) -> tuple[str, str | None]:
+    """Pick the vault-relative image path for a shot.
+
+    Prefer the chosen image set's `<vid>_Shot_<id>.png`. Only when assembling
+    from an explicit curated `--image-set` (`allow_fallback=True`) — where gaps
+    are intentional, e.g. the HD set reuses the north star for shot 01a — fall
+    back to the locked north-star scene frame `Raw_Assets/<vid>/<vid>_Scene_NN.png`.
+    In the default `_gen` flow fallback is OFF: a missing frame keeps the primary
+    path so the assembler hard-fails loudly (a failed render must not silently
+    become repeated stills). Returns (rel_path, fallback_note); note is None
+    unless a fallback was used.
+    """
+    primary = f"{images_rel}/{vid}_Shot_{sid}.png"
+    if (asset_dir / primary).is_file():
+        return primary, None
+    if allow_fallback:
+        north_star = f"Raw_Assets/{vid}/{vid}_Scene_{scene:02d}.png"
+        if (asset_dir / north_star).is_file():
+            return north_star, f"{vid}_Shot_{sid} absent from {images_rel} -> north-star {vid}_Scene_{scene:02d}.png"
+    return primary, None
+
+
 def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict[int, dict],
                          vid: str, asset_dir: Path, images_rel: str, vo_rel: str,
-                         output_dir: Path, output_name: str) -> tuple[dict, bool]:
-    """Author the video_factory edit manifest. Returns (manifest, all_vo_present)."""
+                         output_dir: Path, output_name: str,
+                         allow_image_fallback: bool = False) -> tuple[dict, bool, list[str]]:
+    """Author the video_factory edit manifest.
+
+    `allow_image_fallback` (set only for an explicit `--image-set`) lets a shot
+    missing from `images_rel` resolve to the locked north-star scene frame;
+    otherwise a missing frame is left as-is for the assembler to hard-fail on.
+    Returns (manifest, all_vo_present, image_fallbacks) — image_fallbacks lists
+    any shots that fell back (logged by the caller, never silent).
+    """
     by_scene: dict[int, list[dict]] = {}
     for s in shots:
         by_scene.setdefault(s["scene"], []).append(s)
 
     out_shots: list[dict] = []
     all_vo = True
+    fallbacks: list[str] = []
     mi = 0  # global motion index, for visual variety across the whole video
     for scene in sorted(by_scene):
         scene_shots = by_scene[scene]
@@ -228,8 +269,11 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         cum = 0.0  # cumulative fraction of the clip consumed by prior shots
         for i, s in enumerate(scene_shots):
             text, weight = cap_parts[i]
+            image_rel, fb = _resolve_image(asset_dir, images_rel, vid, scene, s["id"], allow_image_fallback)
+            if fb:
+                fallbacks.append(fb)
             shot: dict = {
-                "image": f"{images_rel}/{vid}_Shot_{s['id']}.png",
+                "image": image_rel,
                 "vo_clip": f"{vo_rel}/{vo_name}",
                 "motion": _MOTIONS[mi % len(_MOTIONS)],
                 "caption_text": text,
@@ -250,7 +294,7 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         "defaults": {"zoom": 1.04, "fit": "cover"},
         "shots": out_shots,
     }
-    return manifest, all_vo
+    return manifest, all_vo, fallbacks
 
 
 # --- engine invocation -----------------------------------------------------
@@ -275,6 +319,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--assemble", action="store_true", help="Run video_factory (free).")
     p.add_argument("--run", action="store_true", help="All three stages (images+vo+assemble).")
     p.add_argument("--vo-source", help="Vault-relative dir of existing VO mp3s to assemble from (e.g. Voice_Files/Video_01).")
+    p.add_argument("--image-set", help="Vault-relative dir of existing image PNGs to assemble from (e.g. Raw_Assets/Video_01_HD). Mutually exclusive with --images.")
     p.add_argument("--force", action="store_true", help="Pass --force to the billed stages (re-render existing).")
     return p.parse_args()
 
@@ -289,6 +334,9 @@ def main() -> None:
     if do_vo and args.vo_source:
         die("--vo writes to <video>_gen but --vo-source points assembly elsewhere; "
             "pick one (generate fresh, OR assemble from an existing set).")
+    if do_images and args.image_set:
+        die("--images writes to <video>_gen but --image-set points assembly at an existing set; "
+            "pick one (generate fresh, OR assemble from an existing set).")
 
     vid, nn = normalize_id(args.video)
     vlt = vault()
@@ -297,14 +345,20 @@ def main() -> None:
     if not shot_list.is_file():
         die(f"shot list not found: {shot_list}")
 
-    images_rel = f"Raw_Assets/{vid}_gen"
-    if args.vo_source:
-        if Path(args.vo_source).is_absolute():
-            die("--vo-source must be vault-relative (e.g. Voice_Files/Video_01), not an absolute path.")
-        vo_rel = args.vo_source.strip("/")
-    else:
-        vo_rel = f"Voice_Files/{vid}_gen"
-    images_out = vlt / images_rel
+    def _vault_rel(flag: str, raw: str) -> str:
+        """Validate a user dir is vault-relative and stays inside the vault."""
+        if Path(raw).is_absolute():
+            die(f"{flag} must be vault-relative, not an absolute path.")
+        rel = raw.strip("/")
+        if not (vlt / rel).resolve().is_relative_to(vlt):
+            die(f"{flag} escapes the vault ({raw!r}); must stay under {vlt}.")
+        return rel
+
+    images_rel = _vault_rel("--image-set", args.image_set) if args.image_set else f"Raw_Assets/{vid}_gen"
+    vo_rel = _vault_rel("--vo-source", args.vo_source) if args.vo_source else f"Voice_Files/{vid}_gen"
+    # Generation ALWAYS targets <vid>_gen — a curated `--image-set` is an input,
+    # never an output, so a stale image manifest can never overwrite it.
+    images_out = vlt / f"Raw_Assets/{vid}_gen"
     vo_out = vlt / f"Voice_Files/{vid}_gen"
 
     shots, cadence = parse_shot_list(shot_list)
@@ -337,19 +391,22 @@ def main() -> None:
     img_manifest_path = REPO / "image_factory" / "manifests" / f"{vid}_orchestrated.json"
     write_json(img_manifest_path, img_manifest)
 
-    edit_manifest, all_vo = author_edit_manifest(
+    edit_manifest, all_vo, fallbacks = author_edit_manifest(
         shots, cadence, kit, vid, vlt, images_rel, vo_rel,
         vlt / "Footage_and_Edits", f"{vid}_v2",
+        allow_image_fallback=bool(args.image_set),
     )
-    # Key the edit manifest by its VO source so the default (`_gen`) and a
-    # `--vo-source` run never overwrite each other's manifest. A flagless plan
-    # then can't silently break a working hand-VO assembly config (same inputs
-    # + same source -> same manifest path).
-    edit_manifest_path = REPO / "video_factory" / "manifests" / f"{vid}_orchestrated_{Path(vo_rel).name}.json"
+    # Key the edit manifest by BOTH its image set and its VO source so distinct
+    # asset combinations (e.g. `_gen`+`_gen` vs `Video_01_HD`+hand-VO) never
+    # overwrite each other's manifest. A flagless plan then can't silently break
+    # a working assembly config (same inputs + same sources -> same path).
+    edit_manifest_path = REPO / "video_factory" / "manifests" / f"{vid}_orchestrated_{Path(images_rel).name}_{Path(vo_rel).name}.json"
     write_json(edit_manifest_path, edit_manifest)
 
     print(f"\nauthored   : {img_manifest_path.relative_to(REPO)}  ({len(img_manifest['images'])} images)")
     print(f"authored   : {edit_manifest_path.relative_to(REPO)}  ({len(edit_manifest['shots'])} shots)")
+    for fb in fallbacks:
+        print(f"  ⚠ image fallback — {fb}")
     if not all_vo:
         print("  note: some VO clips not found yet — shot timing used the shot-list "
               "cadence table; it is re-probed exactly once the VO mp3s exist.")
@@ -385,10 +442,13 @@ def main() -> None:
         rc |= run(cmd, label="STAGE vo (billed)")
     if do_assemble:
         # Re-author the edit manifest now that VO clips should exist (exact durations).
-        edit_manifest, _ = author_edit_manifest(
+        edit_manifest, _, fallbacks = author_edit_manifest(
             shots, cadence, kit, vid, vlt, images_rel, vo_rel,
             vlt / "Footage_and_Edits", f"{vid}_v2",
+            allow_image_fallback=bool(args.image_set),
         )
+        for fb in fallbacks:
+            print(f"  ⚠ image fallback — {fb}")
         write_json(edit_manifest_path, edit_manifest)
         rc |= run([sys.executable, str(assembler), str(edit_manifest_path)], label="STAGE assemble (free)")
 
