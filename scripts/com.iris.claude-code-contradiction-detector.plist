@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-contradiction-detector</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh contradiction-detector /Volumes/AI_Workspace/iris_studio/routines/contradiction-detector.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-contradiction-detector.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-contradiction-detector.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Day</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>45</integer>
+	</dict>
+	<!-- Monthly on the 1st at 04:45 ET — after the 04:10 vault gardener and the
+	     04:15 credential-check, before the 05:00 pre-brief, so the day's first
+	     decision-bearing writes are settled. Like the gardener this pass reads
+	     many decision/design files at once (Decisions_Log + Designs + Preferences
+	     + Decision_Queue) and runs filesystem/obsidian MCP servers, so raise the
+	     soft file-descriptor limit above launchd's default 256 to avoid the
+	     "low max file descriptors" failure the gardener's real 04:10 fire hit. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>

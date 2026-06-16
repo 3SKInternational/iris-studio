@@ -74,6 +74,29 @@ Perform these health checks and write findings into INBOX.md as a single "🌅 P
     ```
     If the output is `GARDENER_EMPTY`, include exactly one line in today's INBOX pre-brief sweep subsection body (the one Pass 1 regenerates daily — fold this in, don't post-append): `⚠️ COWORK LIKELY CLOSED ON MINI OVERNIGHT — vault gardener (4:10 AM) did not fire; relaunch Cowork on the Mini and leave it open. Gardener catches up next 4:10 fire.` If the output is empty (gardener populated), note nothing — silent on clean nights. Read-only: never edit the daily note, never restart anything, never touch the gardener section itself. Strip discipline: only strip the standing italic placeholder line that starts `_Written by the nightly` (so a real gardener bullet that happens to contain the word "Written" still counts as content); strip blank lines and bare `-` bullets (the template seeds a bare bullet under the section). Anything else surviving in the section body counts as content, even if thin — the corroborating "overnight rollup" and "Cowork intra-day log" sections are NOT consulted (gardener-only per the pickup contract).
 
+17. **Nightly value-pulse liveness (added 2026-06-16).** The Cowork nightly value-pulse (fires ~12:35 AM ET) is the OTHER app-open-dependent Cowork job, and like the gardener it can silently skip when the app is closed. Unlike the gardener it does NOT own a dedicated daily-note heading (it writes into the shared `## 🌅 Overnight` section), so emptiness there can't detect it. Its OWN distinct artifacts are: (a) a session digest at `_Iris_Memory/Sessions/YYYY-MM-DD_*Nightly_Value_Pulse*.md` carrying today's date, and (b) a "value pulse fired …" marker line in today's daily note. Detect a miss, but DON'T double-flag the Cowork-closed case Pass 16 already owns:
+    ```bash
+    DAILY="/Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/$(date +%F).md"
+    SESS="/Users/steve/Documents/3SK/outputs/_Iris_Memory/Sessions"
+    TODAY="$(date +%F)"
+    PULSE_DIGEST=$(ls "$SESS/${TODAY}"*[Nn]ightly_[Vv]alue_[Pp]ulse*.md 2>/dev/null | head -1)
+    PULSE_LINE=""
+    [ -f "$DAILY" ] && PULSE_LINE=$(grep -iE "value[ _-]?pulse fired|Nightly[ _]Value[ _]Pulse" "$DAILY" | head -1)
+    GARDENER_BODY=""
+    if [ -f "$DAILY" ]; then
+      GARDENER_BODY=$(awk '/^## 🌿 Vault gardener/{f=1;next} f&&/^## /{exit} f{print}' "$DAILY" \
+        | grep -v '^_Written by the nightly' | grep -v '^[[:space:]]*$' | grep -v '^-[[:space:]]*$')
+    fi
+    if [ -z "$PULSE_DIGEST" ] && [ -z "$PULSE_LINE" ]; then
+      if [ -n "$GARDENER_BODY" ]; then echo "PULSE_MISSING_INDEPENDENT"; else echo "PULSE_MISSING_COWORK_CLOSED"; fi
+    fi
+    ```
+    Act on the output:
+    - `PULSE_MISSING_INDEPENDENT` → Cowork WAS up overnight (the gardener populated its section) but the value-pulse specifically left no digest and no daily-note marker. That's an independent miss the gardener check can't see — the pulse task may be disabled, errored, or the app opened after 12:35. Add exactly one line to today's INBOX pre-brief sweep subsection body (the one Pass 1 regenerates — fold in, don't post-append): `⚠️ NIGHTLY VALUE-PULSE DID NOT LOG (gardener ran, so Cowork was up) — check the pulse task is enabled in Cowork and didn't error; expected a digest at _Iris_Memory/Sessions/<today>_*Nightly_Value_Pulse*.md.`
+    - `PULSE_MISSING_COWORK_CLOSED` → the value-pulse also missed, but Pass 16 already flagged "Cowork likely closed overnight" which is the same root cause — do NOT add a second line (no double-flagging, per the C2 anti-triple-flag philosophy). Pass 16's line covers it.
+    - empty output → the pulse logged; note nothing (silent on healthy nights).
+    Read-only: never edit the daily note, the digest, or restart anything. (If Steve later RETIRES the Cowork value-pulse — the audit `2026-06-16_Scheduled_Task_Overlap_Audit.md` notes he may once it's redundant — delete this Pass 17 so it doesn't false-alarm daily.)
+
 **Output expectations:**
 - Write findings to INBOX.md. ONE subsection per sweep, dated.
 - If you find something fixable inline (e.g., MCP needs a re-add via `claude mcp add`), fix it and note "Auto-fixed: <thing>" in the findings.

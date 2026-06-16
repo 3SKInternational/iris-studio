@@ -203,6 +203,23 @@ QUICK_CAPTURE_PREFIXES = (
     "MILESTONE:", "STATEMENT:", "IDEA:", "QUESTION:", "FEEDBACK:",
 )
 
+# --- Second-brain quick-capture (2026-06-16) ---
+# The personal Zettelkasten ("second brain") lives at the PARENT of WORKSPACE_DIR:
+# /Users/steve/Documents/3SK/  (folders "00 - INBOX" … "08 - REFERENCES").
+# It was built, scheduled, and never fed — because capture required opening
+# Obsidian. This bridge lets Steve text `BRAIN: <thought>` (or `NOTE:`) on
+# Telegram and have it land as a friction-free, timestamped capture note in the
+# second brain's "00 - INBOX/", structured with the vault's capture-template
+# scaffold so the nightly inbox-processor can route it. This is the keystone
+# that "turns the water on" for the whole second-brain pipeline. It is handled
+# as a dedicated fast-path (no model call, instant ack) and deliberately does
+# NOT touch the business vault's TELEGRAM_CAPTURE.md (different vault, different
+# routing owner). The prefix is matched case-insensitively, longest-first, and
+# is checked BEFORE the business Quick-Capture prefixes so it can't be shadowed.
+SECOND_BRAIN_DIR = Path("/Users/steve/Documents/3SK")
+SECOND_BRAIN_INBOX = SECOND_BRAIN_DIR / "00 - INBOX"
+SECOND_BRAIN_PREFIXES = ("BRAIN:", "NOTE:", "ZK:")
+
 # A4 (Redesign Night 4, 2026-06-13) — Telegram receipt-photo auto-routing.
 # When Steve sends a photo on Telegram with a `RECEIPT:` caption, the daemon
 # (a) downloads the photo to `02_Finance/Receipts/` for the audit trail,
@@ -347,6 +364,18 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 600,  # 10 min — Gmail scan + categorize + draft write
         "deliverable_dir": "02_Finance/Expense_Tracker_Drafts",
     },
+    # --- Added 2026-06-16: the Decision Feeder (founder's highest-leverage workflow) ---
+    # Scans BOTH the business vault (cwd) AND the personal second-brain Zettelkasten
+    # (granted via extra_add_dirs below — it lives at the PARENT of WORKSPACE_DIR) for
+    # every note bearing on a decision, then writes a DECISION BRIEF. Fires on demand
+    # via `/decision <q>` + the `decision-feeder-deadline-watch` daily auto-fire.
+    "decision-feeder": {
+        "timeout_seconds": 900,  # 15 min — two-vault wide grep + synthesis + brief write
+        "deliverable_dir": "06_CEO/Decision_Briefs",
+        # Grant read of the whole 3SK tree (parent of WORKSPACE_DIR) so the agent can
+        # reach the second brain at /Users/steve/Documents/3SK/ "02 - PERMANENT/" etc.
+        "extra_add_dirs": ["/Users/steve/Documents/3SK"],
+    },
     # The 4 engineering agents (senior-systems-architect, senior-engineer,
     # skeptical-code-reviewer, performance-optimizer) are deliberately NOT in this
     # enum yet — their target is a codebase (typically /Volumes/AI_Workspace/iris_studio/),
@@ -440,6 +469,29 @@ AUTONOMOUS_DISPATCHES: list[dict] = [
             "stdout: what was scanned, top finding, next rotation item."
         ),
     },
+    {
+        "name": "decision-feeder-deadline-watch",
+        "agent_name": "decision-feeder",
+        # daily 03:40 ET — between Cowork's 03:05 pulse and the 04:10 gardener, so a
+        # near-deadline decision gets its evidence brief in place before the morning
+        # brief. Conditional/skip-on-empty: the prompt makes the agent FIRST check
+        # for 💰/📤/⚖️ rows within 2 days of deadline (without a fresh brief) and exit
+        # cheaply if there are none — so most days this is a no-op, not a burn.
+        "trigger_kwargs": {"hour": 3, "minute": 40},
+        "prompt": (
+            "Mode B — deadline-watch auto-fire. Run the skip-or-work gate FIRST: read "
+            "06_CEO/Decision_Queue.md, find every OPEN row classed 💰 / 📤 / ⚖️ (never "
+            "AUTO, never 🎨) whose deadline is within the next 2 days (or, if no explicit "
+            "deadline, days-pending ≥ 5). For each, skip it if a brief from the last 7 "
+            "days already exists in 06_CEO/Decision_Briefs/ matching its slug. If NOTHING "
+            "qualifies after both filters, output exactly 'No near-deadline decisions "
+            "without a brief — skipping.' and exit WITHOUT writing any file. Otherwise "
+            "build a DECISION BRIEF for each qualifying row (cap 3), scanning BOTH the "
+            "business vault and the personal second brain, and additively link each brief "
+            "from its Decision_Queue row. Return a short stdout summary of what you briefed "
+            "or the skip line."
+        ),
+    },
 ]
 # Max simultaneous subagent subprocesses (asyncio semaphore). A request beyond
 # this still gets a dispatch_id but waits for a free slot (reported as queued).
@@ -486,6 +538,11 @@ Available subagents (agent_name -> what it does):
   Expense_Tracker rows with Schedule C categorization (draft only — Steve approves
   via `/approve <run-id>`). Runs daily 09:00 ET automatically; dispatch on demand
   for backfills with a `since` date. ~10 min.
+- `decision-feeder` — the founder's Decision Feeder: scans BOTH the business vault
+  AND Steve's personal second brain for every note bearing on a decision, then writes
+  a DECISION BRIEF (evidence for/against/nuance + the gaps to fill). Dispatch when
+  Steve wants the full picture his own notes hold before a real call ("brief me on
+  the ESP decision"). He can also trigger it directly with `/decision <q>`. ~15 min.
 
 When you dispatch:
 1. Call `dispatch_subagent` with agent_name, a clear self-contained prompt, and
@@ -736,6 +793,82 @@ async def save_quick_capture(prefix: str, raw_text: str, user_id: int, username:
     except Exception as exc:
         logger.warning(f"Quick Capture save failed: {exc}. Reply continues normally.")
         return False
+
+
+def _detect_brain_capture(text: str) -> str | None:
+    """If text starts with a second-brain capture prefix (BRAIN:/NOTE:/ZK:),
+    return the matched prefix uppercased; else None. Checked BEFORE the business
+    Quick-Capture prefixes so a second-brain thought is never shadowed."""
+    upper = text.strip().upper()
+    for prefix in SECOND_BRAIN_PREFIXES:
+        if upper.startswith(prefix):
+            return prefix
+    return None
+
+
+def _save_brain_capture_sync(prefix: str, raw_text: str, user_id: int, username: str, ts: datetime) -> str:
+    """Write a friction-free capture note into the second brain's '00 - INBOX/'.
+    Uses the vault's capture-template scaffold so the nightly inbox-processor can
+    route it. Returns the absolute path written. Raises on filesystem error."""
+    stripped = raw_text.strip()
+    content = stripped[len(prefix):].strip() if stripped.upper().startswith(prefix) else stripped
+    if not content:
+        content = "(empty capture)"
+
+    first_line = content.splitlines()[0].strip()
+    slug_source = first_line[:60] or "untitled"
+    slug = re.sub(r"[^a-z0-9]+", "_", slug_source.lower()).strip("_")[:40] or "untitled"
+    date_str = ts.strftime("%Y-%m-%d")
+    time_str = ts.strftime("%H%M%S")
+
+    SECOND_BRAIN_INBOX.mkdir(parents=True, exist_ok=True)
+    dest = SECOND_BRAIN_INBOX / f"{date_str}_{time_str}_{slug}.md"
+    # Guard against a same-second + same-first-line collision silently overwriting
+    # an earlier capture (write_text truncates). Effectively unreachable for a human
+    # typist, but cheap insurance — append a short uuid so both notes survive.
+    if dest.exists():
+        dest = SECOND_BRAIN_INBOX / f"{date_str}_{time_str}_{slug}_{uuid.uuid4().hex[:4]}.md"
+    # Capture-template scaffold (07 - SYSTEM/templates/capture.md). The structured
+    # lines are left blank for Steve/the inbox-processor — they're optional and the
+    # processor honors any that get filled. Title = the first line of the thought.
+    body = (
+        "---\n"
+        "type: capture\n"
+        f"created: \"{date_str}\"\n"
+        "captured_via: telegram-brain-capture\n"
+        f"captured_by: \"@{username} (id={user_id})\"\n"
+        "status: inbox\n"
+        "---\n\n"
+        f"# {first_line[:80]}\n\n"
+        f"{content}\n\n"
+        "---\n"
+        "**CONNECTS TO:** \n"
+        "**MIGHT USE FOR:** \n"
+        "**RAISES THE QUESTION:** \n"
+        "**COULD APPLY TO / ACTION IF TRUE:** \n\n"
+        f"<!-- Captured friction-free from Telegram at {ts.strftime('%Y-%m-%d %H:%M:%S')} ET. "
+        "The nightly second-brain inbox-processor triages this against the Four Uses and routes it. -->\n"
+    )
+    dest.write_text(body, encoding="utf-8")
+    return str(dest)
+
+
+async def save_brain_capture(prefix: str, raw_text: str, user_id: int, username: str) -> str | None:
+    """Async wrapper for the second-brain capture write. Returns the vault-relative
+    path (under SECOND_BRAIN_DIR) on success, else None. Best-effort — logged + swallowed."""
+    try:
+        loop = asyncio.get_event_loop()
+        ts = datetime.now()
+        dest = await loop.run_in_executor(
+            None,
+            lambda: _save_brain_capture_sync(prefix, raw_text, user_id, username, ts),
+        )
+        rel = str(Path(dest).relative_to(SECOND_BRAIN_DIR))
+        logger.info(f"Second-brain capture saved: prefix={prefix} -> {rel} from @{username}")
+        return rel
+    except Exception as exc:
+        logger.warning(f"Second-brain capture failed for {prefix}: {exc}. Reply continues normally.")
+        return None
 
 
 # A-1: Quick Capture routing — when a markdown-safe prefix arrives, route the
@@ -2373,16 +2506,23 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes,
                 )
                 return
 
-            timeout = DISPATCH_AGENTS[agent_name]["timeout_seconds"]
+            _cfg = DISPATCH_AGENTS[agent_name]
+            timeout = _cfg["timeout_seconds"]
+            # Per-agent extra working dirs (e.g. decision-feeder needs read of the
+            # second-brain vault, which lives outside WORKSPACE_DIR). Each extra dir
+            # adds another `--add-dir`. Default [] = identical to prior behavior.
+            _add_dir_args: list[str] = ["--add-dir", str(WORKSPACE_DIR)]
+            for _extra in _cfg.get("extra_add_dirs", []):
+                _add_dir_args += ["--add-dir", str(_extra)]
             logger.info(
                 f"Dispatch {d_id}: spawning {agent_name} via {CLAUDE_CLI_PATH} "
-                f"(timeout {timeout}s)"
+                f"(timeout {timeout}s, add-dirs={_add_dir_args[1::2]})"
             )
             proc = await asyncio.create_subprocess_exec(
                 CLAUDE_CLI_PATH,
                 "--print",
                 "--agent", agent_name,
-                "--add-dir", str(WORKSPACE_DIR),
+                *_add_dir_args,
                 "--dangerously-skip-permissions",
                 "--", prompt,
                 cwd=str(WORKSPACE_DIR),
@@ -3562,6 +3702,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_approve_command(update, chat_id, run_id)
         return
 
+    # Second-brain capture (2026-06-16): `BRAIN: <thought>` (or NOTE:/ZK:) lands
+    # a friction-free, timestamped note in the personal Zettelkasten's "00 - INBOX/"
+    # for the nightly inbox-processor to triage. Dedicated fast-path: instant ack,
+    # NO model call, and does not touch the business vault. Checked before the
+    # business Quick-Capture prefixes so a second-brain thought can't be shadowed.
+    brain_prefix = _detect_brain_capture(text)
+    if brain_prefix:
+        rel = await save_brain_capture(brain_prefix, text, user_id, username)
+        if rel:
+            await update.message.reply_text(
+                f"🧠 Captured to your second brain → `{rel}`.\n"
+                "The nightly inbox-processor will triage + file it."
+            )
+            logger.info(f"To @{username} (brain-capture): saved {rel}")
+        else:
+            await update.message.reply_text(
+                "🧠 Couldn't write the capture to the second-brain inbox (see daemon logs). "
+                "Your message wasn't filed — try again or capture manually."
+            )
+        return
+
+    # Decision Feeder (2026-06-16): `/decision <decision>` dispatches the
+    # decision-feeder subagent, which scans BOTH the business vault AND the
+    # personal second brain for every note bearing on the decision and writes a
+    # DECISION BRIEF to 06_CEO/Decision_Briefs/. (Also reachable via
+    # `/agent decision-feeder <prompt>` and the cloud model's dispatcher.)
+    if stripped_text.lower().startswith(("/decision ", "!decision ")):
+        query = stripped_text[len("/decision "):].strip()
+        if not query:
+            await update.message.reply_text(
+                "Usage: /decision <the decision to brief>\n"
+                "e.g. /decision which ESP to pick\n"
+                "I'll scan both vaults and write a decision brief to "
+                "06_CEO/Decision_Briefs/, then send the summary here."
+            )
+            return
+        expected = DISPATCH_AGENTS["decision-feeder"]["timeout_seconds"] // 60
+        df_prompt = (
+            "Mode A — on-demand single decision. Build a DECISION BRIEF for this "
+            f"decision: {query}"
+        )
+        result = await _start_dispatch("decision-feeder", df_prompt, chat_id, expected)
+        logger.info(f"From @{username} (/decision): dispatch {result['dispatch_id']} for {query!r}")
+        await update.message.reply_text(
+            f"🧭 Feeding the decision: \"{query}\". Scanning both vaults "
+            f"(dispatch {result['dispatch_id']}); I'll send the brief summary here when it's done."
+        )
+        return
+
     # Quick Capture bridge: if message starts with RECEIPT/DECISION/etc.,
     # append the raw text to TELEGRAM_CAPTURE.md. Continue to model for a
     # natural acknowledgement reply. Save is best-effort — a failure here
@@ -3704,6 +3893,14 @@ def main() -> None:
     )
     logger.info(
         f"Quick Capture bridge: ENABLED. Prefixes {QUICK_CAPTURE_PREFIXES} append to {QUICK_CAPTURE_FILE} for Cowork-Iris routing."
+    )
+    logger.info(
+        f"Second-brain capture: ENABLED. Prefixes {SECOND_BRAIN_PREFIXES} write a timestamped "
+        f"capture note into {SECOND_BRAIN_INBOX} for the nightly inbox-processor (fast-path, no model call)."
+    )
+    logger.info(
+        "Decision Feeder: ENABLED. '/decision <q>' (or /agent decision-feeder) scans both vaults → "
+        "06_CEO/Decision_Briefs/; daily 03:40 ET deadline-watch auto-fires for near-deadline 💰/📤/⚖️ rows (skip-on-empty)."
     )
     logger.info(
         f"A4 receipt-photo capture: ENABLED. Photos with a `RECEIPT:` "
