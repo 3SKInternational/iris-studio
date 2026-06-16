@@ -1,1 +1,11 @@
 Read /Users/steve/Documents/3SK/outputs/06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md and execute tonight's engineering work per the Work Queue. Append your session summary to /Users/steve/Documents/3SK/outputs/_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md per the Communication Protocol section. Do not duplicate any item Cowork's nightly pulse has already completed (check the Build Queue file).
+
+---
+
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — every step finished, nothing skipped/blocked/partial.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — anything was skipped, blocked, deferred, or failed.
+
+Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.

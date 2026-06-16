@@ -69,3 +69,14 @@ Look for: empty folders, `.DS_Store`, zero-byte or placeholder README stubs that
 - Auto-refresh is ONE-WAY vault→Drive only — never overwrite a Drive copy newer than its vault source.
 - Never delete anything outside the curated `3SK International` folder.
 - When in doubt on filing or pruning, FLAG don't guess.
+
+
+---
+
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — every step finished, nothing skipped/blocked/partial.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — anything was skipped, blocked, deferred, or failed.
+
+Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.

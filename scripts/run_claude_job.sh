@@ -54,11 +54,50 @@ fi
 PROMPT="$(cat "$PROMPT_FILE")"
 cd "$VAULT"
 
-"$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG"
+# Capture THIS run's output in isolation (RUN_OUT) while still appending to the
+# cumulative LOG, so we can read just this run's last line for the completion
+# sentinel each routine prompt is instructed to emit.
+RUN_OUT="$(mktemp -t "claude-job-${JOB}.XXXXXX")"
+trap 'rm -f "$RUN_OUT"' EXIT
+
+"$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG" | tee "$RUN_OUT" >/dev/null
 rc=${PIPESTATUS[0]}
 
+# 1) Process died / non-zero exit → hard failure.
 if [ "$rc" -ne 0 ]; then
-    fail "$rc" "exit code $rc"
+    fail "$rc" "exit code $rc (process died / non-zero)"
 fi
 
-echo "run_claude_job: '${JOB}' completed ok at $(date '+%Y-%m-%d %H:%M %Z')" >> "$LOG"
+# 2) Exit 0 — classify how it finished from the sentinel on the last non-empty line.
+#    ROUTINE_COMPLETE → fully done; ROUTINE_INCOMPLETE: <reason> → partial;
+#    neither → ran but completion unconfirmed (treat as not-fully-done).
+# Normalize first: strip CR (CRLF output) and ANSI color codes, then trim
+# surrounding whitespace, so the sentinel match is exact and the reason is clean.
+# NOTE: this script must NOT use `set -e` — the grep below returns 1 on no-match
+# (empty output), which under -e would silently abort and skip the alert.
+LAST_LINE="$(grep -vE '^[[:space:]]*$' "$RUN_OUT" | tail -1 \
+    | tr -d '\r' \
+    | sed -e $'s/\033\\[[0-9;]*m//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+TS="$(date '+%Y-%m-%d %H:%M %Z')"
+
+# Anchor the sentinel to the START of the (normalized) last line so prose that
+# merely mentions the token (e.g. "I will not print ROUTINE_COMPLETE") can't
+# trigger a false ✅. INCOMPLETE is checked first because it is a prefix of
+# COMPLETE's substring — ordering is load-bearing.
+case "$LAST_LINE" in
+    ROUTINE_INCOMPLETE*)
+        REASON="$(printf '%s' "$LAST_LINE" | sed 's/^ROUTINE_INCOMPLETE:*[[:space:]]*//')"
+        alert "⚠️ launchd job '${JOB}' ran but is NOT fully done.
+Time: ${TS}
+Reason: ${REASON:-(none given)}"
+        echo "run_claude_job: '${JOB}' INCOMPLETE at ${TS}" >> "$LOG"
+        ;;
+    ROUTINE_COMPLETE)
+        alert "✅ launchd job '${JOB}' completed at $(date '+%H:%M %Z')."
+        echo "run_claude_job: '${JOB}' completed ok at ${TS}" >> "$LOG"
+        ;;
+    *)
+        alert "⚠️ launchd job '${JOB}' finished (exit 0) but emitted no completion signal — may not be fully done. Check the log."
+        echo "run_claude_job: '${JOB}' completed WITHOUT sentinel at ${TS}" >> "$LOG"
+        ;;
+esac

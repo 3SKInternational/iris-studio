@@ -49,3 +49,14 @@ Perform these four passes:
 **Hard ban on building.** This routine surfaces + ranks only. No code changes, no plist deploys, no daemon edits. Builds happen in the nightly engineering routine — either after Steve ✅s a candidate via Telegram or in-session, OR (per the 2026-06-01 escalation rule) when an `auto-build-eligible: true` tagged item ages past 4 days without 🔴.
 
 **C2 cross-cadence rule (Redesign Night 4, 2026-06-12).** The C2 stale-on-you block in `INBOX.md` (between `<!-- C2_STALE_ON_YOU:BEGIN -->` markers, refreshed by pre-brief Pass 15) is the single canonical "awaiting Steve" surface. When this routine's session digest narrates pending Steve-call items: if the item is already a DQ row, reference DQ-N by id (one line) and let the C2 surface carry the day-counter — do NOT re-list with a fresh per-cadence day-count or unlock-value rationale. New Steve-call candidates this routine promotes land as DQ rows (per Pass 3) and join the C2 surface automatically at next 05:00 ET; the routine's own digest should not duplicate the same surface in narrative form. Pre-brief verifies the surface freshness; this routine writes new entries to it; hygiene references it. Three cadences, one canonical surface.
+
+
+---
+
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — every step finished, nothing skipped/blocked/partial.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — anything was skipped, blocked, deferred, or failed.
+
+Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.
