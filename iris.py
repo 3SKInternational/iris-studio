@@ -173,6 +173,10 @@ BLUEPRINT_FILE = WORKSPACE_DIR / "_MAP" / "Iris_Operator_Blueprint.md"
 # Local tier keeps the trimmed TIER1 prompt — 70KB of context wastes Llama 8B.
 INBOX_FILE = WORKSPACE_DIR / "INBOX.md"
 DAILY_BRIEFING_FILE = WORKSPACE_DIR / "DAILY_BRIEFING.md"
+# Fix (2026-06-16): briefing .bak files land in the archive, not the vault root
+# (root .bak clutter was the single biggest recurring librarian violation).
+DAILY_BRIEFING_BAK_DIR = WORKSPACE_DIR / "07_Archive" / "daily_briefing_baks"
+DAILY_BRIEFING_BAK_RETENTION = 30
 TODO_FILE = WORKSPACE_DIR / "TODO.md"
 DECISIONS_DIR = WORKSPACE_DIR / "06_CEO" / "Decisions_Log"
 SESSIONS_DIR = WORKSPACE_DIR / "_Iris_Memory" / "Sessions"
@@ -2685,6 +2689,29 @@ def _preserve_evening_addendum() -> str | None:
         return None
 
 
+def _archive_daily_briefing(timestamp: str) -> Path:
+    """Move the existing DAILY_BRIEFING.md into the archive dir as a timestamped
+    .bak. Returns the backup path. Keeps the .bak out of the vault root."""
+    DAILY_BRIEFING_BAK_DIR.mkdir(parents=True, exist_ok=True)
+    backup_path = DAILY_BRIEFING_BAK_DIR / f"DAILY_BRIEFING.md.bak-{timestamp}"
+    DAILY_BRIEFING_FILE.rename(backup_path)
+    return backup_path
+
+
+def _prune_daily_briefing_baks() -> None:
+    """Keep only the most recent DAILY_BRIEFING_BAK_RETENTION backups so the
+    archive doesn't grow unbounded (matches the db-backup retention pattern)."""
+    try:
+        baks = sorted(
+            DAILY_BRIEFING_BAK_DIR.glob("DAILY_BRIEFING.md.bak-*"),
+            key=lambda p: p.name,
+        )
+        for stale in baks[:-DAILY_BRIEFING_BAK_RETENTION]:
+            stale.unlink()
+    except Exception as exc:
+        logger.warning(f"Pruning daily-briefing baks failed (non-fatal): {exc}")
+
+
 async def regenerate_daily_briefing_file() -> bool:
     """Regenerate DAILY_BRIEFING.md from current workspace state.
 
@@ -2712,14 +2739,15 @@ async def regenerate_daily_briefing_file() -> bool:
         preserved = _preserve_evening_addendum()
         if preserved:
             logger.info(preserved)
-        # Back up existing file with timestamp
+        # Back up existing file with timestamp into the archive dir (not root).
         if DAILY_BRIEFING_FILE.exists():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = DAILY_BRIEFING_FILE.with_name(
-                f"DAILY_BRIEFING.md.bak-{timestamp}"
+            backup_path = _archive_daily_briefing(timestamp)
+            logger.info(
+                f"Previous DAILY_BRIEFING.md backed up to "
+                f"{backup_path.relative_to(WORKSPACE_DIR)}"
             )
-            DAILY_BRIEFING_FILE.rename(backup_path)
-            logger.info(f"Previous DAILY_BRIEFING.md backed up to {backup_path.name}")
+            _prune_daily_briefing_baks()
         DAILY_BRIEFING_FILE.write_text(new_content, encoding="utf-8")
         logger.info(f"DAILY_BRIEFING.md regenerated ({len(new_content)} chars)")
         await record_message_stat("cloud", cost_usd=0.0)
