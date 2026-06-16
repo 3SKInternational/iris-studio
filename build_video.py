@@ -291,7 +291,7 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         "asset_dir": str(asset_dir),
         "output_dir": str(output_dir),
         "output_name": output_name,
-        "defaults": {"zoom": 1.04, "fit": "cover"},
+        "defaults": {"zoom": 1.04, "fit": "contain"},
         "shots": out_shots,
     }
     return manifest, all_vo, fallbacks

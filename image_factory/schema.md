@@ -66,12 +66,22 @@ whose PNG already exists** (resumable) unless `--force`.
 | `defaults` | no | `{}` | `model`, `quality`, `size`, `input_fidelity` — see below. |
 | `images` | yes | — | Ordered list of image objects. |
 
-`defaults` keys: `model` (default `gpt-image-1` — see *Model choice* below),
-`quality` (`low`|`medium`|`high`|`auto`, default `medium`), `size`
-(`1024x1024`|`1536x1024`|`1024x1536`|`auto`, default `1536x1024` — 3:2 landscape
-that feeds the 1920×1080 video render), `input_fidelity` (`low`|`high`, default
-`high` — only applies to gpt-image-1's edits endpoint; silently skipped on
-models that don't support it).
+`defaults` keys: `model` (default `gpt-image-2` — see *Model choice* below),
+`quality` (`low`|`medium`|`high`|`auto`, default `medium`), `size` (default
+`2048x1152` — **native 16:9 (2K)** that fills the 1920×1080 render edge-to-edge
+with **no crop**), `input_fidelity` (`low`|`high`, default `high` — only applies
+to gpt-image-1's edits endpoint; omitted on gpt-image-2, which processes every
+reference at high fidelity automatically).
+
+**Size rules (validated before any spend):**
+- **gpt-image-2** accepts any `WIDTHxHEIGHT` where both edges are multiples of
+  16, max edge ≤ 3840, total pixels in 655 360–8 294 400, and long:short aspect
+  ≤ 3:1. Native-16:9 picks: `2048x1152` (2K, ~$0.095/img medium — the default),
+  `3840x2160` (4K, ~$0.33/img — usually overkill). Note `1920x1080` is **invalid**
+  (1080 isn't a multiple of 16) — use `2048x1152`.
+- **gpt-image-1** is limited to the fixed menu `1024x1024`|`1536x1024`|
+  `1024x1536`|`auto` (it has **no** 16:9); a gpt-image-1 manifest must set `size`
+  to one of those. 3:2 `1536x1024` cover-crops ~16% off the 16:9 frame.
 
 ## Image fields
 
@@ -138,6 +148,29 @@ Counter-intuitively, the **deprecated** model is the right one for now:
 
 The lesson that held: keep the model id (and now `input_fidelity`) as config
 values — this whole pivot was a manifest edit, not a code rewrite.
+
+### Addendum 2026-06-16 — gpt-image-2 reconsidered (now the default)
+
+The A/B above led to two conclusions that later evidence overturned, so the
+default is now **gpt-image-2**:
+
+- **It holds the character after all.** The full 46-shot V1 "HD" set was generated
+  on **gpt-image-2 with the 5 reference PNGs** and graded **on-model** (dot-eyes,
+  chibi proportions, flat 2D, correct age progression). The early A/B's "drift"
+  almost certainly came from references not being anchored the way the production
+  batch anchors them.
+- **The `input_fidelity` 400 was a usage error, not a wall.** OpenAI's current
+  image-gen guide states gpt-image-2 **processes every image input at high fidelity
+  automatically** — so you *omit* `input_fidelity` (the runner already gates it to
+  gpt-image-1). gpt-image-2 gets high-fidelity references for free.
+- **Only gpt-image-2 can do native 16:9** (gpt-image-1 is locked to its 3 presets),
+  and 16:9 is required to fill the video frame without a ~16% crop. That alone
+  makes gpt-image-2 the production model going forward.
+
+gpt-image-1 + `input_fidelity: high` remains a valid fallback (and the local Flux
++ LoRA endgame is unchanged), but new videos default to gpt-image-2 at `2048x1152`.
+*Worth a clean re-run of the original Scene-01 A/B to fully close the loop — flagged,
+not yet done.*
 
 ## Cowork-Iris access (author-side bridge)
 

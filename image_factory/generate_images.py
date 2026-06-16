@@ -31,6 +31,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -39,22 +40,39 @@ from pathlib import Path
 
 VALID_PROVIDERS = ("openai", "flux")
 VALID_QUALITIES = ("low", "medium", "high", "auto")
-VALID_SIZES = ("1024x1024", "1536x1024", "1024x1536", "auto")
+# gpt-image-1's fixed menu (it accepts ONLY these). gpt-image-2 is far more
+# flexible — see GPT2_SIZE_CONSTRAINTS + validate_size().
+GPT1_SIZES = ("1024x1024", "1536x1024", "1024x1536", "auto")
+# gpt-image-2 accepts any WIDTHxHEIGHT meeting these (OpenAI image-gen guide,
+# verified 2026-06-16): both edges multiples of 16, max edge <=3840, total
+# pixels in [655360, 8294400], long:short aspect ratio <=3:1. This is what
+# unlocks native 16:9 (e.g. 2048x1152 = exact 16:9, 3840x2160 = 4K 16:9) so a
+# 16:9 video frame fills edge-to-edge with zero crop.
+GPT2_SIZE_CONSTRAINTS = dict(mult=16, max_edge=3840, min_px=655_360,
+                             max_px=8_294_400, max_ratio=3.0)
 VALID_FIDELITY = ("low", "high")
 
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-image-2"  # NOT gpt-image-1 (deprecated 2026-06-02, sunset 2026-12-01)
 DEFAULT_QUALITY = "medium"
-DEFAULT_SIZE = "1536x1024"  # 3:2 landscape, feeds the 1920x1080 video render
-# Reference fidelity for the edits endpoint. "high" preserves the character's
-# face/features/style from the reference PNGs far more strictly than the "low"
-# default — required to hold "Three"'s dot-eyes + chibi proportions. Costs more
-# image-input tokens. Ignored by the no-reference generate path.
+DEFAULT_SIZE = "2048x1152"  # native 16:9 (2K) — fills the 1920x1080 render with
+                            # NO crop. (Was 1536x1024 3:2, which cover-cropped
+                            # ~16% off top/bottom — exactly where on-image labels
+                            # sit. gpt-image-2 supports true 16:9; gpt-image-1
+                            # does not, so a gpt-image-1 manifest must override
+                            # size back to one of GPT1_SIZES.)
+# Reference fidelity for the edits endpoint. Only meaningful for gpt-image-1,
+# where "high" preserves the character's face/features/style from the reference
+# PNGs far more strictly than the "low" default. Ignored by the no-reference
+# generate path.
 DEFAULT_INPUT_FIDELITY = "high"
-# input_fidelity is a gpt-image-1 parameter; gpt-image-2 rejects it with a 400
-# (verified live 2026-06-15). gpt-image-1 + high fidelity is the only config
-# tested that holds the character — but gpt-image-1 sunsets 2026-12-01, so this
-# is a launch bridge; the permanent answer is the local Flux + LoRA provider.
+# input_fidelity is a gpt-image-1-only parameter. gpt-image-2 does NOT accept it
+# because it already processes every image input at high fidelity automatically
+# (OpenAI image-gen guide, verified 2026-06-16) — so gpt-image-2 holds the
+# character from references WITHOUT this flag. (Supersedes the earlier
+# "gpt-image-2 drifts / 400s on input_fidelity" note: the param is simply
+# omitted; the V1 HD set generated on gpt-image-2 graded on-model.) gpt-image-1
+# sunsets 2026-12-01; the permanent answer is the local Flux + LoRA provider.
 MODELS_WITH_INPUT_FIDELITY = ("gpt-image-1",)
 
 # gpt-image token pricing, USD per 1M tokens. Approximate — verify against
@@ -98,12 +116,53 @@ def expand(path: str) -> Path:
     return Path(os.path.expanduser(path)).resolve()
 
 
+def parse_size(size: str):
+    """(w, h) for a 'WIDTHxHEIGHT' string, or None for 'auto'/unparseable."""
+    if size == "auto":
+        return None
+    m = re.fullmatch(r"(\d+)x(\d+)", size.strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def validate_size(model: str, size: str) -> None:
+    """Reject a size the chosen model can't render — fail BEFORE any spend."""
+    if size == "auto":
+        return
+    wh = parse_size(size)
+    if wh is None:
+        die(f"size must be 'WIDTHxHEIGHT' or 'auto', got {size!r}")
+    w, h = wh
+    if model == "gpt-image-1":            # fixed menu, no custom sizes
+        if size not in GPT1_SIZES:
+            die(f"gpt-image-1 only supports {GPT1_SIZES}; got {size!r} "
+                f"— use gpt-image-2 for arbitrary / native-16:9 sizes")
+        return
+    c = GPT2_SIZE_CONSTRAINTS             # gpt-image-2: arbitrary within bounds
+    if w % c["mult"] or h % c["mult"]:
+        die(f"{model}: {size} — both edges must be multiples of {c['mult']}")
+    if max(w, h) > c["max_edge"]:
+        die(f"{model}: {size} — max edge is {c['max_edge']}px")
+    px = w * h
+    if not (c["min_px"] <= px <= c["max_px"]):
+        die(f"{model}: {size} — total pixels {px:,} outside "
+            f"[{c['min_px']:,}, {c['max_px']:,}]")
+    if max(w, h) / min(w, h) > c["max_ratio"] + 1e-9:
+        die(f"{model}: {size} — aspect ratio exceeds {c['max_ratio']:g}:1")
+
+
 def estimate_cost(model: str, quality: str, size: str, prompt: str, n_refs: int) -> float:
     """Rough USD estimate for one image — dry-run planning only."""
     price = PRICING.get(model, PRICING[DEFAULT_MODEL])
     q = quality if quality in OUTPUT_TOKENS else "medium"
-    s = size if size in OUTPUT_TOKENS[q] else "1536x1024"
-    out_tokens = OUTPUT_TOKENS[q][s]
+    # Exact table for the known presets; otherwise area-scale the output-token
+    # count from the 1536x1024 anchor (this is a planning estimate only — the
+    # real cost is read back from the API `usage` field after each live call).
+    if size in OUTPUT_TOKENS[q]:
+        out_tokens = OUTPUT_TOKENS[q][size]
+    else:
+        wh = parse_size(size)
+        px = wh[0] * wh[1] if wh else 1536 * 1024
+        out_tokens = round(px * OUTPUT_TOKENS[q]["1536x1024"] / (1536 * 1024))
     text_tokens = max(1, len(prompt) // 4)
     # Each reference image runs ~300-1000 input tokens; use a flat midpoint.
     img_in_tokens = n_refs * 600
@@ -175,7 +234,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--provider", choices=VALID_PROVIDERS, help="Override manifest/default provider.")
     p.add_argument("--model", help="Override the model id (config value).")
     p.add_argument("--quality", choices=VALID_QUALITIES, help="Override quality for the whole batch.")
-    p.add_argument("--size", choices=VALID_SIZES, help="Override size for the whole batch.")
+    p.add_argument("--size", help="Override size for the whole batch ('WIDTHxHEIGHT' or "
+                   "'auto'). gpt-image-2 takes any 16-divisible size up to 3840px/edge, "
+                   "ratio <=3:1 (e.g. 2048x1152 for native 16:9); gpt-image-1 is limited "
+                   f"to {GPT1_SIZES}.")
     p.add_argument("--input-fidelity", choices=VALID_FIDELITY, help="Reference fidelity (edits endpoint). 'high' holds the character.")
     p.add_argument("--output", help="Override the manifest's output_dir.")
     p.add_argument("--limit", type=int, help="Generate at most N images (smoke test).")
@@ -205,10 +267,12 @@ def main() -> None:
     b_quality = args.quality or defaults.get("quality", DEFAULT_QUALITY)
     b_size = args.size or defaults.get("size", DEFAULT_SIZE)
     b_fidelity = args.input_fidelity or defaults.get("input_fidelity", DEFAULT_INPUT_FIDELITY)
+    validate_size(model, b_size)  # batch size — fail before any spend
     fidelity_active = model in MODELS_WITH_INPUT_FIDELITY
     if b_fidelity == "high" and not fidelity_active:
-        print(f"note: {model} does not support input_fidelity — references will be "
-              f"loose hints, expect character drift (gpt-image-1 holds it).", file=sys.stderr)
+        print(f"note: {model} ignores input_fidelity — it already processes every "
+              f"reference image at high fidelity automatically, so the character "
+              f"holds without the flag.", file=sys.stderr)
 
     images = manifest.get("images")
     if not images:
@@ -271,6 +335,8 @@ def main() -> None:
 
         quality = img.get("quality", b_quality)
         size = img.get("size", b_size)
+        if size != b_size:                 # per-image override — validate too
+            validate_size(model, size)
         use_refs = img.get("use_references", True) and bool(ref_paths)
         these_refs = ref_paths if use_refs else []
         full_prompt = f"{preamble}\n\n{prompt}" if preamble else prompt
