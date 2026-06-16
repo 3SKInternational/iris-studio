@@ -23,5 +23,16 @@
 		<key>Minute</key>
 		<integer>10</integer>
 	</dict>
+	<!-- The vault gardener is file-descriptor-heavy (vault-wide 24h diff +
+	     per-note relatedness search + filesystem/obsidian MCP servers). Under
+	     launchd's default soft RLIMIT_NOFILE of 256 the real 2026-06-16 04:10
+	     fire died with "low max file descriptors (Current limit: 256)". Raise
+	     the soft limit so the scheduled fire has headroom (the manual kickstart
+	     succeeded only because it inherited an interactive shell's larger limit). -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
 </dict>
 </plist>
