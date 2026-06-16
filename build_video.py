@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Video orchestrator (Build 2) — one command per video.
+
+Glue over three already-built engines:
+  - image_factory/generate_images.py   (shot prompts -> scene PNGs)
+  - vo_factory/generate_vo.py          (VO kit -> scene mp3s)
+  - video_factory/assemble.py          (PNGs + mp3s + manifest -> mp4 + srt)
+
+It collapses the two manual manifest hand-offs into one run: from a video's
+**shot list** + **VO kit** it auto-authors the image manifest and the edit
+manifest, then (on demand) fires each engine. The only real new logic is the
+two manifest-authoring functions; everything else is orchestration.
+
+Resolution from a video id (e.g. `Video_01` or `01`), under the 3SK Finance
+vault (override with $SK_VAULT):
+  shot list   : Scene_Image_Prompts/Video_NN_Shot_List.md
+  VO kit      : Voice_Files/Video_NN/_VO_Session_B_Kit.md
+  images out  : Raw_Assets/Video_NN_gen/
+  VO out      : Voice_Files/Video_NN_gen/
+  draft video : Footage_and_Edits/Video_NN_v2.mp4 (+ .srt)
+
+Usage:
+  python3 build_video.py Video_01                 # PLAN: author both manifests + cost, no spend
+  python3 build_video.py Video_01 --assemble      # author + render (free) from existing assets
+  python3 build_video.py Video_01 --vo            # author + generate VO (billed)
+  python3 build_video.py Video_01 --images        # author + generate images (billed)
+  python3 build_video.py Video_01 --run           # all three stages, each skip-if-exists
+  python3 build_video.py Video_01 --vo-source Voice_Files/Video_01  # assemble off an existing VO set
+
+Billed stages (images, VO) NEVER run without their explicit flag (or --run);
+the default is a free dry plan. Each stage is independently runnable and
+resumable (skip-if-output-exists). Same inputs -> same manifests -> same video.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+DEFAULT_VAULT = "~/Documents/3SK/outputs/BRANDS/3SK_Finance"
+# The locked "Three" character header (style preamble + reference sheet +
+# gpt-image defaults) is brand-level and shared by every 3SK Finance video.
+CANONICAL_IMG_HEADER = REPO / "image_factory" / "manifests" / "video_01_images.example.json"
+
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def vault() -> Path:
+    return Path(os.path.expanduser(os.environ.get("SK_VAULT", DEFAULT_VAULT))).resolve()
+
+
+def normalize_id(raw: str) -> tuple[str, str]:
+    """'Video_01' | '01' | '1' -> ('Video_01', '01')."""
+    m = re.search(r"(\d+)", raw)
+    if not m:
+        die(f"could not parse a video number from '{raw}'")
+    nn = f"{int(m.group(1)):02d}"
+    return f"Video_{nn}", nn
+
+
+# --- shot-list parsing -----------------------------------------------------
+
+_SCENE_RE = re.compile(r"^##\s+Scene\s+(\d+)\b.*$", re.MULTILINE)
+# Tolerate descriptive lines between the "### Shot Na" header and its prompt
+# fence (non-greedy to the first fence) so a stray note never silently drops a
+# shot. The header-count cross-check in parse_shot_list catches any real miss.
+_SHOT_RE = re.compile(r"^###\s+Shot\s+(\d+)([a-z])\b[^\n]*\n(?:[^\n]*\n)*?```[^\n]*\n(.*?)\n```", re.MULTILINE | re.DOTALL)
+_SHOT_HEADER_RE = re.compile(r"^###\s+Shot\s+\d+[a-z]\b", re.MULTILINE)
+# Cadence table rows: "| S1 | 11.4 | 1 | single |"
+_CADENCE_RE = re.compile(r"^\|\s*S(\d+)\s*\|\s*([\d.]+)\s*\|", re.MULTILINE)
+
+
+def parse_shot_list(path: Path) -> tuple[list[dict], dict[int, float]]:
+    """Return (shots, cadence_seconds_by_scene).
+
+    shots = [{scene:int, sub:str, id:str, prompt:str, no_char:bool}] in order.
+    """
+    text = path.read_text(encoding="utf-8")
+    cadence = {int(s): float(sec) for s, sec in _CADENCE_RE.findall(text)}
+    shots: list[dict] = []
+    for m in _SHOT_RE.finditer(text):
+        scene = int(m.group(1))
+        sub = m.group(2)
+        prompt = re.sub(r"\s+", " ", m.group(3)).strip()
+        shots.append({
+            "scene": scene,
+            "sub": sub,
+            "id": f"{scene:02d}{sub}",
+            "prompt": prompt,
+            "no_char": bool(re.search(r"\bno character\b", prompt, re.I)),
+        })
+    if not shots:
+        die(f"no '### Shot Na' blocks found in {path.name}")
+    n_headers = len(_SHOT_HEADER_RE.findall(text))
+    if n_headers != len(shots):
+        print(f"  ⚠ {n_headers} '### Shot' headers but only {len(shots)} parsed a "
+              f"prompt fence in {path.name} — {n_headers - len(shots)} shot(s) "
+              f"will be MISSING from the manifests (check for a malformed code fence).")
+    return shots, cadence
+
+
+# --- VO kit parsing (captions) --------------------------------------------
+
+_KIT_BLOCK_RE = re.compile(r"^##\s+Scene\s+(\d+)\s*(?:->|→)\s*`([^`]+\.mp3)`[^\n]*\n", re.MULTILINE)
+
+
+def parse_kit(path: Path) -> dict[int, dict]:
+    """scene_number -> {caption, filename} from the VO kit (break tags stripped)."""
+    if not path.is_file():
+        return {}
+    body = path.read_text(encoding="utf-8")
+    heads = list(_KIT_BLOCK_RE.finditer(body))
+    out: dict[int, dict] = {}
+    for i, m in enumerate(heads):
+        scene = int(m.group(1))
+        filename = m.group(2).strip()
+        start = m.end()
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+        chunk = re.split(r"^---\s*$", body[start:end], maxsplit=1, flags=re.MULTILINE)[0]
+        chunk = re.sub(r"<break[^>]*/>", " ", chunk)            # drop SSML
+        chunk = re.sub(r"\*\*([^*]+)\*\*", r"\1", chunk)        # bold
+        chunk = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", chunk)  # italic
+        chunk = re.sub(r"\s+", " ", chunk).strip()
+        out[scene] = {"caption": chunk, "filename": filename}
+    return out
+
+
+def split_scene(caption: str, n: int) -> list[tuple[str, float]]:
+    """Split a caption into n contiguous groups, each with its audio time-weight.
+
+    Caption text and audio cut-point are derived from the SAME sentence grouping
+    so the on-screen caption matches the words heard under each shot. The weight
+    is the group's share of total caption characters (weights sum to 1.0). Falls
+    back to an even split when the caption can't be aligned — empty, or fewer
+    sentences than shots — so audio still covers every shot.
+    """
+    if n <= 1:
+        return [(caption, 1.0)]
+    sentences = [s.strip() for s in re.findall(r".*?[.!?](?:\s+|$)", caption) if s.strip()] if caption else []
+    if len(sentences) < n:
+        # Can't give every shot its own sentence: keep audio even, front-load text.
+        parts = [sentences[i] if i < len(sentences) else "" for i in range(n)]
+        return [(p, 1.0 / n) for p in parts]
+    per = len(sentences) / n
+    groups: list[tuple[str, float]] = []
+    for i in range(n):
+        lo = round(i * per)
+        hi = round((i + 1) * per)
+        text = " ".join(sentences[lo:hi]).strip()
+        groups.append((text, float(max(len(text), 1))))
+    total = sum(w for _, w in groups)
+    return [(t, w / total) for t, w in groups]
+
+
+# --- duration probing ------------------------------------------------------
+
+def ffprobe_seconds(mp3: Path) -> float | None:
+    if not mp3.is_file():
+        return None
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", str(mp3)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return float(out)
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+
+
+# --- manifest authoring ----------------------------------------------------
+
+def author_image_manifest(shots: list[dict], vid: str, images_out: Path) -> dict:
+    if not CANONICAL_IMG_HEADER.is_file():
+        die(f"canonical image header not found: {CANONICAL_IMG_HEADER}")
+    header = json.loads(CANONICAL_IMG_HEADER.read_text(encoding="utf-8"))
+    images = []
+    for s in shots:
+        entry = {"name": f"{vid}_Shot_{s['id']}", "prompt": s["prompt"]}
+        if s["no_char"]:
+            entry["use_references"] = False
+        images.append(entry)
+    return {
+        "project": vid,
+        "output_dir": str(images_out),
+        "reference_dir": header.get("reference_dir"),
+        "reference_images": header.get("reference_images", []),
+        "style_preamble": header.get("style_preamble", ""),
+        "defaults": header.get("defaults", {}),
+        "images": images,
+    }
+
+
+_MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left", "pan_up", "pan_down"]
+
+
+def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict[int, dict],
+                         vid: str, asset_dir: Path, images_rel: str, vo_rel: str,
+                         output_dir: Path, output_name: str) -> tuple[dict, bool]:
+    """Author the video_factory edit manifest. Returns (manifest, all_vo_present)."""
+    by_scene: dict[int, list[dict]] = {}
+    for s in shots:
+        by_scene.setdefault(s["scene"], []).append(s)
+
+    out_shots: list[dict] = []
+    all_vo = True
+    mi = 0  # global motion index, for visual variety across the whole video
+    for scene in sorted(by_scene):
+        scene_shots = by_scene[scene]
+        k = len(scene_shots)
+        # Use the filename the kit declares (what vo_factory actually writes);
+        # fall back to the standard pattern when the kit is absent.
+        vo_name = kit.get(scene, {}).get("filename") or f"{vid}_VO_Scene_{scene:02d}.mp3"
+        vo_path = asset_dir / vo_rel / vo_name
+        dur = ffprobe_seconds(vo_path)
+        if dur is None:
+            all_vo = False
+            dur = cadence.get(scene)  # fallback: shot-list cadence table
+        cap_parts = split_scene(kit.get(scene, {}).get("caption", ""), k)
+        cum = 0.0  # cumulative fraction of the clip consumed by prior shots
+        for i, s in enumerate(scene_shots):
+            text, weight = cap_parts[i]
+            shot: dict = {
+                "image": f"{images_rel}/{vid}_Shot_{s['id']}.png",
+                "vo_clip": f"{vo_rel}/{vo_name}",
+                "motion": _MOTIONS[mi % len(_MOTIONS)],
+                "caption_text": text,
+            }
+            mi += 1
+            if dur is not None and k > 1:
+                shot["start"] = round(cum * dur, 3)
+                cum += weight
+                if i < k - 1:                       # omit end on the tail shot so
+                    shot["end"] = round(cum * dur, 3)  # it runs to clip end
+            out_shots.append(shot)
+
+    manifest = {
+        "video": f"{vid}_v2 (orchestrated)",
+        "asset_dir": str(asset_dir),
+        "output_dir": str(output_dir),
+        "output_name": output_name,
+        "defaults": {"zoom": 1.04, "fit": "cover"},
+        "shots": out_shots,
+    }
+    return manifest, all_vo
+
+
+# --- engine invocation -----------------------------------------------------
+
+def run(cmd: list[str], *, label: str) -> int:
+    print(f"\n>>> {label}\n    $ {' '.join(cmd)}")
+    return subprocess.run(cmd).returncode
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+# --- CLI -------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="3SK video orchestrator (Build 2).")
+    p.add_argument("video", help="Video id, e.g. Video_01 or 01.")
+    p.add_argument("--images", action="store_true", help="Run image_factory (BILLED).")
+    p.add_argument("--vo", action="store_true", help="Run vo_factory (BILLED).")
+    p.add_argument("--assemble", action="store_true", help="Run video_factory (free).")
+    p.add_argument("--run", action="store_true", help="All three stages (images+vo+assemble).")
+    p.add_argument("--vo-source", help="Vault-relative dir of existing VO mp3s to assemble from (e.g. Voice_Files/Video_01).")
+    p.add_argument("--force", action="store_true", help="Pass --force to the billed stages (re-render existing).")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    do_images = args.images or args.run
+    do_vo = args.vo or args.run
+    do_assemble = args.assemble or args.run
+    plan_only = not (do_images or do_vo or do_assemble)
+
+    if do_vo and args.vo_source:
+        die("--vo writes to <video>_gen but --vo-source points assembly elsewhere; "
+            "pick one (generate fresh, OR assemble from an existing set).")
+
+    vid, nn = normalize_id(args.video)
+    vlt = vault()
+    shot_list = vlt / "Scene_Image_Prompts" / f"{vid}_Shot_List.md"
+    vo_kit = vlt / "Voice_Files" / vid / "_VO_Session_B_Kit.md"
+    if not shot_list.is_file():
+        die(f"shot list not found: {shot_list}")
+
+    images_rel = f"Raw_Assets/{vid}_gen"
+    if args.vo_source:
+        if Path(args.vo_source).is_absolute():
+            die("--vo-source must be vault-relative (e.g. Voice_Files/Video_01), not an absolute path.")
+        vo_rel = args.vo_source.strip("/")
+    else:
+        vo_rel = f"Voice_Files/{vid}_gen"
+    images_out = vlt / images_rel
+    vo_out = vlt / f"Voice_Files/{vid}_gen"
+
+    shots, cadence = parse_shot_list(shot_list)
+    kit = parse_kit(vo_kit)
+
+    # Warn if the kit and shot list disagree on which scenes exist — a mismatch
+    # means a scene will silently fall back to the standard mp3 name / cadence
+    # timing / empty caption, which is almost always an authoring error.
+    shot_scenes = {s["scene"] for s in shots}
+    kit_scenes = set(kit)
+    if kit and shot_scenes != kit_scenes:
+        only_shots = sorted(shot_scenes - kit_scenes)
+        only_kit = sorted(kit_scenes - shot_scenes)
+        warn = []
+        if only_shots:
+            warn.append(f"in shot list but not kit: {only_shots}")
+        if only_kit:
+            warn.append(f"in kit but not shot list: {only_kit}")
+        print(f"  ⚠ scene mismatch — {'; '.join(warn)}")
+
+    print(f"video      : {vid}")
+    print(f"vault      : {vlt}")
+    print(f"shot list  : {len(shots)} shots across {len(shot_scenes)} scenes")
+    print(f"captions   : {len(kit)} scenes from {vo_kit.name if kit else '(kit missing)'}")
+    print(f"images out : {images_out}")
+    print(f"VO source  : {vlt / vo_rel}")
+
+    # --- always author both manifests (free, deterministic) ---
+    img_manifest = author_image_manifest(shots, vid, images_out)
+    img_manifest_path = REPO / "image_factory" / "manifests" / f"{vid}_orchestrated.json"
+    write_json(img_manifest_path, img_manifest)
+
+    edit_manifest, all_vo = author_edit_manifest(
+        shots, cadence, kit, vid, vlt, images_rel, vo_rel,
+        vlt / "Footage_and_Edits", f"{vid}_v2",
+    )
+    # Key the edit manifest by its VO source so the default (`_gen`) and a
+    # `--vo-source` run never overwrite each other's manifest. A flagless plan
+    # then can't silently break a working hand-VO assembly config (same inputs
+    # + same source -> same manifest path).
+    edit_manifest_path = REPO / "video_factory" / "manifests" / f"{vid}_orchestrated_{Path(vo_rel).name}.json"
+    write_json(edit_manifest_path, edit_manifest)
+
+    print(f"\nauthored   : {img_manifest_path.relative_to(REPO)}  ({len(img_manifest['images'])} images)")
+    print(f"authored   : {edit_manifest_path.relative_to(REPO)}  ({len(edit_manifest['shots'])} shots)")
+    if not all_vo:
+        print("  note: some VO clips not found yet — shot timing used the shot-list "
+              "cadence table; it is re-probed exactly once the VO mp3s exist.")
+
+    img_gen = REPO / "image_factory" / "generate_images.py"
+    vo_gen = REPO / "vo_factory" / "generate_vo.py"
+    assembler = REPO / "video_factory" / "assemble.py"
+
+    if plan_only:
+        print("\n--- PLAN ONLY (no spend). To execute: ---")
+        print(f"  images (billed) : python3 {img_gen} {img_manifest_path} --dry-run   # then drop --dry-run")
+        print(f"  VO     (billed) : python3 {vo_gen} {vo_kit} --output {vo_out} --dry-run")
+        print(f"  assemble (free) : python3 {assembler} {edit_manifest_path}")
+        print("  or all at once  : build_video.py {0} --run".format(vid))
+        # Free cost preview for the billed stages.
+        run([sys.executable, str(img_gen), str(img_manifest_path), "--dry-run"], label="image cost preview")
+        if kit:
+            run([sys.executable, str(vo_gen), str(vo_kit), "--output", str(vo_out), "--dry-run"], label="VO cost preview")
+        return
+
+    rc = 0
+    if do_images:
+        cmd = [sys.executable, str(img_gen), str(img_manifest_path)]
+        if args.force:
+            cmd.append("--force")
+        rc |= run(cmd, label="STAGE images (billed)")
+    if do_vo:
+        if not vo_kit.is_file():
+            die(f"VO kit not found: {vo_kit}")
+        cmd = [sys.executable, str(vo_gen), str(vo_kit), "--output", str(vo_out)]
+        if args.force:
+            cmd.append("--force")
+        rc |= run(cmd, label="STAGE vo (billed)")
+    if do_assemble:
+        # Re-author the edit manifest now that VO clips should exist (exact durations).
+        edit_manifest, _ = author_edit_manifest(
+            shots, cadence, kit, vid, vlt, images_rel, vo_rel,
+            vlt / "Footage_and_Edits", f"{vid}_v2",
+        )
+        write_json(edit_manifest_path, edit_manifest)
+        rc |= run([sys.executable, str(assembler), str(edit_manifest_path)], label="STAGE assemble (free)")
+
+    if rc:
+        raise SystemExit(1)
+    print(f"\ndone. Draft video -> {vlt / 'Footage_and_Edits' / (vid + '_v2.mp4')}")
+
+
+if __name__ == "__main__":
+    main()

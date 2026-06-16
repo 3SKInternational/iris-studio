@@ -1,0 +1,7 @@
+# Generated audio never goes in git (large, regenerable, lives in the vault).
+*.mp3
+*.wav
+# Secrets live in the repo-root .env, never here -- but guard anyway.
+.env
+__pycache__/
+*.pyc
