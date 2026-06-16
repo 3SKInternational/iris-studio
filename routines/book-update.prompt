@@ -1,0 +1,44 @@
+You are Claude Code running the nightly "Building Iris" book-update routine on the Mac Mini.
+
+BOOK: /Users/steve/Documents/3SK/outputs/iris-studio-ebook/iris-studio-ebook.md
+VAULT: /Users/steve/Documents/3SK/outputs
+
+PASS 0 — CHEAP NO-OP GUARD (do this before spending any writing effort):
+  - Extract LAST_BOOK_DATE = the date (YYYY-MM-DD) of the TOP entry under the book's "## Changelog" heading. Use the Changelog entry, NOT the title-block "Draft vX.Y — date" line (the two can diverge mid-bump; the Changelog is the canonical anchor). Set it as a real shell variable so the find below interpolates it — do NOT leave the literal token in the command:
+      cd /Users/steve/Documents/3SK/outputs
+      LAST_BOOK_DATE="2026-05-26"   # <-- replace with the date you just read from the Changelog top entry
+  - Find vault source files modified since LAST_BOOK_DATE (note: NO 2>/dev/null — a malformed date must surface as an error, not masquerade as "no new material"):
+      find STEVE_CONTEXT.md _Iris_Memory/Sessions _Iris_Memory/Daily 06_CEO/Decisions_Log 06_CEO/Designs -name '*.md' -newermt "$LAST_BOOK_DATE"
+  - ALSO scan STEVE_CONTEXT.md for "Date bump" entries dated after LAST_BOOK_DATE.
+  - If the find errors (e.g. "Invalid timestamp") instead of returning a file list, STOP — do not treat an error as "no new material." Re-extract the date and retry.
+  - If there is genuinely NO new material: write one line to today's daily note (_Iris_Memory/Daily/YYYY-MM-DD.md) under "## 🤖 Claude Code intra-day log" ("HH:MM — book-update: no new source material since LAST_BOOK_DATE, skipped") and EXIT. Do not invoke the agents. Do not commit.
+
+PASS 1 — WRITE:
+  - Clear any stale backup left by a prior HOLD/crash, then back up the book fresh so the editor can diff against a known-clean baseline (the vault is NOT a git repo). Verify the copy actually succeeded before invoking the writer — if it didn't, STOP (a missing/stale backup makes the editor's diff meaningless):
+      BOOK=/Users/steve/Documents/3SK/outputs/iris-studio-ebook/iris-studio-ebook.md
+      rm -f "$BOOK.bak-pre-writer"
+      cp "$BOOK" "$BOOK.bak-pre-writer" && test -f "$BOOK.bak-pre-writer" || { echo "book-update: backup failed, aborting"; exit 1; }
+  - Invoke the book-writer subagent. Brief it with LAST_BOOK_DATE and the list of new source files from Pass 0 so it focuses only on the delta. (The writer bumps BOTH the title-block "Draft vX.Y — date" line AND the Changelog top entry in lockstep — they must not diverge, or Pass 0's date anchor drifts.)
+
+PASS 2 — EDIT:
+  - Invoke the book-editor subagent to review the writer's diff (it compares the live book against the .bak-pre-writer backup).
+  - If the editor returns HOLD, do NOT commit. Surface the HOLD reasons in the bridge file + a one-line Telegram-style note in today's daily note, then clean up the backup (`rm -f "$BOOK.bak-pre-writer"`) so it can't poison the next night's diff, and stop. The writer's edits stay on disk for a human to inspect.
+
+PASS 2.5 — REDACT (deterministic gate):
+  - Run `python3 /Volumes/AI_Workspace/iris_studio/scripts/redact-book.py`.
+  - Exit 0 = clean, proceed to SHIP. Exit 1 = a known identifier survived the auto-fix (should never happen) → HOLD and surface it (bridge file + one-line daily-note note), clean up the backup, and stop.
+  - This runs the proven ordered-replacement scrub so anonymization never depends on the model remembering.
+
+PASS 3 — SHIP (only if editor verdict = SHIP):
+  - The book file lives in the vault. The vault is NOT a git repository (confirmed 2026-06-15), so the durable artifact is simply the saved file on disk — there is nothing to commit and nothing to push (Syncthing is stopped; cross-Mac sync is manual). Before assuming this, re-confirm:
+      cd /Users/steve/Documents/3SK/outputs
+      git rev-parse --is-inside-work-tree 2>/dev/null
+    - If that command errors (not a git repo, the current reality): the saved book file IS the ship. Do not attempt to commit. Keep a DATED insurance snapshot of the pre-edit state instead of deleting it outright (this is a revenue artifact; cheap rollback insurance, per the X9-incident habit), and prune snapshots older than ~7 days:
+        mv "$BOOK.bak-pre-writer" "$BOOK.$(date +%Y-%m-%d).bak"
+        find /Users/steve/Documents/3SK/outputs/iris-studio-ebook -name 'iris-studio-ebook.md.*.bak' -mtime +7 -delete
+    - If it ever prints "true" (the vault was later turned into a repo): commit the book locally, do NOT push unless `git remote -v` shows a remote AND pushing is this machine's established convention:
+        git add iris-studio-ebook/iris-studio-ebook.md
+        git commit -m "book: nightly update to <new version> (auto: writer+editor pipeline)"
+  - Append a session line to _Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md and a 1-line entry to today's daily note "## 🤖 Claude Code intra-day log".
+
+NEVER fabricate book content. The agents enforce source-grounding; you enforce the SHIP/HOLD gate.
