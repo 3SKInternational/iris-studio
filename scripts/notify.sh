@@ -54,11 +54,14 @@ if [ -z "${MSG//[[:space:]]/}" ]; then
     exit 1
 fi
 
+# `|| RESP=""` so a curl-level failure (DNS, no network, --max-time timeout)
+# falls through to the explicit error branch below instead of aborting the
+# script with curl's exit code under `set -e`.
 RESP=$(curl -s --max-time 20 \
     -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${CHAT_ID}" \
     --data-urlencode "text=${MSG}" \
-    --data-urlencode "disable_web_page_preview=true")
+    --data-urlencode "disable_web_page_preview=true") || RESP=""
 
 if printf '%s' "$RESP" | grep -q '"ok":true'; then
     echo "notify.sh: delivered to chat ${CHAT_ID}"

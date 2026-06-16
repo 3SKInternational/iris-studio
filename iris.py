@@ -109,6 +109,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -3596,6 +3597,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Telegram error handler
 # ============================================================
 
+_NOTIFY_SCRIPT = Path(__file__).resolve().parent / "scripts" / "notify.sh"
+
+
+def _alert_steve(text: str, wait: bool = False) -> None:
+    """Push a Telegram alert via scripts/notify.sh. Deliberately decoupled from
+    this daemon's own _send_telegram path so it still delivers when the bot /
+    event loop is the thing that broke. Best-effort — never raises. Set
+    wait=True only on the crash path (where the process is about to exit and a
+    fire-and-forget child could be killed before curl finishes)."""
+    try:
+        if not _NOTIFY_SCRIPT.exists():
+            logger.warning("notify.sh not found at %s; cannot alert Steve", _NOTIFY_SCRIPT)
+            return
+        proc = subprocess.Popen(
+            [str(_NOTIFY_SCRIPT), text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if wait:
+            proc.wait(timeout=25)
+    except Exception as exc:  # noqa: BLE001 — alerting must never crash the caller
+        logger.warning("notify.sh alert failed: %s", exc)
+
+
 async def _on_telegram_error(
     update: object, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -3608,6 +3633,10 @@ async def _on_telegram_error(
         logger.warning(f"Telegram transient: {type(err).__name__}: {err}")
         return
     logger.exception("Unhandled Telegram error", exc_info=err)
+    _alert_steve(
+        f"🔴 Iris daemon — unhandled Telegram error: "
+        f"{type(err).__name__}: {str(err)[:300]}"
+    )
 
 
 # ============================================================
@@ -3705,4 +3734,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as _crash:  # noqa: BLE001 — alert before launchd restarts us
+        import traceback as _tb
+        _last = _tb.format_exc().strip().splitlines()[-1:]
+        _alert_steve(
+            "🔴 Iris daemon CRASHED — going down (launchd will restart it).\n"
+            f"{type(_crash).__name__}: {str(_crash)[:300]}\n"
+            f"{_last[0] if _last else ''}",
+            wait=True,
+        )
+        raise

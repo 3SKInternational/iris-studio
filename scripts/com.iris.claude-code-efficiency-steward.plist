@@ -8,7 +8,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-lc</string>
-		<string>cd /Users/steve/Documents/3SK/outputs &amp;&amp; /opt/homebrew/bin/claude --print --dangerously-skip-permissions "$(cat /Volumes/AI_Workspace/iris_studio/routines/efficiency-steward.prompt)" 2&gt;&amp;1 | tee -a /Users/steve/iris_studio/logs/claude-code-efficiency-steward.log</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh efficiency-steward /Volumes/AI_Workspace/iris_studio/routines/efficiency-steward.prompt</string>
 	</array>
 	<key>RunAtLoad</key>
 	<false/>
