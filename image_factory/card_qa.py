@@ -150,6 +150,8 @@ def main() -> None:
         spec = json.loads(spec_path.read_text())
     except json.JSONDecodeError as e:
         die(f"spec is not valid JSON: {e}")
+    if not isinstance(spec, dict):
+        die("spec must be a JSON object {canvas, base_dir, out_dir, defaults, cards}")
 
     cards = spec.get("cards", {})
     if not isinstance(cards, dict):
@@ -195,8 +197,19 @@ def main() -> None:
     }
 
     out_path = Path(os.path.expanduser(args.out)) if args.out else comp_dir / "card_qa_packet.json"
+    if out_path.is_dir():
+        die(f"--out is a directory, expected a file path: {out_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(packet, indent=2))
+    # Atomic write (mirrors the contact sheet) so a crash mid-write can't leave a
+    # truncated packet the vision agent then fails to parse.
+    fd, tmp = tempfile.mkstemp(suffix=".json", dir=str(out_path.parent))
+    os.close(fd)
+    try:
+        Path(tmp).write_text(json.dumps(packet, indent=2))
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     print(f"[card_qa] packet -> {out_path}")
     print(f"[card_qa] {len(items)} card(s), {n_present} present, {len(packet['missing'])} missing")
     if packet["missing"]:

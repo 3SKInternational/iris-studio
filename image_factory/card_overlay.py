@@ -264,8 +264,9 @@ def _validate_text(card, i, el, canvas, defaults):
     style = el.get("style", defaults.get("style", "plain"))
     if style not in VALID_STYLES:
         die(f"{card} element {i}: unknown style {style!r} (valid: {sorted(VALID_STYLES)})")
-    if el.get("align", defaults.get("align", "center")) not in VALID_ALIGN:
-        die(f"{card} element {i}: unknown align {el.get('align')!r} (valid: {sorted(VALID_ALIGN)})")
+    align = el.get("align", defaults.get("align", "center"))
+    if align not in VALID_ALIGN:
+        die(f"{card} element {i}: unknown align {align!r} (valid: {sorted(VALID_ALIGN)})")
     _check_anchor(card, i, el.get("anchor", defaults.get("anchor", "mm")))
     _num(card, i, "size", el.get("size", defaults.get("size", 54)), positive=True)
     _num(card, i, "stroke", el.get("stroke", defaults.get("stroke", 0)), nonneg=True)
@@ -281,7 +282,7 @@ def _validate_text(card, i, el, canvas, defaults):
         resolve_color(el["underline_color"])
 
 
-def _validate_ladder(card, i, el):
+def _validate_ladder(card, i, el, canvas):
     rungs = el.get("rungs")
     if not isinstance(rungs, list) or len(rungs) < 2:
         die(f"{card} element {i}: ladder needs a 'rungs' list of >=2 labels")
@@ -292,9 +293,17 @@ def _validate_ladder(card, i, el):
     for f in ("x", "top", "bottom"):
         _opt_num(card, i, el, f)
     _opt_num(card, i, el, "width", positive=True)
-    # top must sit above bottom (smaller y); a swap silently flips the ladder.
-    if "top" in el and "bottom" in el and el["top"] >= el["bottom"]:
-        die(f"{card} element {i}: ladder 'top' ({el['top']}) must be < 'bottom' ({el['bottom']})")
+    # top must sit above bottom (smaller resolved y); a swap silently flips the
+    # ladder. Resolve BOTH the same way draw_ladder does (fraction-of-height vs
+    # literal px) before comparing — otherwise mixing 0.9 and 800 gives a wrong
+    # verdict in either direction. Fall back to the SAME defaults draw_ladder
+    # uses (top 0.12, bottom 0.90) so the check also catches an inversion when
+    # only one side is given (e.g. bottom:50 against the default top).
+    top_px = resolve_pos(el.get("top", 0.12), canvas[1])
+    bottom_px = resolve_pos(el.get("bottom", 0.90), canvas[1])
+    if top_px >= bottom_px:
+        die(f"{card} element {i}: ladder 'top' ({el.get('top', 0.12)}→{top_px}px) "
+            f"must resolve above 'bottom' ({el.get('bottom', 0.90)}→{bottom_px}px)")
     _num(card, i, "label_size", el.get("label_size", 36), positive=True)
     for f in ("rail_thickness", "rung_thickness"):
         _opt_num(card, i, el, f, positive=True)
@@ -348,7 +357,7 @@ def validate_element(card: str, i: int, el: dict, canvas: tuple[int, int],
     if etype == "text":
         _validate_text(card, i, el, canvas, defaults)
     elif etype == "ladder":
-        _validate_ladder(card, i, el)
+        _validate_ladder(card, i, el, canvas)
     elif etype == "tiles":
         _validate_tiles(card, i, el)
     elif etype == "line":
@@ -555,11 +564,27 @@ def main() -> None:
     if not spec_path.is_file():
         die(f"spec not found: {spec_path}")
     try:
-        spec = json.loads(spec_path.read_text())
+        # parse_constant rejects NaN/Infinity/-Infinity — json accepts them by
+        # default, and they'd pass the isinstance(v,(int,float)) validators only
+        # to blow up with a raw ValueError/OverflowError at int()/resolve_pos
+        # during the real render (a false-clean --dry-run). Fail fast instead.
+        spec = json.loads(
+            spec_path.read_text(),
+            parse_constant=lambda c: die(f"spec contains non-finite number {c!r} "
+                                         "(NaN/Infinity not allowed)"),
+        )
     except json.JSONDecodeError as e:
         die(f"spec is not valid JSON: {e}")
+    if not isinstance(spec, dict):
+        die("spec must be a JSON object {canvas, base_dir, out_dir, defaults, cards}")
 
-    canvas_raw = tuple(spec.get("canvas", DEFAULT_CANVAS))
+    canvas_spec = spec.get("canvas", DEFAULT_CANVAS)
+    if isinstance(canvas_spec, (str, bytes)):
+        die(f"canvas must be [W,H], got {canvas_spec!r}")
+    try:
+        canvas_raw = tuple(canvas_spec)
+    except TypeError:
+        die(f"canvas must be [W,H], got {canvas_spec!r}")
     if len(canvas_raw) != 2:
         die(f"canvas must be [W,H], got {canvas_raw}")
     try:
@@ -569,7 +594,11 @@ def main() -> None:
     if canvas[0] <= 0 or canvas[1] <= 0:
         die(f"canvas dimensions must be > 0, got {canvas}")
     defaults = spec.get("defaults", {})
+    if not isinstance(defaults, dict):
+        die("spec 'defaults' must be an object")
     cards = spec.get("cards", {})
+    if not isinstance(cards, dict):
+        die("spec 'cards' must be an object {name: [elements]}")
     if not cards:
         die("spec has no 'cards'")
 
