@@ -1,3 +1,5 @@
 # image_factory — batch scene-image generator
 # Stdlib does everything except the API client.
 openai>=1.40.0
+# card_overlay.py composites crisp text onto text-free card backplates.
+Pillow>=10.0.0
