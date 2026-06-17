@@ -11,10 +11,9 @@
   ],
   "style_preamble": "The attached images are the locked visual reference for a character named Three. The character MUST match these references exactly: same face, solid black dot eyes only (no iris, no whites, no highlights), same chibi proportions (oversized round head about one-third of total height, small compact torso, short stubby limbs), same flat 2D explainer-cartoon style — clean outlines, solid color fills, minimal flat shading. Do not drift toward realism, 3D, soft rendering, Pixar style, or detailed texture. Keep backgrounds to simple flat shapes with no surface texture or clutter. Hair is a smooth brushy cap, short and dark brown, no individual curls. Clean-shaven, no watch, no jewelry unless specified. Use the wardrobe, age, expression, and setting described below; keep everything else identical to the reference.",
   "defaults": {
-    "model": "gpt-image-1",
+    "model": "gpt-image-2",
     "quality": "medium",
-    "size": "1536x1024",
-    "input_fidelity": "high"
+    "size": "2048x1152"
   },
   "images": [
     {
