@@ -383,7 +383,9 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         "asset_dir": str(asset_dir),
         "output_dir": str(output_dir),
         "output_name": output_name,
-        "defaults": {"zoom": 1.04, "fit": fit or "contain"},
+        # zoom 1.02 = a gentle ~2% Ken Burns drift. 1.04 cropped too far into the
+        # top/bottom of the contain-fitted stills (Steve, 2026-06-17); halved it.
+        "defaults": {"zoom": 1.02, "fit": fit or "contain"},
         "shots": out_shots,
     }
     return manifest, all_vo, fallbacks, undetermined, align_notes

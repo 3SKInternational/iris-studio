@@ -35,8 +35,8 @@ OUT_W, OUT_H = 1920, 1080
 # Ken Burns works on a high-res canvas so zoompan's whole-pixel crop stepping is
 # sub-pixel relative to the 1080p output -> smooth, jitter-free motion. At 4x
 # output (7680) each 1px crop step is ~0.25 output px, below perceptible judder
-# even for very slow moves (the gentle 4% Ken Burns that exposed zoompan jitter
-# at 2x). Higher = smoother but slower; 4x is the sweet spot.
+# even for very slow moves (the gentle ~2% Ken Burns default that exposed zoompan
+# jitter at 2x canvas). Higher = smoother but slower; 4x is the sweet spot.
 CANVAS_W, CANVAS_H = 7680, 4320
 VIDEO_CODEC = ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
                "-pix_fmt", "yuv420p"]
@@ -143,7 +143,7 @@ def resolve_asset(asset_dir: Path, name: str, kind: str) -> Path:
 
 def build_shots(manifest: dict, asset_dir: Path) -> list[Shot]:
     defaults = manifest.get("defaults", {})
-    def_zoom = float(defaults.get("zoom", 1.04))
+    def_zoom = float(defaults.get("zoom", 1.02))  # gentle Ken Burns; matches build_video default
     def_fit = defaults.get("fit", "cover")
     shots_in = manifest.get("shots")
     if not shots_in:
