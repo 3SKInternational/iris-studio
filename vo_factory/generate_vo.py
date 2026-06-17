@@ -135,8 +135,14 @@ def parse_kit(kit_path: Path) -> list[dict]:
         text = clean_vo_text(chunk)
         if not text:
             continue
+        fname = m.group(2).strip()
+        # The filename is later used as `out_dir / fname` for a write — reject any
+        # path-traversal so a kit can't escape out_dir (M3). Author-controlled today,
+        # but it's an unvalidated write at a trust boundary.
+        if "/" in fname or "\\" in fname or ".." in fname or fname.startswith("."):
+            raise SystemExit(f"unsafe VO filename in kit: {fname!r} (no path separators or '..')")
         blocks.append(
-            {"scene": int(m.group(1)), "filename": m.group(2).strip(), "text": text}
+            {"scene": int(m.group(1)), "filename": fname, "text": text}
         )
     return blocks
 

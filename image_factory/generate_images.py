@@ -295,6 +295,13 @@ def main() -> None:
     if args.limit is not None:
         images = images[: args.limit]
 
+    # Pre-validate every per-image size override BEFORE any spend. validate_size()
+    # calls die()→sys.exit, so doing this inside the generation loop would abort the
+    # run after earlier images were already billed (H1). Fail fast here instead.
+    for _img in images:
+        if isinstance(_img, dict) and _img.get("size") and _img["size"] != b_size:
+            validate_size(model, str(_img["size"]))
+
     print(f"manifest : {manifest_path.name}  ({manifest.get('project', 'untitled')})")
     print(f"provider : {provider}   model: {model}   quality: {b_quality}   size: {b_size}   fidelity: {b_fidelity}")
     print(f"output   : {out_dir}")
@@ -322,10 +329,13 @@ def main() -> None:
     made = skipped = failed = 0
 
     for img in images:
-        name = img.get("name")
+        # Coerce to safe types before any membership/format check: a hand-authored
+        # manifest can carry a non-str name (e.g. JSON number) or prompt, and
+        # `"/" in <int>` would TypeError and abort the whole batch mid-spend (H1).
+        name = str(img.get("name") or "")
         prompt = img.get("prompt")
-        if not name or not prompt:
-            print(f"  skip (missing name/prompt): {img}")
+        if not name or not prompt or not isinstance(prompt, str):
+            print(f"  skip (missing/invalid name or prompt): {img}", file=sys.stderr)
             failed += 1
             continue
         if "/" in name or "\\" in name or name.startswith("."):
@@ -334,9 +344,7 @@ def main() -> None:
             continue
 
         quality = img.get("quality", b_quality)
-        size = img.get("size", b_size)
-        if size != b_size:                 # per-image override — validate too
-            validate_size(model, size)
+        size = img.get("size", b_size)  # per-image overrides already validated pre-loop
         use_refs = img.get("use_references", True) and bool(ref_paths)
         these_refs = ref_paths if use_refs else []
         full_prompt = f"{preamble}\n\n{prompt}" if preamble else prompt

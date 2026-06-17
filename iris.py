@@ -20,8 +20,9 @@ What's new in v0.7 (P5-2 — multi-agent dispatch):
     morning briefing, router v2) unchanged.
 
 Deploy: see 06_CEO/Designs/2026-05-28_Phase_5_P5-2_Dispatcher_Deploy.md
-        cp iris.py iris.py.bak-pre-dispatcher
-        cp iris-py-v0.7-dispatcher.py iris.py
+        (HISTORICAL — the one-time dispatcher cutover already happened on 2026-05-28.
+        This file IS the live daemon now; do NOT copy any iris-py-v0.7-dispatcher.py
+        over it — that legacy file is a frozen ancestor and would revert months of work.)
         launchctl kickstart -k gui/$(id -u)/com.iris.studio
         Test: Telegram "/agent echo hello world" → expect "📦 echo done ... hello world"
 
@@ -102,6 +103,7 @@ Lazy model load:
   one-time load cost.
 """
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -1116,9 +1118,25 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
 # Conversation memory (SQLite)
 # ============================================================
 
+@contextlib.contextmanager
+def _db():
+    """Single DB-connection factory. Guarantees the connection is CLOSED (the bare
+    `with sqlite3.connect(...)` form commits but never closes — that was the H1 leak),
+    sets a 30s busy_timeout + WAL journal so concurrent executor-thread writers wait
+    instead of raising `database is locked` and silently dropping rows (H2)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        with conn:  # commit on success / rollback on exception
+            yield conn
+    finally:
+        conn.close()
+
+
 def _init_db_sync() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -1244,7 +1262,7 @@ async def _ensure_db() -> None:
 
 
 def _get_history_sync(chat_id: str, limit: int) -> list[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         cursor = conn.execute(
             "SELECT role, content, tier, created_at FROM messages "
             "WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
@@ -1269,7 +1287,7 @@ async def get_history(chat_id: str, limit: int) -> list[dict]:
 
 
 def _save_message_sync(chat_id: str, user_id: int, role: str, content: str, tier: str | None) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO messages (chat_id, user_id, role, content, tier) VALUES (?, ?, ?, ?, ?)",
             (chat_id, user_id, role, content, tier),
@@ -1296,7 +1314,7 @@ def _today_iso() -> str:
 
 
 def _record_message_stat_sync(tier: str, cost_usd: float) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO daily_stats (date, tier, cost_usd) VALUES (?, ?, ?)",
             (_today_iso(), tier, cost_usd),
@@ -1317,7 +1335,7 @@ async def record_message_stat(tier: str, cost_usd: float = 0.0) -> None:
 
 def _get_today_stats_sync() -> dict:
     today = _today_iso()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         cursor = conn.execute(
             "SELECT tier, COUNT(*), COALESCE(SUM(cost_usd), 0.0) "
             "FROM daily_stats WHERE date = ? GROUP BY tier",
@@ -1389,7 +1407,7 @@ def _vault_rel(path_str: str | None) -> str:
 # --- SQLite helpers (sync; run via executor like the rest of the daemon) ---
 
 def _insert_dispatch_sync(d_id, agent_name, prompt, chat_id, expected, started_epoch):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO dispatches (id, agent_name, prompt, status, chat_id, "
             "expected_turnaround_minutes, started_epoch) "
@@ -1403,19 +1421,19 @@ def _update_dispatch_sync(d_id, fields: dict):
         return
     cols = ", ".join(f"{k} = ?" for k in fields)
     vals = list(fields.values()) + [d_id]
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(f"UPDATE dispatches SET {cols} WHERE id = ?", vals)
 
 
 def _list_dispatches_by_status_sync(status):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("SELECT * FROM dispatches WHERE status = ?", (status,))
         return [dict(r) for r in cur.fetchall()]
 
 
 def _count_active_dispatches_sync():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         cur = conn.execute(
             "SELECT COUNT(*) FROM dispatches WHERE status IN ('pending', 'running')"
         )
@@ -1423,7 +1441,7 @@ def _count_active_dispatches_sync():
 
 
 def _list_recent_dispatches_sync(limit):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
             "SELECT * FROM dispatches ORDER BY started_at DESC LIMIT ?", (limit,)
@@ -1432,7 +1450,7 @@ def _list_recent_dispatches_sync(limit):
 
 
 def _queue_notification_sync(chat_id, text):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO pending_notifications (chat_id, text) VALUES (?, ?)",
             (chat_id, text),
@@ -1440,7 +1458,7 @@ def _queue_notification_sync(chat_id, text):
 
 
 def _pop_pending_notifications_sync():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM pending_notifications ORDER BY id"
@@ -1460,7 +1478,7 @@ async def _db_call(fn, *args):
 # --- Phase 5 (P5-12) — expense-categorizer SQLite helpers ---
 
 def _insert_expense_run_sync(run_id: str, since_date: str, until_date: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO expense_categorizer_runs "
             "(id, since_date, until_date, status) VALUES (?, ?, ?, 'pending')",
@@ -1473,14 +1491,14 @@ def _update_expense_run_sync(run_id: str, fields: dict) -> None:
         return
     cols = ", ".join(f"{k} = ?" for k in fields)
     vals = list(fields.values()) + [run_id]
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             f"UPDATE expense_categorizer_runs SET {cols} WHERE id = ?", vals
         )
 
 
 def _get_expense_run_sync(run_id: str) -> dict | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM expense_categorizer_runs WHERE id = ?", (run_id,)
@@ -1490,7 +1508,7 @@ def _get_expense_run_sync(run_id: str) -> dict | None:
 
 def _get_last_expense_run_until_sync() -> str | None:
     """Most recent run's until_date (any status). Used to pick the next since."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         row = conn.execute(
             "SELECT until_date FROM expense_categorizer_runs "
             "ORDER BY started_at DESC LIMIT 1"
@@ -1501,7 +1519,7 @@ def _get_last_expense_run_until_sync() -> str | None:
 def _list_processed_msg_ids_sync(limit: int = 500) -> list[str]:
     """Most recent processed msg_ids (any status). Passed to the agent so it
     can dedup against prior runs. Capped to keep the brief tractable."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         rows = conn.execute(
             "SELECT msg_id FROM expense_categorizer_processed_msg_ids "
             "ORDER BY processed_at DESC LIMIT ?",
@@ -1513,7 +1531,7 @@ def _list_processed_msg_ids_sync(limit: int = 500) -> list[str]:
 def _upsert_processed_msg_id_sync(msg_id: str, run_id: str, status: str) -> None:
     """Insert or update a msg_id row. Idempotent: re-running the ingest or
     /approve on the same msg_id flips status without duplicating."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db() as conn:
         conn.execute(
             "INSERT INTO expense_categorizer_processed_msg_ids "
             "(msg_id, run_id, status) VALUES (?, ?, ?) "
@@ -1705,6 +1723,10 @@ def _parse_receipt_caption(caption: str, now: datetime) -> dict:
         vendor = vendor.replace(m.group(0), " ").strip()
     if dm:
         vendor = vendor.replace(dm.group(0), " ").strip()
+    # Neutralize markdown-table-breaking chars: a `|` would split the 7-column draft
+    # row (downstream column-misparse → wrong expense CSV), a newline would inject extra
+    # rows. Collapse both to safe separators before truncation (M2).
+    vendor = vendor.replace("|", "/").replace("\n", " ").replace("\r", " ")
     vendor = re.sub(r"\s+", " ", vendor).strip(" ,.-")
     if not vendor:
         vendor = "[VERIFY]"
@@ -1785,8 +1807,6 @@ async def _handle_receipt_photo(update: Update,
     Telegram ack with the /approve hint. Best-effort throughout; any
     individual failure is logged and surfaced to Steve as a soft warning
     (the photo + caption are still in Telegram, so nothing is lost)."""
-    user_id = update.effective_user.id
-    chat_id = str(update.effective_chat.id)
     username = update.effective_user.username or update.effective_user.first_name
     message = update.message
     now = datetime.now()
@@ -1894,7 +1914,7 @@ def _telegram_receipt_existing_sync(msg_id: str) -> dict | None:
     Used for idempotency on a Telegram photo re-send (the user clicks the
     same photo again — common UX). Returns the matching processed_msg_id
     row's `run_id` + `status`, or None if unseen."""
-    with sqlite3.connect(DB_PATH) as con:
+    with _db() as con:
         con.row_factory = sqlite3.Row
         row = con.execute(
             "SELECT msg_id, run_id, status FROM "
@@ -2211,16 +2231,26 @@ async def _send_telegram(chat_id, text) -> bool:
 
 # --- Deliverable detection + synthesis ---
 
-def _find_deliverable(agent_name: str, started_epoch: float) -> str | None:
+def _find_deliverable(agent_name: str, started_epoch: float,
+                      finished_epoch: float | None = None,
+                      allow_vault_wide: bool = True) -> str | None:
     """Best-effort: the file the subagent most likely produced. Prefer the
-    newest file modified at/after dispatch start under the agent's configured
-    deliverable_dir; else the newest such file anywhere in the vault; else None
-    (caller falls back to stdout). Skips dotfiles/dot-dirs."""
+    newest file modified within this dispatch's [start, finish] window under the
+    agent's configured deliverable_dir; else (only when no other dispatch is
+    concurrently active) the newest such file anywhere in the vault; else None
+    (caller falls back to stdout). Skips dotfiles/dot-dirs.
+
+    The time-window upper bound + the `allow_vault_wide` gate exist to stop
+    cross-dispatch mis-attribution (H3): without them, a concurrent dispatch's
+    freshly written file (anywhere in the vault) could be returned as THIS
+    agent's deliverable. When other dispatches are active the caller passes
+    allow_vault_wide=False so we only trust the agent's own dir."""
     cfg = DISPATCH_AGENTS.get(agent_name, {})
     search_dirs = []
     if cfg.get("deliverable_dir"):
         search_dirs.append(WORKSPACE_DIR / cfg["deliverable_dir"])
-    search_dirs.append(WORKSPACE_DIR)
+    if allow_vault_wide:
+        search_dirs.append(WORKSPACE_DIR)
     for base in search_dirs:
         if not base.exists():
             continue
@@ -2232,7 +2262,9 @@ def _find_deliverable(agent_name: str, started_epoch: float) -> str | None:
                 m = p.stat().st_mtime
             except OSError:
                 continue
-            if m >= started_epoch and m > newest_mtime:
+            if m < started_epoch or (finished_epoch is not None and m > finished_epoch):
+                continue
+            if m > newest_mtime:
                 newest, newest_mtime = p, m
         if newest is not None:
             return str(newest)
@@ -2308,9 +2340,18 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
 
     deliverable = None
     if status == "completed" and agent_name != DISPATCH_ECHO_AGENT:
+        finished_epoch = _now_epoch()
+        # This dispatch is still 'running' here (flipped to terminal below), so a
+        # count of 1 means it's the only active dispatch → the vault-wide fallback
+        # is safe. >1 means a concurrent dispatch could own files outside this
+        # agent's dir, so restrict to the agent's own deliverable_dir (H3).
+        active_now = await _db_call(_count_active_dispatches_sync)
         loop = asyncio.get_event_loop()
         deliverable = await loop.run_in_executor(
-            None, lambda: _find_deliverable(agent_name, started_epoch)
+            None,
+            lambda: _find_deliverable(
+                agent_name, started_epoch, finished_epoch, active_now <= 1
+            ),
         )
 
     await _update_dispatch(
@@ -2541,10 +2582,19 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes,
                     proc.kill()
                 except ProcessLookupError:
                     pass
+                # Re-draining communicate() after kill() can hang if the pipes are
+                # half-consumed — bound it and reap the process so the task can't
+                # block forever and the child can't linger as a zombie (M3).
                 try:
-                    out_b, err_b = await proc.communicate()
+                    out_b, err_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=5
+                    )
                 except Exception:
                     out_b, err_b = b"", b""
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except Exception:
+                        pass
             out = (out_b or b"").decode("utf-8", "replace").strip()
             err = (err_b or b"").decode("utf-8", "replace").strip()
             partial_path = None
@@ -3572,13 +3622,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     chat_id = str(update.effective_chat.id)
     username = update.effective_user.username or update.effective_user.first_name
-    text = update.message.text
+    # `.text` is None for non-text updates that still reach this handler (service
+    # messages, some edited/forwarded updates) — `None[:80]`/`None.strip()` would
+    # raise and drop the message with a false 🔴 alert (M1).
+    text = update.message.text or ""
 
     if user_id not in ALLOWED_USER_IDS:
         logger.warning(
             f"BLOCKED unauthorized message: user_id={user_id}, "
             f"username=@{username}, text={text[:80]!r}"
         )
+        return
+
+    if not text.strip():
         return
 
     logger.info(f"From @{username}: {text}")

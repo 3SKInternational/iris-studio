@@ -37,6 +37,11 @@ DB_BACKUP_DIR = Path("/Volumes/AI_Workspace/iris_studio")
 ACCEPTABLE_LATENESS = timedelta(hours=2)
 LOOKBACK = timedelta(hours=24)
 
+# Mirror of iris.py MORNING_BRIEFING_HOUR. Kept here as a named constant so the
+# fire-diff's expected morning-brief time stays in sync (was hard-coded 6 → stale
+# after the 06:00→08:00 move on 2026-06-16, H1).
+MORNING_BRIEFING_HOUR = 8
+
 # Python's weekday(): Mon=0..Sun=6. LaunchD's Weekday is Sun=0..Sat=6 so we
 # convert at the schedule table.
 MON, TUE, WED, THU, FRI, SAT, SUN = 0, 1, 2, 3, 4, 5, 6
@@ -137,7 +142,10 @@ def collect_expected(now: datetime) -> list[Expected]:
         ))
 
     # === iris.py daemon (APScheduler) ===
-    if (t := _last_fire_daily(now, 6, 0)):
+    # MUST match iris.py MORNING_BRIEFING_HOUR (currently 8 — moved 06:00→08:00
+    # ET on 2026-06-16). A stale value here makes the check perpetually false-flag
+    # the brief as a skip (H1); keep this in sync if iris.py changes.
+    if (t := _last_fire_daily(now, MORNING_BRIEFING_HOUR, 0)):
         expected.append(Expected(
             "morning_briefing", t, "morning_brief",
         ))
@@ -233,7 +241,7 @@ def _check_dispatch(exp: Expected, now: datetime) -> tuple[bool, str]:
         )
     statuses = [r[1] for r in rows]
     if "completed" in statuses:
-        return True, f"dispatch completed (id {rows[0][0][:8]}, status {rows[0][1]})"
+        return True, f"dispatch completed (id {str(rows[0][0])[:8]}, status {rows[0][1]})"
     return False, (
         f"dispatch row exists but no 'completed' status — "
         f"{len(rows)} row(s), statuses={statuses}"
@@ -266,8 +274,8 @@ def _check_expense_run(exp: Expected, now: datetime) -> tuple[bool, str]:
         )
     statuses = [r[1] for r in rows]
     if "failed" in statuses:
-        return False, f"expense run failed (id {rows[0][0][:8]})"
-    return True, f"expense run {rows[0][1]} (id {rows[0][0][:8]})"
+        return False, f"expense run failed (id {str(rows[0][0])[:8]})"
+    return True, f"expense run {rows[0][1]} (id {str(rows[0][0])[:8]})"
 
 
 CHECKERS = {

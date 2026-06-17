@@ -92,7 +92,7 @@ Time: ${TS}
 Reason: ${REASON:-(none given)}"
         echo "run_claude_job: '${JOB}' INCOMPLETE at ${TS}" >> "$LOG"
         ;;
-    ROUTINE_COMPLETE)
+    ROUTINE_COMPLETE*)
         alert "✅ launchd job '${JOB}' completed at $(date '+%H:%M %Z')."
         echo "run_claude_job: '${JOB}' completed ok at ${TS}" >> "$LOG"
         ;;

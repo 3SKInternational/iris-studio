@@ -26,6 +26,7 @@ Shipped: 2026-06-11 (Redesign Night 3 second half — A2 still blocked on Steve)
 from __future__ import annotations
 
 import datetime
+import os
 import re
 import sys
 import unicodedata
@@ -38,6 +39,11 @@ INBOX = VAULT / "INBOX.md"
 
 STATE_DIR = Path("/Users/steve/iris_studio/state")
 STATE_FILE = STATE_DIR / "stale_on_you_seen.tsv"
+
+# Drop ledger rows not seen in this many days, so slugs for items that have
+# left INBOX don't accumulate forever (M3). 14 days gives a couple of weekly
+# cycles of grace before an item's first-seen day-count is forgotten.
+SEEN_RETENTION_DAYS = 14
 
 # Decisions_Log lookup defaults (Night 4 fix — DQ-10 false-alarm root cause).
 DECISIONS_LOG_LOOKBACK_DAYS = 30
@@ -82,12 +88,24 @@ def _load_seen() -> dict[str, dict[str, str]]:
     return seen
 
 
-def _save_seen(seen: dict[str, dict[str, str]]) -> None:
+def _save_seen(seen: dict[str, dict[str, str]], today: str) -> None:
+    """Atomically persist the ledger, pruning rows stale beyond retention (M1, M3).
+
+    Prune: drop slugs whose last_seen is older than SEEN_RETENTION_DAYS, so the
+    ledger doesn't grow unbounded as items churn through INBOX.
+    Write: serialize to a temp file in the same dir then os.replace() (atomic
+    rename), so a crash mid-write can never leave a truncated/corrupt ledger.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lines = ["# slug\tfirst_seen\tlast_seen\ttext"]
     for slug, row in sorted(seen.items()):
+        if _days_between(row["last_seen"], today) > SEEN_RETENTION_DAYS:
+            continue
         lines.append(f"{slug}\t{row['first_seen']}\t{row['last_seen']}\t{row['text']}")
-    STATE_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    data = "\n".join(lines) + "\n"
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
 def _days_between(iso_a: str, iso_b: str) -> int:
@@ -361,10 +379,22 @@ def write_inbox(section: str) -> str:
         return "INBOX.md not found — skipping write"
     text = INBOX.read_text(encoding="utf-8")
     block = f"{SECTION_BEGIN}\n{section}\n{SECTION_END}"
-    if SECTION_BEGIN in text and SECTION_END in text:
+    n_begin = text.count(SECTION_BEGIN)
+    n_end = text.count(SECTION_END)
+    # Refuse to write on a malformed marker state (M2): more than one of either
+    # marker, or a count mismatch, or END-before-BEGIN ordering would make the
+    # DOTALL re.sub span the wrong region and corrupt INBOX. Bail loudly instead.
+    if n_begin > 1 or n_end > 1 or n_begin != n_end:
+        return (
+            f"refusing write — malformed C2 markers in INBOX "
+            f"(BEGIN×{n_begin}, END×{n_end}); fix markers by hand"
+        )
+    if n_begin == 1 and n_end == 1 and text.index(SECTION_END) < text.index(SECTION_BEGIN):
+        return "refusing write — C2 END marker precedes BEGIN in INBOX; fix by hand"
+    if n_begin == 1 and n_end == 1:
         new_text = re.sub(
             re.escape(SECTION_BEGIN) + r".*?" + re.escape(SECTION_END),
-            block.replace("\\", r"\\"),
+            lambda _m: block,
             text,
             count=1,
             flags=re.DOTALL,
@@ -381,7 +411,9 @@ def write_inbox(section: str) -> str:
         action = "inserted new C2 block"
     if new_text == text:
         return "C2 block unchanged"
-    INBOX.write_text(new_text, encoding="utf-8")
+    tmp = INBOX.with_name(INBOX.name + ".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, INBOX)
     return f"INBOX.md {action}"
 
 
@@ -400,7 +432,7 @@ def main() -> int:
     # an item that gets correctly excluded still has its first_seen ledger row,
     # which keeps day-counts honest if the decision later proves stale and the
     # item re-emerges.
-    _save_seen(seen)
+    _save_seen(seen, today)
 
     # Night 4 fix — exclude items that already have a recent decision logged
     # (the DQ-10 false-alarm class). Title-token overlap + DQ-id body grep,

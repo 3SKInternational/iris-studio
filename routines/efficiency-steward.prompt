@@ -70,3 +70,13 @@ The ledger main map table is **structured markdown** that downstream readers (th
 - **Never edit a blueprint someone else wrote.** If a prior steward audit already produced a blueprint for a row, leave it; the build lane closes it when the build ships.
 - **When unsure whether to surface a new cadence, ERR TOWARDS surfacing it** in the audit-log entry. Missing cadences hide standing costs; an over-eager surface is cheap to dismiss next audit.
 - **Hard rule #6 (don't design for hypothetical):** if a workflow's volume is currently zero (e.g. expense-categorizer pre-Mercury), tier-fit it for *today's* volume, not the projected post-launch volume. Tier-reassessment is part of every audit — promote later when volume justifies it.
+
+---
+
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the audit ran fully: ledger audit-log entry written, any flags/blueprints/routes filed, daily-note bullet appended. A fully clean audit (zero flags) is still COMPLETE.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — anything was skipped, blocked, or failed (couldn't read the ledger, a write failed, ran out of window mid-audit).
+
+Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.

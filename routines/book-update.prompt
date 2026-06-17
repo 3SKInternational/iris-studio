@@ -42,3 +42,13 @@ PASS 3 — SHIP (only if editor verdict = SHIP):
   - Append a session line to _Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md and a 1-line entry to today's daily note "## 🤖 Claude Code intra-day log".
 
 NEVER fabricate book content. The agents enforce source-grounding; you enforce the SHIP/HOLD gate.
+
+---
+
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the pipeline ran to a clean designed outcome: book shipped, OR a no-op (PASS 0 guard found nothing new), OR a deliberate HOLD that you surfaced + cleaned up per the rules. A HOLD is a *correct* outcome, not a failure.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — something actually broke or was skipped: the redact gate exited 1, an agent errored, a write failed, or you couldn't finish a pass.
+
+Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.

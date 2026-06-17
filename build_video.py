@@ -237,14 +237,16 @@ def _resolve_image(asset_dir: Path, images_rel: str, vid: str,
 def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict[int, dict],
                          vid: str, asset_dir: Path, images_rel: str, vo_rel: str,
                          output_dir: Path, output_name: str,
-                         allow_image_fallback: bool = False) -> tuple[dict, bool, list[str]]:
+                         allow_image_fallback: bool = False) -> tuple[dict, bool, list[str], list[int]]:
     """Author the video_factory edit manifest.
 
     `allow_image_fallback` (set only for an explicit `--image-set`) lets a shot
     missing from `images_rel` resolve to the locked north-star scene frame;
     otherwise a missing frame is left as-is for the assembler to hard-fail on.
-    Returns (manifest, all_vo_present, image_fallbacks) — image_fallbacks lists
-    any shots that fell back (logged by the caller, never silent).
+    Returns (manifest, all_vo_present, image_fallbacks, undetermined_scenes).
+    `undetermined_scenes` lists multi-shot scenes whose per-shot timing could NOT
+    be computed (no VO mp3 AND no cadence entry) — assembling those would replay
+    the scene's audio once per shot (M1), so the caller must refuse to assemble.
     """
     by_scene: dict[int, list[dict]] = {}
     for s in shots:
@@ -253,6 +255,7 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     out_shots: list[dict] = []
     all_vo = True
     fallbacks: list[str] = []
+    undetermined: list[int] = []
     mi = 0  # global motion index, for visual variety across the whole video
     for scene in sorted(by_scene):
         scene_shots = by_scene[scene]
@@ -285,6 +288,8 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
                 if i < k - 1:                       # omit end on the tail shot so
                     shot["end"] = round(cum * dur, 3)  # it runs to clip end
             out_shots.append(shot)
+        if dur is None and k > 1:
+            undetermined.append(scene)
 
     manifest = {
         "video": f"{vid}_v2 (orchestrated)",
@@ -294,7 +299,7 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         "defaults": {"zoom": 1.04, "fit": "contain"},
         "shots": out_shots,
     }
-    return manifest, all_vo, fallbacks
+    return manifest, all_vo, fallbacks, undetermined
 
 
 # --- engine invocation -----------------------------------------------------
@@ -391,7 +396,7 @@ def main() -> None:
     img_manifest_path = REPO / "image_factory" / "manifests" / f"{vid}_orchestrated.json"
     write_json(img_manifest_path, img_manifest)
 
-    edit_manifest, all_vo, fallbacks = author_edit_manifest(
+    edit_manifest, all_vo, fallbacks, _undetermined = author_edit_manifest(
         shots, cadence, kit, vid, vlt, images_rel, vo_rel,
         vlt / "Footage_and_Edits", f"{vid}_v2",
         allow_image_fallback=bool(args.image_set),
@@ -442,13 +447,20 @@ def main() -> None:
         rc |= run(cmd, label="STAGE vo (billed)")
     if do_assemble:
         # Re-author the edit manifest now that VO clips should exist (exact durations).
-        edit_manifest, _, fallbacks = author_edit_manifest(
+        edit_manifest, _, fallbacks, undetermined = author_edit_manifest(
             shots, cadence, kit, vid, vlt, images_rel, vo_rel,
             vlt / "Footage_and_Edits", f"{vid}_v2",
             allow_image_fallback=bool(args.image_set),
         )
         for fb in fallbacks:
             print(f"  ⚠ image fallback — {fb}")
+        if undetermined:
+            # Refuse rather than emit a video that replays each scene's VO once per
+            # shot. Happens when a multi-shot scene still has no VO mp3 and no
+            # shot-list cadence entry to derive timing from (M1).
+            die("cannot assemble — these multi-shot scenes have no determinable "
+                f"timing (missing VO mp3 AND no cadence entry): {undetermined}. "
+                "Generate the VO clips (or add cadence entries) first.")
         write_json(edit_manifest_path, edit_manifest)
         rc |= run([sys.executable, str(assembler), str(edit_manifest_path)], label="STAGE assemble (free)")
 
