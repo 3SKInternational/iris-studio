@@ -592,7 +592,7 @@ DAILY_TIER4_CAP_USD = 2.0  # canonical plan: "$2/day ($60/mo ceiling)"
 # and sends via Telegram to Steve. Also exposed as /briefing slash command
 # for on-demand testing without waiting for 7 AM.
 TIMEZONE = ZoneInfo("America/New_York")
-MORNING_BRIEFING_HOUR = 6  # Was 7, moved to 6 AM ET on 2026-05-25 per Steve
+MORNING_BRIEFING_HOUR = 8  # 7→6 (2026-05-25); →8 AM ET 2026-06-16 per Steve (window-align: overnight CC jobs open the 5-hr usage window ~02:30, it resets ~07:30, so an 8 AM brief lands after reset → Steve gets a fresh window when he opens Claude Code)
 MORNING_BRIEFING_MINUTE = 0
 _scheduler: AsyncIOScheduler | None = None
 
