@@ -2,7 +2,7 @@ Sunday engineering hygiene at 09:00 AM ET. Weekly multi-pass grooming sweep.
 
 Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
 
-Perform these 7 grooming passes. Write all findings into a single new design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` (date-prefixed). Cross-reference from INBOX.md by appending a one-line link under "🧍 THIS WEEK".
+Perform these 8 grooming passes. Write all findings into a single new design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` (date-prefixed). Cross-reference from INBOX.md by appending a one-line link under "🧍 THIS WEEK".
 
 1. **iris.py type check.** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/pyright iris.py 2>&1 | tail -30` (or `which pyright` then full path). If pyright not installed, suggest `.venv/bin/pip install pyright` and skip this pass. Flag any reported type errors but do NOT auto-fix (Steve approves changes).
 
@@ -18,6 +18,10 @@ Perform these 7 grooming passes. Write all findings into a single new design doc
 6. **Dependency drift check.** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/pip list --outdated 2>&1 | head -20`. Note any package with major-version drift. Do NOT auto-update; flag for Steve.
 
 7. **Insurance/backup audit.** List any `.OLD-*` insurance directories older than 48 hours that are still on disk. Recommend deletion in the hygiene doc.
+
+8. **Claude Code cask version-skew guardrail (added 2026-06-17).** Every launchd CC routine invokes `/opt/homebrew/bin/claude` — the Homebrew cask — which auto-updates on its own track, *independently* of the Desktop-bundled binary that interactive sessions use. On 2026-06-17 the cask silently drifted to 2.1.144 (a build with a Bash-sandbox regression) while Desktop ran 2.1.149: interactive sessions worked, but 6 overnight launchd routines failed with `EPERM: mkdir ~/.claude/session-env/<uuid>` and it took ~6 degraded routines to root-cause. This pass catches that skew early. First guard against a false "all clear": `command -v brew >/dev/null` — if `brew` is NOT on PATH, do NOT treat that as "current"; flag it in the hygiene doc as "⚠️ cask version-skew check SKIPPED — brew not on PATH" and fire the same notify.sh alert (silent-skip is the exact failure mode this pass exists to prevent). Otherwise run: `brew outdated --cask claude-code --quiet 2>/dev/null` (empty output = current; the cask name printed = outdated).
+   - **If output is empty (current):** note one line in the hygiene doc — `Claude Code cask current (vX.Y.Z)`, taking the version from `/opt/homebrew/bin/claude --version`. No alert.
+   - **If output is non-empty (outdated):** this is exactly the silent-routine-degradation failure mode, so surface it loudly, NOT just as a passive doc line. (a) Fire a Telegram push via the canonical channel: `/Volumes/AI_Workspace/iris_studio/scripts/notify.sh "⚠️ Claude Code Homebrew cask is OUTDATED — every launchd routine runs this binary. Installed: $(/opt/homebrew/bin/claude --version 2>&1). Latest available: $(brew info --cask claude-code 2>/dev/null | head -1). Fix: brew upgrade --cask claude-code — your call whether to upgrade."`. (b) Also flag it as a TOP-line item in the hygiene doc. **Do NOT auto-`brew upgrade`** — it replaces the shared binary every routine depends on, so Steve signs off on the upgrade interactively. Alert only.
 
 **Output expectations:**
 - New design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` with frontmatter (`date`, `type: hygiene-report`, `status: complete`, `related: [[Pitch_Log]] [[2026-05-26_Phase_4_and_5_Build_Queue]]`, `tags: [hygiene/weekly]`).
