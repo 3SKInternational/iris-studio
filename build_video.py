@@ -169,6 +169,64 @@ def split_scene(caption: str, n: int) -> list[tuple[str, float]]:
     return [(t, w / total) for t, w in groups]
 
 
+# --- real-speech alignment (optional) --------------------------------------
+
+# Only require faster-whisper when --align is actually used; a normal run must
+# not need it. Resolved lazily and cached on the module.
+_ALIGN_MOD = None
+
+
+def _align_module():
+    global _ALIGN_MOD
+    if _ALIGN_MOD is None:
+        sys.path.insert(0, str(REPO / "vo_factory"))
+        import align_vo  # noqa: E402  (intentional lazy import)
+        _ALIGN_MOD = align_vo
+    return _ALIGN_MOD
+
+
+# Below this fraction of words anchored to real audio we don't trust the
+# alignment for this clip and fall back to the character-proportion estimate.
+_MIN_MATCH_RATE = 0.5
+
+
+def aligned_internal_cuts(caption: str, cap_parts: list[tuple[str, float]],
+                          dur: float, vo_path: Path) -> list[float] | None:
+    """Real-speech cut times for the k-1 internal shot boundaries of a scene.
+
+    Maps each shot boundary (a cumulative word count into the caption) to the
+    time that word is actually spoken, via local forced alignment. Returns the
+    k-1 boundary times, or None to signal "fall back to the proportional split"
+    — when the clip can't be aligned, the alignment is low-confidence, a boundary
+    word index is out of range, or the resulting cuts aren't strictly increasing
+    inside (0, dur). The caller keeps its existing character-proportion math on
+    None, so alignment can only ever improve timing, never break assembly.
+    """
+    k = len(cap_parts)
+    if k <= 1 or dur is None or dur <= 0 or not vo_path.is_file():
+        return None
+    am = _align_module()
+    try:
+        result = am.load_or_align(vo_path, caption)
+    except SystemExit:
+        return None  # align_vo.die() on a bad clip must not abort the build
+    words = result.get("words") or []
+    if not words or result.get("match_rate", 0.0) < _MIN_MATCH_RATE:
+        return None
+    cuts: list[float] = []
+    wc = 0
+    for i in range(k - 1):  # k-1 internal boundaries; tail runs to clip end
+        wc += len(am.tokenize(cap_parts[i][0]))
+        if not (0 < wc < len(words)):
+            return None
+        cuts.append(float(words[wc]["start"]))
+    # Strictly increasing and strictly inside (0, dur), else don't trust it.
+    bounds = [0.0, *cuts, dur]
+    if any(bounds[j] >= bounds[j + 1] for j in range(len(bounds) - 1)):
+        return None
+    return cuts
+
+
 # --- duration probing ------------------------------------------------------
 
 def ffprobe_seconds(mp3: Path) -> float | None:
@@ -237,16 +295,28 @@ def _resolve_image(asset_dir: Path, images_rel: str, vid: str,
 def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict[int, dict],
                          vid: str, asset_dir: Path, images_rel: str, vo_rel: str,
                          output_dir: Path, output_name: str,
-                         allow_image_fallback: bool = False) -> tuple[dict, bool, list[str], list[int]]:
+                         allow_image_fallback: bool = False,
+                         align: bool = False,
+                         fit: str | None = None) -> tuple[dict, bool, list[str], list[int], list[str]]:
     """Author the video_factory edit manifest.
 
     `allow_image_fallback` (set only for an explicit `--image-set`) lets a shot
     missing from `images_rel` resolve to the locked north-star scene frame;
     otherwise a missing frame is left as-is for the assembler to hard-fail on.
-    Returns (manifest, all_vo_present, image_fallbacks, undetermined_scenes).
-    `undetermined_scenes` lists multi-shot scenes whose per-shot timing could NOT
-    be computed (no VO mp3 AND no cadence entry) — assembling those would replay
-    the scene's audio once per shot (M1), so the caller must refuse to assemble.
+
+    `align` (set by --align): for multi-shot scenes, derive each shot's audio
+    window from where its words are ACTUALLY spoken (local forced alignment)
+    instead of the caption character-proportion estimate. Any scene that can't be
+    aligned cleanly silently keeps the proportional split, so --align only ever
+    sharpens timing. `fit` overrides the manifest's default fit ("contain" when
+    unset); pass "cover" to keep V1's original crop-to-fill look.
+
+    Returns (manifest, all_vo_present, image_fallbacks, undetermined_scenes,
+    align_notes). `undetermined_scenes` lists multi-shot scenes whose per-shot
+    timing could NOT be computed (no VO mp3 AND no cadence entry) — assembling
+    those would replay the scene's audio once per shot (M1), so the caller must
+    refuse to assemble. `align_notes` are human-readable per-scene alignment
+    outcomes (empty unless `align`).
     """
     by_scene: dict[int, list[dict]] = {}
     for s in shots:
@@ -256,6 +326,7 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     all_vo = True
     fallbacks: list[str] = []
     undetermined: list[int] = []
+    align_notes: list[str] = []
     mi = 0  # global motion index, for visual variety across the whole video
     for scene in sorted(by_scene):
         scene_shots = by_scene[scene]
@@ -268,7 +339,16 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         if dur is None:
             all_vo = False
             dur = cadence.get(scene)  # fallback: shot-list cadence table
-        cap_parts = split_scene(kit.get(scene, {}).get("caption", ""), k)
+        caption = kit.get(scene, {}).get("caption", "")
+        cap_parts = split_scene(caption, k)
+        # Real-speech cut times (k-1 internal boundaries) when --align is on and
+        # the scene aligns cleanly; None means keep the proportional estimate.
+        align_cuts = None
+        if align and dur is not None and k > 1:
+            align_cuts = aligned_internal_cuts(caption, cap_parts, dur, vo_path)
+            align_notes.append(
+                f"scene {scene}: real-speech cut timing ({k} shots)" if align_cuts is not None
+                else f"scene {scene}: alignment unavailable/low-confidence — kept proportional timing")
         cum = 0.0  # cumulative fraction of the clip consumed by prior shots
         for i, s in enumerate(scene_shots):
             text, weight = cap_parts[i]
@@ -283,10 +363,17 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             }
             mi += 1
             if dur is not None and k > 1:
-                shot["start"] = round(cum * dur, 3)
-                cum += weight
-                if i < k - 1:                       # omit end on the tail shot so
-                    shot["end"] = round(cum * dur, 3)  # it runs to clip end
+                if align_cuts is not None:
+                    # Real word-boundary times: [0, cut1, …, cut(k-1), clip end].
+                    bounds = [0.0, *align_cuts, dur]
+                    shot["start"] = round(bounds[i], 3)
+                    if i < k - 1:                       # tail omits end -> clip end
+                        shot["end"] = round(bounds[i + 1], 3)
+                else:
+                    shot["start"] = round(cum * dur, 3)
+                    cum += weight
+                    if i < k - 1:                       # omit end on the tail shot so
+                        shot["end"] = round(cum * dur, 3)  # it runs to clip end
             out_shots.append(shot)
         if dur is None and k > 1:
             undetermined.append(scene)
@@ -296,10 +383,10 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         "asset_dir": str(asset_dir),
         "output_dir": str(output_dir),
         "output_name": output_name,
-        "defaults": {"zoom": 1.04, "fit": "contain"},
+        "defaults": {"zoom": 1.04, "fit": fit or "contain"},
         "shots": out_shots,
     }
-    return manifest, all_vo, fallbacks, undetermined
+    return manifest, all_vo, fallbacks, undetermined, align_notes
 
 
 # --- engine invocation -----------------------------------------------------
@@ -326,6 +413,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vo-source", help="Vault-relative dir of existing VO mp3s to assemble from (e.g. Voice_Files/Video_01).")
     p.add_argument("--image-set", help="Vault-relative dir of existing image PNGs to assemble from (e.g. Raw_Assets/Video_01_HD). Mutually exclusive with --images.")
     p.add_argument("--force", action="store_true", help="Pass --force to the billed stages (re-render existing).")
+    p.add_argument("--align", action="store_true",
+                   help="Cut multi-shot scenes at REAL spoken-word boundaries via local "
+                        "forced alignment (fixes within-scene A/V drift). Local, free, no API.")
+    p.add_argument("--fit", choices=["cover", "contain"], default=None,
+                   help="Override the edit-manifest default fit. 'cover' = crop-to-fill "
+                        "(V1's original look); 'contain' = blurred-fill, no crop (default).")
     return p.parse_args()
 
 
@@ -396,10 +489,15 @@ def main() -> None:
     img_manifest_path = REPO / "image_factory" / "manifests" / f"{vid}_orchestrated.json"
     write_json(img_manifest_path, img_manifest)
 
-    edit_manifest, all_vo, fallbacks, _undetermined = author_edit_manifest(
+    # The initial authoring is for the plan/preview + an interim manifest write;
+    # keep it alignment-free so a plan (or any non-assemble run) never triggers
+    # local transcription. Real-speech timing is applied in the assemble
+    # re-author below, right before the render.
+    edit_manifest, all_vo, fallbacks, _undetermined, _align_notes = author_edit_manifest(
         shots, cadence, kit, vid, vlt, images_rel, vo_rel,
         vlt / "Footage_and_Edits", f"{vid}_v2",
         allow_image_fallback=bool(args.image_set),
+        fit=args.fit,
     )
     # Key the edit manifest by BOTH its image set and its VO source so distinct
     # asset combinations (e.g. `_gen`+`_gen` vs `Video_01_HD`+hand-VO) never
@@ -446,14 +544,19 @@ def main() -> None:
             cmd.append("--force")
         rc |= run(cmd, label="STAGE vo (billed)")
     if do_assemble:
-        # Re-author the edit manifest now that VO clips should exist (exact durations).
-        edit_manifest, _, fallbacks, undetermined = author_edit_manifest(
+        # Re-author the edit manifest now that VO clips should exist (exact
+        # durations). With --align this is where local forced alignment runs, so
+        # the cut times use real spoken-word boundaries instead of the estimate.
+        edit_manifest, _, fallbacks, undetermined, align_notes = author_edit_manifest(
             shots, cadence, kit, vid, vlt, images_rel, vo_rel,
             vlt / "Footage_and_Edits", f"{vid}_v2",
             allow_image_fallback=bool(args.image_set),
+            align=args.align, fit=args.fit,
         )
         for fb in fallbacks:
             print(f"  ⚠ image fallback — {fb}")
+        for note in align_notes:
+            print(f"  ◆ {note}")
         if undetermined:
             # Refuse rather than emit a video that replays each scene's VO once per
             # shot. Happens when a multi-shot scene still has no VO mp3 and no
