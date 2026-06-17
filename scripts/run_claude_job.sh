@@ -97,6 +97,29 @@ Reason: ${REASON:-(none given)}"
         echo "run_claude_job: '${JOB}' completed ok at ${TS}" >> "$LOG"
         ;;
     *)
+        # No sentinel. Before the generic warning, disambiguate the one cause
+        # that's both common and silently misrouted here: a Claude CLI auth /
+        # credit failure. When the CLI can't authenticate it prints its error
+        # (e.g. "Failed to authenticate. API Error: 401 ..." / "out of usage
+        # credits") and exits *0* — the agent never runs, so there is never a
+        # sentinel, which is *why* this branch is the only place it can land.
+        # Gating on "no sentinel" (rather than scanning all output) means a
+        # routine that merely WROTE about credits/auth — e.g. the book chapter on
+        # the two-quota model — can't false-alarm: it still emits its sentinel
+        # above and never reaches here. This wrapper is the shared choke point
+        # for every claude --print launchd job, so this one guard hardens the
+        # whole suite. (Root-caused 2026-06-17 after book-update + nightly
+        # silently died on a stale CLI login for days.)
+        if grep -qiE 'Failed to authenticate|API Error: 40[0-9]|out of usage credits' "$RUN_OUT"; then
+            DETAIL="$(grep -iE 'Failed to authenticate|API Error: 40[0-9]|out of usage credits|Invalid authentication' "$RUN_OUT" | head -2 | tr '\n' ' ' | sed -e $'s/\033\\[[0-9;]*m//g' -e 's/[[:space:]]\\+/ /g' -e 's/[[:space:]]*$//')"
+            alert "🔴 launchd job '${JOB}' FAILED — Claude CLI auth/credits rejected.
+FIX: run \`claude login\` in a Terminal on the Mini, then re-run the job. (A 401 = stale OAuth token; re-auth clears it. If re-auth doesn't help, you may be genuinely out of Max credits — wait for the window reset.)
+This blocks EVERY overnight claude job until cleared.
+Time: ${TS}
+Detail: ${DETAIL}"
+            echo "run_claude_job: '${JOB}' AUTH/CREDIT FAILURE at ${TS} — needs \`claude login\` on the Mini" >> "$LOG"
+            exit 1
+        fi
         alert "⚠️ launchd job '${JOB}' finished (exit 0) but emitted no completion signal — may not be fully done. Check the log."
         echo "run_claude_job: '${JOB}' completed WITHOUT sentinel at ${TS}" >> "$LOG"
         ;;
