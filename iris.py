@@ -443,8 +443,10 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # DRAFTS ONLY — it never posts (publishing target is undecided pending the
     # brand-split call, Charter §7.2). Redaction is fail-closed: it scrubs
     # [AUTHOR]/[COMPANY]/[ASSISTANT]/[EMAIL]/[BOT]/[USER] to placeholders, runs the
-    # shared deterministic scrub (scripts/redact-book.py) on its own draft as a
-    # MANDATORY post-write pass, and DROPS any item it can't safely redact. It
+    # brand-safe deterministic scrub (scripts/redact-buildlog.py — keeps the public
+    # "Iris" brand name, scrubs infra tokens + structural paths/IPs/hosts/creds) on its
+    # own draft as a MANDATORY post-write pass, and DROPS any item it can't safely
+    # redact. It
     # reads git via its own Bash tool (`git -C <repo> log`),
     # which is NOT sandboxed by --add-dir, so no extra_add_dirs is needed — the
     # bridge file + session digests it Reads all live inside WORKSPACE_DIR.
