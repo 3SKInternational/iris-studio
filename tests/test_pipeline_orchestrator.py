@@ -454,5 +454,105 @@ class TestStatusReadOnly(unittest.TestCase):
                              "--status must not write to the state file")
 
 
+class TestInfraFailureClassification(unittest.TestCase):
+    """Round-2 HIGH fix: INFRA_FAILURE_MARKERS were too broad — substrings like
+    'no such file or directory' / 'permission denied' / 'operation not permitted'
+    also matched GENUINE task failures, so a real failure retried forever and
+    never parked. These lock the markers down so that regression can't sneak back."""
+
+    GENUINE_TASK_FAILURES = (
+        "Error: No such file or directory: '/task/input.md'",
+        "PermissionError: [Errno 1] Operation not permitted",
+        "Permission denied (publickey).",
+        "EPERM: operation not permitted, open '/x'",
+        "Traceback ... FileNotFoundError: [Errno 2] No such file or directory",
+    )
+    REAL_INFRA = (
+        "claude: error reading ~/.claude/session-env (EPERM)",
+        "fork: Resource temporarily unavailable",
+        "OSError: [Errno 12] Cannot allocate memory",
+        "bash: claude: command not found",
+        "OSError: [Errno 24] Too many open files",
+    )
+
+    def test_genuine_task_failures_are_not_infra(self):
+        for msg in self.GENUINE_TASK_FAILURES:
+            self.assertFalse(po._is_infra_failure(msg),
+                             f"must NOT be infra (genuine task failure): {msg!r}")
+
+    def test_real_host_failures_are_infra(self):
+        for msg in self.REAL_INFRA:
+            self.assertTrue(po._is_infra_failure(msg),
+                            f"must be infra (host/toolchain): {msg!r}")
+
+
+class TestOnFailureRetryBounding(unittest.TestCase):
+    """Round-2 HIGH fix: infra skips must be bounded by MAX_INFRA (so a host
+    outage that never clears parks+surfaces instead of looping invisibly), while
+    a genuine task failure still parks as 'failed' at MAX_FAILS and never touches
+    infra_count."""
+
+    def test_infra_parks_at_max_infra(self):
+        s = po._stage("orchestrator", False, [])
+        for i in range(1, po.MAX_INFRA + 1):
+            po._on_failure(s, "broken session-env")
+            if i < po.MAX_INFRA:
+                self.assertEqual(s["status"], "ready")
+                self.assertIsNone(s.get("park_reason"))
+        self.assertEqual(s["status"], "needs-steve")
+        self.assertEqual(s["park_reason"], "infra")
+        self.assertEqual(s["infra_count"], po.MAX_INFRA)
+        self.assertEqual(s["fail_count"], 0, "infra must never burn a task-failure retry")
+
+    def test_genuine_failure_parks_at_max_fails_without_touching_infra(self):
+        s = po._stage("orchestrator", False, [])
+        for _ in range(po.MAX_FAILS):
+            po._on_failure(s, "agent task returned No such file or directory: '/x'")
+        self.assertEqual(s["status"], "needs-steve")
+        self.assertEqual(s["park_reason"], "failed")
+        self.assertEqual(s["fail_count"], po.MAX_FAILS)
+        self.assertEqual(s["infra_count"], 0)
+
+    def test_success_resets_both_counters(self):
+        s = po._stage("orchestrator", False, [])
+        s["fail_count"], s["infra_count"] = 2, 3
+        po._on_success(s, "1_script", 1, "done")
+        self.assertEqual(s["fail_count"], 0)
+        self.assertEqual(s["infra_count"], 0)
+
+
+class TestStalenessFromLastProgress(unittest.TestCase):
+    """Round-2 HIGH fix: staleness is measured from last_progress_at (forward
+    progress only), not updated_at (which bumps on every save incl. infra-skip
+    and gate-park). So an infra-retry loop still goes stale, and a pre-existing
+    state file lacking the field still classifies via the fallback."""
+
+    def _line(self, **top):
+        data = {"video": 1, "title": "T", "stages": po.default_stages()}
+        data.update(top)
+        return po._video_summary_line(data)[1]
+
+    def test_old_progress_fresh_update_is_stale(self):
+        import datetime as _dt
+        old_iso = (_dt.datetime.now(_dt.timezone.utc)
+                   - _dt.timedelta(days=po.STALE_DAYS + 2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = self._line(last_progress_at=old_iso, updated_at=po.now_iso(),
+                          created_at=old_iso)
+        self.assertIn("no progress", line,
+                      "stale must be measured from last_progress_at, not updated_at")
+
+    def test_fresh_progress_not_stale(self):
+        line = self._line(last_progress_at=po.now_iso(), updated_at=po.now_iso(),
+                          created_at=po.now_iso())
+        self.assertNotIn("no progress", line)
+
+    def test_missing_field_falls_back_without_crashing(self):
+        # A pre-existing file (no last_progress_at, no per-stage infra_count) must
+        # classify cleanly via the updated_at→created_at fallback.
+        line = self._line(updated_at=po.now_iso(), created_at=po.now_iso())
+        self.assertIsInstance(line, str)
+        self.assertIn("V1", line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

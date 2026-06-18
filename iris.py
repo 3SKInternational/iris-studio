@@ -2783,6 +2783,44 @@ async def _run_pipeline_command(video: int, action: str, chat_id) -> None:
         await _send_telegram(chat_id, f"⚠️ /pipeline {video} {action} crashed: {exc}")
 
 
+# Fleet flags carry NO --video — they sweep every Video_NN_pipeline.json. Both
+# route through the orchestrator's gated select_next, so --advance-all physically
+# cannot cross a gate / spend / publish / record VO any more than a per-video
+# advance can (the structural invariant lives in select_next). --supervise spawns
+# no agents at all (read-only). Same fixed-shape, non-model-routable posture.
+_PIPELINE_FLEET_FLAGS = {"advance": "--advance-all", "status": "--supervise"}
+
+
+async def _run_pipeline_fleet_command(action: str, chat_id) -> None:
+    """Run the orchestrator subprocess for ONE fixed fleet action (advance-all |
+    supervise) and relay stdout. `action` is validated by the caller. Never raises."""
+    flag = _PIPELINE_FLEET_FLAGS[action]
+    cmd = [sys.executable, str(PIPELINE_SCRIPT), flag]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(PROJECT_DIR),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate()
+        out = (out_b or b"").decode(errors="replace").strip()
+        err = (err_b or b"").decode(errors="replace").strip()
+        if proc.returncode == 0 and out:
+            await _send_telegram(chat_id, out[:3500])
+        elif out or err:
+            await _send_telegram(
+                chat_id,
+                f"/pipeline all {action} (rc={proc.returncode}):\n{(out or err)[:3000]}",
+            )
+        else:
+            await _send_telegram(
+                chat_id,
+                f"/pipeline all {action} finished (rc={proc.returncode}, no output).",
+            )
+    except Exception as exc:
+        logger.exception(f"/pipeline all {action} crashed: {exc}")
+        await _send_telegram(chat_id, f"⚠️ /pipeline all {action} crashed: {exc}")
+
+
 async def _reconcile_orphaned_dispatches():
     """On boot, any dispatch left pending/running was orphaned when the prior
     daemon stopped (its subprocess was a child of that process and is gone).
@@ -3847,12 +3885,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if stripped_text.lower().startswith(("/pipeline ", "!pipeline ")):
         rest = stripped_text.split(None, 1)[1].strip() if len(stripped_text.split(None, 1)) > 1 else ""
         parts = rest.split()
+        # Fleet path: "/pipeline all" advances every in-flight video to its next
+        # gate; "/pipeline all status" is the read-only supervision sweep. Both
+        # are gated through select_next — they can never spend/publish/record VO.
+        if parts and parts[0].lower() == "all":
+            fleet_action = "advance"
+            if len(parts) == 2 and parts[1].lower() == "status":
+                fleet_action = "status"
+            elif len(parts) >= 2:
+                await update.message.reply_text(
+                    "Usage:\n"
+                    "  /pipeline all          advance every in-flight video to its next gate\n"
+                    "  /pipeline all status   read-only fleet supervision sweep"
+                )
+                return
+            logger.info(f"From @{username} (/pipeline all {fleet_action})")
+            ack = {
+                "advance": "🌙 Advancing every in-flight video to its next gate…",
+                "status": "📋 Reading the whole pipeline fleet…",
+            }[fleet_action]
+            await update.message.reply_text(ack + " I'll send the digest here when it's done.")
+            asyncio.create_task(_run_pipeline_fleet_command(fleet_action, chat_id))
+            return
         if not parts or not parts[0].isdigit():
             await update.message.reply_text(
                 "Usage:\n"
                 "  /pipeline <N>            advance video N one stage\n"
                 "  /pipeline <N> status     show the pipeline state table\n"
                 "  /pipeline <N> spend-ok   authorize the BILLED image batch (stage 5)\n"
+                "  /pipeline all            advance every in-flight video to its next gate\n"
+                "  /pipeline all status     read-only fleet supervision sweep\n"
                 "N must be an integer."
             )
             return
@@ -4127,7 +4189,9 @@ def main() -> None:
     logger.info(
         f"Pipeline orchestrator: ENABLED. '/pipeline <N>' advances video N one stage; "
         f"'/pipeline <N> status' shows the state table; '/pipeline <N> spend-ok' is the "
-        f"ONLY billed-image path. Fixed-shape, NOT model-routable. Script: {PIPELINE_SCRIPT}."
+        f"ONLY billed-image path. Fleet: '/pipeline all' advances every video to its next "
+        f"gate, '/pipeline all status' is the read-only supervision sweep. "
+        f"Fixed-shape, NOT model-routable. Script: {PIPELINE_SCRIPT}."
     )
     logger.info(
         "OAuth-aware error reply: ENABLED. Auth failures surface a 'run claude login' hint to Steve via Telegram."
