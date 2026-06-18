@@ -15,12 +15,26 @@ is the explicit, human-typed `--spend-ok` (CLI) / `/pipeline NN spend-ok`
 (Telegram) command, which is not routable by the cloud model.
 
 Design: 06_CEO/Designs/2026-06-18_Pipeline_Orchestrator_Architecture.md
-CLI:
+Per-video CLI (one video):
   python scripts/pipeline_orchestrator.py --video 5 --advance
   python scripts/pipeline_orchestrator.py --video 5 --status
   python scripts/pipeline_orchestrator.py --video 5 --init [--title "..."]
   python scripts/pipeline_orchestrator.py --video 5 --spend-ok
   python scripts/pipeline_orchestrator.py --video 5 --force-reset
+
+Fleet CLI (every video state file; NO --video):
+  python scripts/pipeline_orchestrator.py --advance-all   # drain each video to its next gate, then ONE digest
+  python scripts/pipeline_orchestrator.py --supervise     # read-only fleet digest (where is everything stuck?)
+
+--advance-all is still a sequencer, not a swarm: it drains each video by calling
+the SAME gate-respecting advance path, so the no-spend/publish/VO invariant holds
+fleet-wide unchanged — it physically cannot cross a gate. It stops draining a
+video at the first gate/failure (never burns retries in one pass), caps stages
+per video per run, isolates per-video errors (one bad video never aborts the
+sweep), and detects infra failures (e.g. a broken ~/.claude/session-env) so a
+host problem leaves stages 'ready' instead of wrongly parking them as 'failed'.
+--supervise mutates nothing and takes no lock (atomic writes make lock-free reads
+safe), so it can run alongside a live advance.
 
 Stdlib only (json, fcntl, subprocess, ...) — no third-party deps, so it runs
 under any python3 regardless of the daemon's venv.
@@ -31,10 +45,12 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,7 +72,34 @@ CLAUDE_CLI_PATH = (
 )
 
 MAX_FAILS = 3  # consecutive failures → needs-steve (park_reason "failed"), not auto-retry
+MAX_INFRA = 5  # consecutive INFRA skips → needs-steve (park_reason "infra"): a host outage
+               # that never clears must surface, not retry invisibly forever.
 SCHEMA_VERSION = 1
+MAX_STAGES_PER_RUN = 8   # --advance-all: hard cap on stages drained per video per run
+STALE_DAYS = 4           # --supervise/digest: flag a video with no movement in this many days
+
+# Substrings that mark a failure as INFRA (the host/toolchain couldn't even run
+# the stage) rather than a genuine task failure. On an infra failure we leave the
+# stage 'ready' and do NOT increment fail_count — a broken ~/.claude/session-env
+# or a down toolchain must never silently park videos as 'failed'. Matched
+# case-insensitively against the captured stderr/error string.
+#
+# DELIBERATELY NARROW (skeptical-code-reviewer HIGH, 2026-06-18): broad substrings
+# like "no such file or directory" / "permission denied" / "operation not
+# permitted" / "eperm" also match GENUINE task failures (a missing task input, an
+# ssh publickey error, any PermissionError traceback) — misclassifying those as
+# infra meant a real failure retried forever and never parked. These markers are
+# now restricted to signals that essentially never appear in legitimate agent
+# task output: the specific broken-session-env path, host resource exhaustion,
+# and the CLI binary itself being absent. A persistent infra outage is still
+# bounded by MAX_INFRA so it surfaces rather than looping silently.
+INFRA_FAILURE_MARKERS = (
+    "session-env",                       # the broken ~/.claude/session-env outage
+    "cannot allocate memory",            # ENOMEM — host out of memory
+    "resource temporarily unavailable",  # EAGAIN — host fork/thread exhaustion
+    "too many open files",               # EMFILE — host fd-limit (launchd RLIMIT_NOFILE)
+    "command not found",                 # the claude CLI itself missing from PATH
+)
 
 # === The run table — the security + invocation envelope ===
 # A hardcoded dict: the analogue of the daemon's DISPATCH_AGENTS enum. A stage
@@ -167,8 +210,17 @@ def _proc_start_token(pid: int | None) -> str | None:
         return None
 
 
-def notify(message: str) -> None:
-    """Best-effort Telegram line via the canonical daemon-decoupled channel."""
+# During --advance-all we suppress the per-stage Telegram lines and send ONE
+# consolidated digest at the end (so a fleet drain is not a stream of pings).
+SUPPRESS_NOTIFY = False
+
+
+def notify(message: str, force: bool = False) -> None:
+    """Best-effort Telegram line via the canonical daemon-decoupled channel.
+    When SUPPRESS_NOTIFY is set (a fleet drain), per-stage lines are dropped;
+    pass force=True for the consolidated digest and other always-send lines."""
+    if SUPPRESS_NOTIFY and not force:
+        return
     try:
         subprocess.run([str(NOTIFY_SH), message], timeout=20,
                        capture_output=True, text=True)
@@ -179,6 +231,13 @@ def notify(message: str) -> None:
 def die(msg: str, code: int = 1) -> None:
     print(msg, file=sys.stderr)
     sys.exit(code)
+
+
+class LiveRunError(Exception):
+    """A stage is genuinely live (a real process still owns it) — refuse to
+    double-run. Distinct from die()/SystemExit (used for corrupt state, bad args,
+    etc.) so the fleet loop can tell a benign in-flight run apart from a corrupt
+    state file: the former is healthy and skipped, the latter needs attention."""
 
 
 # === State file load / atomic save ========================================
@@ -261,7 +320,7 @@ def _stage(owner: str, gate: bool, deps: list[str]) -> dict:
         "status": "blocked", "owner": owner, "gate": gate, "deps": deps,
         "artifact_path": None, "started_at": None, "completed_at": None,
         "pid": None, "pid_start_token": None, "fail_count": 0,
-        "park_reason": None, "note": None,
+        "infra_count": 0, "park_reason": None, "note": None,
     }
 
 
@@ -277,6 +336,11 @@ def cmd_init(video: int, title: str | None, force: bool) -> int:
         "title": title or f"Video {nn(video)}",
         "created_at": now_iso(),
         "updated_at": now_iso(),
+        # last FORWARD progress (a stage completing). Distinct from updated_at,
+        # which bumps on every save incl. gate-parks and infra-skips. Staleness is
+        # measured from this so an infra-retry loop (which bumps updated_at) still
+        # goes stale, and a gate parked waiting on Steve still nudges after N days.
+        "last_progress_at": now_iso(),
         "stages": default_stages(),
     }
     tmp = path.with_suffix(".json.tmp")
@@ -397,10 +461,13 @@ def reconcile_orphans(stages: dict, video: int) -> list[str]:
             reset.append(key)
         else:
             # A genuinely-live run of OUR process holds it — refuse to double-run.
-            msg = (f"stage {key} already running (pid {pid} since {s.get('started_at')}), "
-                   f"refusing to double-run. If it is stuck, clear it with: "
-                   f"--video {video} --force-reset")
-            die(msg)
+            # Raise (not die) so the fleet loop can distinguish this benign live
+            # run from a corrupt-state die()/SystemExit. The per-video caller
+            # converts it back to die() to preserve the prior CLI behavior.
+            raise LiveRunError(
+                f"stage {key} already running (pid {pid} since {s.get('started_at')}), "
+                f"refusing to double-run. If it is stuck, clear it with: "
+                f"--video {video} --force-reset")
     return reset
 
 
@@ -431,6 +498,24 @@ def first_ready_gate(stages: dict) -> str | None:
     """Lowest-numbered stage that is effectively ready but is a gate (needs Steve)."""
     gates = all_ready_gates(stages)
     return gates[0] if gates else None
+
+
+def gates_awaiting_steve(stages: dict) -> list[str]:
+    """Gate stages that need Steve — in EITHER representation: still effectively
+    'ready' (deps met, not yet parked) OR already parked 'needs-steve' with
+    park_reason 'gate' by a prior advance. Lowest-first, deduped. (all_ready_gates
+    only sees the first; once advance parks a gate it flips to needs-steve, so the
+    fleet digest must also count the parked form — else a parked gate reads as
+    'blocked'.)"""
+    out = []
+    for k in STAGE_ORDER:
+        s = stages.get(k, {})
+        ready_gate = (effective_status(k, stages) == "ready"
+                      and (s.get("gate") or s.get("owner") == "steve"))
+        parked_gate = (s.get("status") == "needs-steve" and s.get("park_reason") == "gate")
+        if ready_gate or parked_gate:
+            out.append(k)
+    return out
 
 
 # === Executors =============================================================
@@ -543,16 +628,40 @@ def _on_success(s: dict, key: str, video: int, out: str) -> None:
     s["completed_at"] = now_iso()
     s["artifact_path"] = stage_artifact_path(key, video)
     s["fail_count"] = 0
+    s["infra_count"] = 0
     s["park_reason"] = None
     s["pid"] = None
     s["pid_start_token"] = None
     s["note"] = (out or "")[-300:] or "done"
 
 
+def _is_infra_failure(err: str) -> bool:
+    """True if the error string looks like the HOST/toolchain couldn't run the
+    stage at all (vs the agent/tool running and failing its task). Such failures
+    must NOT consume a retry or park the video — they're transient host problems
+    (e.g. the broken ~/.claude/session-env that took down book-update tonight)."""
+    low = (err or "").lower()
+    return any(marker in low for marker in INFRA_FAILURE_MARKERS)
+
+
 def _on_failure(s: dict, err: str) -> None:
-    s["fail_count"] = int(s.get("fail_count") or 0) + 1
     s["pid"] = None
     s["pid_start_token"] = None
+    if _is_infra_failure(err):
+        # Host couldn't run it — leave ready, do NOT burn a task-failure retry.
+        # But a host outage that NEVER clears must not loop invisibly forever:
+        # bound it with MAX_INFRA so it parks (visibly, park_reason "infra") and
+        # surfaces in the digest / needs-you count instead (reviewer HIGH).
+        s["infra_count"] = int(s.get("infra_count") or 0) + 1
+        s["note"] = ("infra failure (host/toolchain, not a task failure) #"
+                     + str(s["infra_count"]) + " — " + (err or "")[-300:])
+        if s["infra_count"] >= MAX_INFRA:
+            s["status"] = "needs-steve"
+            s["park_reason"] = "infra"
+        else:
+            s["status"] = "ready"
+        return
+    s["fail_count"] = int(s.get("fail_count") or 0) + 1
     s["note"] = (err or "")[-500:]
     if s["fail_count"] >= MAX_FAILS:
         s["status"] = "needs-steve"
@@ -561,10 +670,20 @@ def _on_failure(s: dict, err: str) -> None:
         s["status"] = "ready"
 
 
-def cmd_advance(sf: StateFile) -> int:
+# Structured outcome of one advance step, so the fleet drainer (--advance-all)
+# can decide whether to keep draining a video. .code is the CLI exit code.
+#   outcome ∈ {"ran_done", "ran_failed", "infra_skip", "parked_gate", "idle"}
+AdvanceResult = namedtuple("AdvanceResult", "code outcome stage line")
+
+
+def advance_once(sf: StateFile) -> AdvanceResult:
+    """Run the SINGLE next ready non-gate stage for one video (reconcile orphans
+    + promote gate-exits first). The shared core of --advance and --advance-all;
+    the gate-respecting structural invariant lives entirely in select_next, so
+    every caller of advance_once inherits no-auto-spend/publish/VO unchanged."""
     stages = sf.data["stages"]
     video = sf.data["video"]
-    reset = reconcile_orphans(stages, video)
+    reset = reconcile_orphans(stages, video)   # may die() on a genuinely-live run
     promoted = promote_gate_exits(stages, video)
     if reset or promoted:
         sf.save()
@@ -586,11 +705,11 @@ def cmd_advance(sf: StateFile) -> int:
                         f"stage {gate} ({STAGE_LABEL[gate]}).")
             print(line)
             notify(line)
-            return 0
+            return AdvanceResult(0, "parked_gate", gate, line)
         line = f"🎬 Video {video}: nothing to advance — all stages done or blocked."
         print(line)
         notify(line)
-        return 0
+        return AdvanceResult(0, "idle", None, line)
 
     s = stages[nxt]
     cfg = RUN_TABLE[nxt]
@@ -606,6 +725,7 @@ def cmd_advance(sf: StateFile) -> int:
 
     if ok:
         _on_success(s, nxt, video, out)
+        sf.data["last_progress_at"] = now_iso()   # forward progress → resets staleness clock
         sf.save()
         gate = first_ready_gate(stages) if select_next(stages) is None else None
         nxt2 = select_next(stages)
@@ -620,19 +740,43 @@ def cmd_advance(sf: StateFile) -> int:
         line = f"🎬 Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) done.{tail}"
         print(line)
         notify(line)
-        return 0
+        return AdvanceResult(0, "ran_done", nxt, line)
+
+    # Failure. _on_failure decides infra (host couldn't run it — no task-failure
+    # retry burned, bounded by MAX_INFRA) vs genuine task failure.
+    infra = _is_infra_failure(out)
+    _on_failure(s, out)
+    sf.save()
+    if infra and s["status"] == "needs-steve":
+        # Infra outage that never cleared — parked at MAX_INFRA so it surfaces.
+        line = (f"⚠️ Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) could not run "
+                f"{MAX_INFRA}× (infra/host issue) — parked needs-steve. {out[:160]}")
+        outcome = "ran_failed"
+    elif infra:
+        line = (f"⏸ Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) could not run "
+                f"(infra/host issue, NOT a task failure) — left ready, will retry "
+                f"(attempt {s.get('infra_count')}/{MAX_INFRA}). {out[:160]}")
+        outcome = "infra_skip"
+    elif s["status"] == "needs-steve":
+        line = (f"⚠️ Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) FAILED "
+                f"{MAX_FAILS}× — parked needs-steve. {out[:160]}")
+        outcome = "ran_failed"
     else:
-        _on_failure(s, out)
-        sf.save()
-        if s["status"] == "needs-steve":
-            line = (f"⚠️ Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) FAILED "
-                    f"{MAX_FAILS}× — parked needs-steve. {out[:160]}")
-        else:
-            line = (f"⚠️ Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) FAILED — {out[:160]}. "
-                    f"Reset to ready; re-run /pipeline {video} to retry.")
-        print(line)
-        notify(line)
-        return 2
+        line = (f"⚠️ Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) FAILED — {out[:160]}. "
+                f"Reset to ready; re-run /pipeline {video} to retry.")
+        outcome = "ran_failed"
+    print(line)
+    notify(line)
+    return AdvanceResult(2, outcome, nxt, line)
+
+
+def cmd_advance(sf: StateFile) -> int:
+    """Single-video --advance: one stage, exit. Thin wrapper over advance_once.
+    A genuinely-live run surfaces as die() (exit 1), preserving prior CLI UX."""
+    try:
+        return advance_once(sf).code
+    except LiveRunError as e:
+        die(str(e))
 
 
 def _gate_note(key: str, video: int) -> str:
@@ -653,11 +797,10 @@ def _gate_note(key: str, video: int) -> str:
 def cmd_status(sf: StateFile) -> int:
     stages = sf.data["stages"]
     video = sf.data["video"]
-    # Read-only-ish: reconcile + gate-exit re-eval so --status reflects truth.
-    reset = reconcile_orphans(stages, video)
-    promoted = promote_gate_exits(stages, video)
-    if reset or promoted:
-        sf.save()
+    # Strictly read-only: --status NEVER mutates or saves. Orphaned/stale running
+    # stages are flagged inline ("running?") via the non-mutating _looks_orphaned
+    # probe; the actual reconcile + gate-exit promotion happen on the next --advance
+    # (or fleet sweep), which holds the lock and persists.
     title = sf.data.get("title", "")
     print(f"Video {video} — {title}")
     print(f"{'stage':<14} {'effective':<12} {'gate':<5} {'owner':<12} artifact")
@@ -665,6 +808,8 @@ def cmd_status(sf: StateFile) -> int:
     for key in STAGE_ORDER:
         s = stages[key]
         eff = effective_status(key, stages)
+        if eff == "running" and _looks_orphaned(s, key):
+            eff = "running?"  # likely orphaned/stale — advance will reconcile it
         art = s.get("artifact_path") or "-"
         print(f"{key:<14} {eff:<12} {str(bool(s.get('gate'))):<5} "
               f"{str(s.get('owner')):<12} {art}")
@@ -803,21 +948,268 @@ def cmd_force_reset(sf: StateFile) -> int:
     return 0
 
 
+# === Fleet (multi-video) ===================================================
+
+def discover_videos() -> list[int]:
+    """Every Video_NN_pipeline.json in STATE_DIR, ascending. Ignores .tmp/junk."""
+    if not STATE_DIR.exists():
+        return []
+    vids = set()
+    for p in STATE_DIR.glob("Video_*_pipeline.json"):
+        m = re.fullmatch(r"Video_(\d+)_pipeline\.json", p.name)
+        if m:
+            vids.add(int(m.group(1)))
+    return sorted(vids)
+
+
+def _looks_orphaned(s: dict, key: str) -> bool:
+    """Read-only orphan test (no mutation, no die) — mirrors reconcile_orphans'
+    3-condition logic, for the supervise digest's stuck-run detection."""
+    pid = s.get("pid")
+    started = parse_iso(s.get("started_at"))
+    timeout = RUN_TABLE.get(key, {}).get("timeout", 1800)
+    dead = not _pid_alive(pid)
+    cur = _proc_start_token(pid)
+    rec = s.get("pid_start_token")
+    recycled = (not dead and cur is not None and rec is not None and cur != rec)
+    timed_out = (started is not None and (time.time() - started) > timeout)
+    return dead or recycled or timed_out
+
+
+def _days_since(iso: str | None) -> float | None:
+    t = parse_iso(iso)
+    return None if t is None else (time.time() - t) / 86400.0
+
+
+# Digest ordering: surface what needs Steve first, completed last.
+_CATEGORY_ORDER = {"blocked-stuck": 0, "needs-steve": 1, "running": 2,
+                   "ready": 3, "blocked": 4, "complete": 5}
+
+
+def _video_summary_line(data: dict, ran: list[str] | None = None) -> tuple[str, str]:
+    """Classify one video into (category, one-line-text). Read-only. `ran` (the
+    stages just advanced this pass) is prefixed when present (--advance-all)."""
+    video = data.get("video")
+    title = data.get("title", "") or ""
+    stages = data.get("stages", {})
+    present = [k for k in STAGE_ORDER if k in stages]
+    if present and all(stages[k].get("status") == "done" for k in present):
+        return ("complete", f"✅ V{video} ({title}): complete — all stages done")
+
+    stuck_run = [k for k in STAGE_ORDER
+                 if stages.get(k, {}).get("status") == "running" and _looks_orphaned(stages[k], k)]
+    live_run = [k for k in STAGE_ORDER
+                if stages.get(k, {}).get("status") == "running" and not _looks_orphaned(stages[k], k)]
+    failed = [k for k in STAGE_ORDER
+              if stages.get(k, {}).get("status") == "needs-steve"
+              and stages[k].get("park_reason") == "failed"]
+    infra_parked = [k for k in STAGE_ORDER
+                    if stages.get(k, {}).get("status") == "needs-steve"
+                    and stages[k].get("park_reason") == "infra"]
+    # Stages auto-retrying after an infra skip (not yet parked) — visible so a
+    # host outage can't hide as a healthy "ready" video (reviewer HIGH).
+    infra_retry = [k for k in STAGE_ORDER
+                   if stages.get(k, {}).get("status") == "ready"
+                   and int(stages.get(k, {}).get("infra_count") or 0) > 0]
+    gates = gates_awaiting_steve(stages)
+    nxt = select_next(stages)
+
+    bits: list[str] = []
+    if ran:
+        bits.append("advanced " + ", ".join(STAGE_LABEL.get(k, k) for k in ran))
+
+    emoji, category = "⏳", "ready"
+    if stuck_run:
+        emoji, category = "🔴", "blocked-stuck"
+        bits.append("STUCK running: " + ", ".join(STAGE_LABEL.get(k, k) for k in stuck_run)
+                    + f" (clear: /pipeline {video} force-reset)")
+    if failed:
+        emoji, category = "🔴", "blocked-stuck"
+        bits.append(f"FAILED {MAX_FAILS}× (needs you): "
+                    + ", ".join(STAGE_LABEL.get(k, k) for k in failed))
+    if infra_parked:
+        emoji, category = "🔴", "blocked-stuck"
+        bits.append(f"HOST CAN'T RUN (infra, {MAX_INFRA}× — needs you): "
+                    + ", ".join(STAGE_LABEL.get(k, k) for k in infra_parked))
+    if infra_retry:
+        if category == "ready":
+            emoji, category = "🟠", "blocked-stuck"
+        bits.append("infra-retrying (host issue, not a task failure): "
+                    + ", ".join(f"{STAGE_LABEL.get(k, k)} ×{stages[k].get('infra_count')}"
+                                for k in infra_retry))
+    if gates:
+        gtxt = []
+        for g in gates:
+            if g == "5_images":
+                gtxt.append(f"{STAGE_LABEL[g]} (BILLED → /pipeline {video} spend-ok)")
+            else:
+                gtxt.append(STAGE_LABEL.get(g, g))
+        if category == "ready":
+            emoji, category = "⛔", "needs-steve"
+        bits.append("waiting on you: " + ", ".join(gtxt))
+    if nxt:
+        bits.append(f"ready to advance: {STAGE_LABEL.get(nxt, nxt)}")
+    if live_run and not stuck_run:
+        bits.append("running: " + ", ".join(STAGE_LABEL.get(k, k) for k in live_run))
+        if category == "ready":
+            emoji, category = "🏃", "running"
+    if not bits:
+        emoji, category = "🚧", "blocked"
+        bits.append("blocked (upstream stages not done)")
+
+    # Staleness from last FORWARD progress, not updated_at (which bumps on every
+    # save incl. infra-retry + gate-park), so an infra loop still goes stale and a
+    # long-parked gate still nudges. Fall back for pre-field state files.
+    progress_at = data.get("last_progress_at") or data.get("updated_at") or data.get("created_at")
+    age = _days_since(progress_at)
+    stale = f"⏰{int(age)}d no progress · " if (age is not None and age > STALE_DAYS) else ""
+    return (category, f"{emoji} V{video} ({title}): {stale}" + " · ".join(bits))
+
+
+def _fleet_digest(header: str, videos: list[int], lines: list[tuple[str, str]]) -> str:
+    ordered = sorted(lines, key=lambda cl: _CATEGORY_ORDER.get(cl[0], 9))
+    n_done = sum(1 for c, _ in lines if c == "complete")
+    n_action = sum(1 for c, _ in lines if c in ("blocked-stuck", "needs-steve"))
+    body = "\n".join(text for _, text in ordered)
+    return (f"{header}\n{len(videos)} video(s) · {n_done} complete · {n_action} need you\n"
+            + body)
+
+
+# Outcomes a human must hear about. Under --quiet-idle the fleet digest is sent
+# only when one of these occurred this tick; a clean all-gate-parked / idle tick
+# stays silent. infra_skip is deliberately included so a host-level failure (a
+# stale `claude login`, a broken session-env, EPERM) that wedges the whole fleet
+# can NEVER hide behind --quiet-idle — exactly the silent-stall the retry system
+# exists to prevent (skeptical-code-reviewer HIGH, 2026-06-18).
+NEWS_OUTCOMES = frozenset({"ran_done", "ran_failed", "infra_skip"})
+
+
+def _outcome_is_news(outcome: str) -> bool:
+    """True iff this per-stage outcome should break --quiet-idle silence."""
+    return outcome in NEWS_OUTCOMES
+
+
+def cmd_advance_all(quiet_idle: bool = False) -> int:
+    """Fleet drain: for EACH video, advance through clean successes until the
+    first gate/failure/idle (capped), then send ONE consolidated digest. Still a
+    sequencer — every step goes through advance_once, so it cannot cross a gate,
+    spend, publish, or record VO. Per-video errors are isolated; a genuinely-live
+    run on one video is skipped, never aborting the sweep.
+
+    quiet_idle: for a frequent (e.g. hourly) cron cadence — suppress the Telegram
+    digest on ticks where NO stage actually executed, so steady-state gate-parked
+    fleets don't ping every hour. A stage running OR failing counts as news."""
+    global SUPPRESS_NOTIFY
+    videos = discover_videos()
+    if not videos:
+        msg = "🎬 Pipeline sweep: no video state files found in Production_Kits."
+        print(msg)
+        if not quiet_idle:
+            notify(msg, force=True)
+        return 0
+    lines: list[tuple[str, str]] = []
+    any_news = False  # did anything happen this tick that Steve must hear about?
+    SUPPRESS_NOTIFY = True
+    try:
+        for v in videos:
+            ran: list[str] = []
+            try:
+                with StateFile(v) as sf:
+                    sf.load()
+                    if sf.data.get("video") != v:
+                        lines.append(("blocked-stuck",
+                                      f"⚠️ V{v}: state file video-id mismatch — skipped"))
+                        any_news = True  # corrupt state — break --quiet-idle silence
+                        continue
+                    for _ in range(MAX_STAGES_PER_RUN):
+                        res = advance_once(sf)
+                        if res.outcome == "ran_done":
+                            ran.append(res.stage)
+                            any_news = True
+                            continue
+                        # ran_failed / infra_skip → news; parked_gate / idle → silent.
+                        if _outcome_is_news(res.outcome):
+                            any_news = True
+                        break  # gate / failure / infra / idle → stop draining this video
+                    lines.append(_video_summary_line(sf.data, ran or None))
+            except LiveRunError:
+                # A stage is genuinely live (a real process still owns it) — skip,
+                # never abort. Benign: expected when a long stage spans the tick.
+                lines.append(("running", f"🏃 V{v}: a stage is genuinely live (left untouched)"))
+            except SystemExit as e:
+                # die() — corrupt/unreadable state file, video-id mismatch, etc.
+                # NOT benign: surface it so a broken state file can't read healthy.
+                lines.append(("blocked-stuck", f"⚠️ V{v}: state file unusable — {e}"))
+                any_news = True
+            except Exception as e:
+                lines.append(("blocked-stuck", f"⚠️ V{v}: skipped after error — {e}"))
+                any_news = True  # a genuine error this tick — break --quiet-idle silence
+    finally:
+        SUPPRESS_NOTIFY = False
+    digest = _fleet_digest("🎬 Pipeline sweep — fleet advance", videos, lines)
+    print(digest)
+    if not (quiet_idle and not any_news):
+        notify(digest, force=True)
+    return 0
+
+
+def cmd_supervise() -> int:
+    """Read-only fleet digest: classify every video (what's done, in-flight,
+    stuck, or waiting on Steve) and send one Telegram line set. Takes NO lock and
+    mutates NOTHING — atomic writes make lock-free reads consistent, so it can run
+    alongside a live advance without blocking or corrupting it."""
+    videos = discover_videos()
+    if not videos:
+        msg = "📋 Pipeline supervise: no video state files found in Production_Kits."
+        print(msg)
+        notify(msg, force=True)
+        return 0
+    lines: list[tuple[str, str]] = []
+    for v in videos:
+        path = STATE_DIR / f"Video_{nn(v)}_pipeline.json"
+        try:
+            data = json.loads(path.read_text())  # lock-free; os.replace keeps it consistent
+            lines.append(_video_summary_line(data, None))
+        except Exception as e:
+            lines.append(("blocked-stuck", f"⚠️ V{v}: unreadable state file — {e}"))
+    digest = _fleet_digest("📋 Pipeline supervise — fleet status", videos, lines)
+    print(digest)
+    notify(digest, force=True)
+    return 0
+
+
 # === Main ==================================================================
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Pipeline orchestrator (deterministic video sequencer).")
-    p.add_argument("--video", type=int, required=True, help="Video number, e.g. 1.")
+    p.add_argument("--video", type=int, default=None,
+                   help="Video number, e.g. 1 (required for per-video commands; omit for fleet commands).")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--advance", action="store_true", help="Run the next ready non-gate stage.")
     g.add_argument("--status", action="store_true", help="Print the state table; run nothing.")
     g.add_argument("--init", action="store_true", help="Seed a fresh state file.")
     g.add_argument("--spend-ok", action="store_true", help="Authorize the BILLED image batch (stage 5).")
     g.add_argument("--force-reset", action="store_true", help="Reset a wedged running stage (orphan-tested).")
+    g.add_argument("--advance-all", action="store_true",
+                   help="FLEET: drain every video to its next gate; one digest. No --video.")
+    g.add_argument("--supervise", action="store_true",
+                   help="FLEET: read-only status digest across every video. No --video.")
     p.add_argument("--title", help="Title for --init.")
     p.add_argument("--force-init", action="store_true", help="Overwrite an existing state file on --init.")
+    p.add_argument("--quiet-idle", action="store_true",
+                   help="With --advance-all: suppress the Telegram digest when no stage executed "
+                        "this run (for a frequent cron cadence). No effect on other commands.")
     args = p.parse_args()
 
+    # Fleet commands operate over ALL video state files and take no --video.
+    if args.advance_all or args.supervise:
+        if args.video is not None:
+            die("Fleet commands (--advance-all/--supervise) operate on ALL videos; do not pass --video.")
+        return cmd_advance_all(quiet_idle=args.quiet_idle) if args.advance_all else cmd_supervise()
+
+    # Per-video commands require a positive --video.
+    if args.video is None:
+        die("--video is required for per-video commands (--advance/--status/--init/--spend-ok/--force-reset).")
     if args.video < 1:
         die("--video must be a positive integer.")
 

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-pipeline-sweep</string>
+	<!-- Fleet auto-advance, HOURLY (more frequent than nightly, per Steve 2026-06-18):
+	     drain EVERY Video_NN_pipeline.json to its next gate, then send ONE
+	     consolidated Telegram digest — but ONLY on ticks where a stage actually
+	     executed (--quiet-idle). Steady-state gate-parked fleets stay silent, so
+	     hourly firing is not noisy; the moment Steve clears a gate, the fleet
+	     advances within the hour. Routed through run_job.sh so a crash alerts Steve
+	     (exit code authoritative) and a failure is retry-queued. The orchestrator is
+	     gated: it advances only ready, non-gate, owner=orchestrator, non-billed
+	     stages — it can never auto-spend, auto-publish, or auto-record VO.
+	     Stdlib-only, so the system python3 is sufficient. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
+		<string>pipeline-sweep</string>
+		<string>/usr/bin/python3</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/pipeline_orchestrator.py</string>
+		<string>--advance-all</string>
+		<string>--quiet-idle</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<!-- The fleet digest IS the signal (only on active ticks); a per-run run_job ✅
+	     would be noise on top. Failures still alert via run_job's red path. -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>JOB_QUIET_OK</key>
+		<string>1</string>
+	</dict>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-pipeline-sweep.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-pipeline-sweep.stdout.log</string>
+	<!-- Hourly, wall-clock-relative (StartInterval resumes/catches up after sleep).
+	     run_job.sh's per-job lock (rq_acquire_lock) prevents an overlapping tick or
+	     a retry replay from colliding with a still-running sweep. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<!-- Agent dispatch + MCP servers are file-descriptor-heavy; launchd's default
+	     soft RLIMIT_NOFILE of 256 kills such jobs (see vault-gardener). The sweep
+	     itself is stdlib-only, but keep parity with the suite. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>

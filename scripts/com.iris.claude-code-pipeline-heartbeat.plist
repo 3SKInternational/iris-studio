@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-pipeline-heartbeat</string>
+	<!-- Daily fleet HEARTBEAT (backstop to the hourly --quiet-idle sweep). The
+	     hourly sweep stays silent on idle/gate-parked ticks, so a fleet sitting on
+	     a gate Steve forgot about could otherwise go invisible for days. This is a
+	     read-only --supervise digest that ALWAYS sends once a day — a guaranteed
+	     "here is the whole fleet's current state" so nothing wedged can hide >24h.
+	     --supervise takes NO lock and mutates NOTHING, so it is safe to run even
+	     while the hourly sweep is mid-advance. Routed through run_job.sh for crash
+	     alerting. Stdlib-only → system python3. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
+		<string>pipeline-heartbeat</string>
+		<string>/usr/bin/python3</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/pipeline_orchestrator.py</string>
+		<string>--supervise</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<!-- The supervise digest IS the daily signal; the run_job ✅ on top is noise. -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>JOB_QUIET_OK</key>
+		<string>1</string>
+	</dict>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-pipeline-heartbeat.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-pipeline-heartbeat.stdout.log</string>
+	<!-- 04:50 ET — after vault-gardener (04:10), before pre-brief (05:00), so the
+	     fleet state is fresh in the morning brief window. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>50</integer>
+	</dict>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>
