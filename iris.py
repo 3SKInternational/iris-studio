@@ -112,6 +112,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -395,6 +396,22 @@ DISPATCH_AGENTS: dict[str, dict] = {
     "channel-analyst": {
         "timeout_seconds": 720,  # 12 min — read benchmarks + analyze one export + write
         "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence/Analytics",
+    },
+    # --- Added 2026-06-18: image REUSE to avoid regeneration spend ---
+    # asset-librarian: reads the prebuilt asset_index.json (built deterministically
+    # by scripts/build_asset_index.py — cheap, no tokens) and matches an upcoming
+    # video's scenes against the ~140 already-generated PNGs, returning reuse
+    # candidates so we don't pay to regenerate shots we already own. Haiku by
+    # design: it reads ONE index, never re-scans the raw files. Dispatch BEFORE
+    # authoring a new scene manifest. deliverable_dir is a DEDICATED subdir
+    # (Reuse_Reports), NOT the shared Image_Factory root: that root holds the
+    # manifests/ subtree + the index JSON, and _find_deliverable rglobs its dir,
+    # so a manifest edited by Cowork/Steve during the 5-min window could be
+    # mis-returned as this dispatch's deliverable. A dedicated dir removes that
+    # collision (same fix the packaging-strategist entry above made).
+    "asset-librarian": {
+        "timeout_seconds": 300,  # 5 min — Haiku, reads one index + writes one report
+        "deliverable_dir": "BRANDS/3SK_Finance/Raw_Assets/Image_Factory/Reuse_Reports",
     },
     # --- Added 2026-05-31 (Session 15, P5-12 dispatcher-side batch) ---
     # expense-categorizer: scans studio@ Gmail for receipts, drafts Expense_Tracker
@@ -2723,6 +2740,49 @@ async def _fire_autonomous_dispatch(entry: dict, chat_id: int) -> None:
         logger.exception(f"Autonomous dispatch '{entry['name']}' crashed: {exc}")
 
 
+# === Pipeline orchestrator bridge (2026-06-18) ===
+# The /pipeline Telegram command shells the standalone deterministic sequencer
+# scripts/pipeline_orchestrator.py. It is a FIXED-SHAPE, hardcoded-action handler
+# (advance | status | spend-ok), NOT a DISPATCH_AGENTS entry — the cloud model can
+# never reach it (same security posture as /agent). The orchestrator self-reports
+# to Telegram via notify.sh; this helper additionally relays its one-line stdout
+# back into the chat that triggered it. Backgrounded so a long stage run (an agent
+# dispatch can take ~20 min) never blocks the daemon loop.
+PIPELINE_SCRIPT = PROJECT_DIR / "scripts" / "pipeline_orchestrator.py"
+_PIPELINE_FLAGS = {"advance": "--advance", "status": "--status", "spend-ok": "--spend-ok"}
+
+
+async def _run_pipeline_command(video: int, action: str, chat_id) -> None:
+    """Run the orchestrator subprocess for ONE fixed action and relay stdout.
+    `action` is one of _PIPELINE_FLAGS (validated by the caller); no free-form
+    input ever reaches the shell. Never raises (logs + notifies on crash)."""
+    flag = _PIPELINE_FLAGS[action]
+    cmd = [sys.executable, str(PIPELINE_SCRIPT), "--video", str(video), flag]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(PROJECT_DIR),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate()
+        out = (out_b or b"").decode(errors="replace").strip()
+        err = (err_b or b"").decode(errors="replace").strip()
+        if proc.returncode == 0 and out:
+            await _send_telegram(chat_id, out[:3500])
+        elif out or err:
+            await _send_telegram(
+                chat_id,
+                f"/pipeline {video} {action} (rc={proc.returncode}):\n{(out or err)[:3000]}",
+            )
+        else:
+            await _send_telegram(
+                chat_id,
+                f"/pipeline {video} {action} finished (rc={proc.returncode}, no output).",
+            )
+    except Exception as exc:
+        logger.exception(f"/pipeline {video} {action} crashed: {exc}")
+        await _send_telegram(chat_id, f"⚠️ /pipeline {video} {action} crashed: {exc}")
+
+
 async def _reconcile_orphaned_dispatches():
     """On boot, any dispatch left pending/running was orphaned when the prior
     daemon stopped (its subprocess was a child of that process and is gone).
@@ -3779,6 +3839,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    # Pipeline orchestrator — FIXED-SHAPE, hardcoded-action command. Mirrors
+    # /agent's security posture: validate NN is an integer + the action token is
+    # one of three literals, then shell pipeline_orchestrator.py via the daemon's
+    # subprocess plumbing. No arbitrary shell, no free-form prompt — the cloud
+    # model can never reach this surface. `spend-ok` is the ONLY billed path.
+    if stripped_text.lower().startswith(("/pipeline ", "!pipeline ")):
+        rest = stripped_text.split(None, 1)[1].strip() if len(stripped_text.split(None, 1)) > 1 else ""
+        parts = rest.split()
+        if not parts or not parts[0].isdigit():
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /pipeline <N>            advance video N one stage\n"
+                "  /pipeline <N> status     show the pipeline state table\n"
+                "  /pipeline <N> spend-ok   authorize the BILLED image batch (stage 5)\n"
+                "N must be an integer."
+            )
+            return
+        video = int(parts[0])
+        action = "advance"
+        if len(parts) == 2:
+            tok = parts[1].lower()
+            if tok == "status":
+                action = "status"
+            elif tok == "spend-ok":
+                action = "spend-ok"
+            else:
+                await update.message.reply_text(
+                    f"Unknown /pipeline action '{parts[1]}'. "
+                    f"Allowed: status, spend-ok (or omit to advance)."
+                )
+                return
+        elif len(parts) > 2:
+            await update.message.reply_text(
+                "Too many arguments. Use /pipeline <N> [status|spend-ok]."
+            )
+            return
+        logger.info(f"From @{username} (/pipeline {video} {action})")
+        ack = {
+            "advance": f"🎬 Advancing video {video} one stage…",
+            "status": f"📋 Reading video {video} pipeline state…",
+            "spend-ok": f"💸 Authorizing the BILLED image batch for video {video}…",
+        }[action]
+        await update.message.reply_text(ack + " I'll send the result here when it's done.")
+        asyncio.create_task(_run_pipeline_command(video, action, chat_id))
+        return
+
     if stripped_text.lower() in ("/dispatches", "!dispatches"):
         rows = await _db_call(_list_recent_dispatches_sync, 10)
         if not rows:
@@ -4017,6 +4123,11 @@ def main() -> None:
         f"caption → photo saved to {RECEIPTS_DIR.relative_to(WORKSPACE_DIR)}/ "
         f"+ single-row draft into {EXPENSE_DRAFTS_DIR.relative_to(WORKSPACE_DIR)}/ "
         f"+ /approve <run-id> fills CSV. Reuses expense-categorizer schema."
+    )
+    logger.info(
+        f"Pipeline orchestrator: ENABLED. '/pipeline <N>' advances video N one stage; "
+        f"'/pipeline <N> status' shows the state table; '/pipeline <N> spend-ok' is the "
+        f"ONLY billed-image path. Fixed-shape, NOT model-routable. Script: {PIPELINE_SCRIPT}."
     )
     logger.info(
         "OAuth-aware error reply: ENABLED. Auth failures surface a 'run claude login' hint to Steve via Telegram."
