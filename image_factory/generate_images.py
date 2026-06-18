@@ -40,6 +40,11 @@ from pathlib import Path
 
 VALID_PROVIDERS = ("openai", "flux")
 VALID_QUALITIES = ("low", "medium", "high", "auto")
+# gpt-image `background` control. "transparent" emits a real alpha channel (PNG
+# only — which is what this script always writes); "opaque"/"auto" are the
+# normal solid-background modes. Per-image or default-level; omitted == provider
+# default (auto). Only gpt-image models accept it.
+VALID_BACKGROUNDS = ("transparent", "opaque", "auto")
 # gpt-image-1's fixed menu (it accepts ONLY these). gpt-image-2 is far more
 # flexible — see GPT2_SIZE_CONSTRAINTS + validate_size().
 GPT1_SIZES = ("1024x1024", "1536x1024", "1024x1536", "auto")
@@ -194,9 +199,18 @@ def actual_cost(model: str, usage) -> float | None:
 # --- Provider: OpenAI gpt-image ---------------------------------------------
 
 
-def generate_openai(client, *, model, prompt, size, quality, ref_paths, input_fidelity):
+def generate_openai(client, *, model, prompt, size, quality, ref_paths, input_fidelity,
+                    background=None):
     """Return (png_bytes, usage). Uses the edits endpoint when refs are given."""
     kwargs = dict(model=model, prompt=prompt, size=size, quality=quality, n=1)
+    if background and background != "auto":
+        kwargs["background"] = background
+        # Transparency lives in the alpha channel, which only PNG/WebP carry.
+        # The API's output_format default is not contractually PNG, so a
+        # "transparent" request can silently round-trip to opaque JPEG. Force
+        # PNG (this script always writes .png) so the alpha actually survives.
+        if background == "transparent":
+            kwargs["output_format"] = "png"
     if ref_paths:
         if model in MODELS_WITH_INPUT_FIDELITY:
             kwargs["input_fidelity"] = input_fidelity
@@ -211,7 +225,11 @@ def generate_openai(client, *, model, prompt, size, quality, ref_paths, input_fi
     b64 = result.data[0].b64_json
     if not b64:
         raise RuntimeError("provider returned no image data")
-    return base64.b64decode(b64), getattr(result, "usage", None)
+    png = base64.b64decode(b64)
+    if background == "transparent" and png[:8] != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError("requested transparent background but provider did not "
+                           "return PNG bytes — alpha channel would be lost")
+    return png, getattr(result, "usage", None)
 
 
 def generate_flux(*_args, **_kwargs):
@@ -267,6 +285,9 @@ def main() -> None:
     b_quality = args.quality or defaults.get("quality", DEFAULT_QUALITY)
     b_size = args.size or defaults.get("size", DEFAULT_SIZE)
     b_fidelity = args.input_fidelity or defaults.get("input_fidelity", DEFAULT_INPUT_FIDELITY)
+    b_background = defaults.get("background")
+    if b_background is not None and b_background not in VALID_BACKGROUNDS:
+        die(f"background must be one of {VALID_BACKGROUNDS}; got {b_background!r}")
     validate_size(model, b_size)  # batch size — fail before any spend
     fidelity_active = model in MODELS_WITH_INPUT_FIDELITY
     if b_fidelity == "high" and not fidelity_active:
@@ -301,6 +322,10 @@ def main() -> None:
     for _img in images:
         if isinstance(_img, dict) and _img.get("size") and _img["size"] != b_size:
             validate_size(model, str(_img["size"]))
+        if isinstance(_img, dict) and _img.get("background") is not None \
+                and _img["background"] not in VALID_BACKGROUNDS:
+            die(f"background must be one of {VALID_BACKGROUNDS}; "
+                f"got {_img['background']!r}")
 
     print(f"manifest : {manifest_path.name}  ({manifest.get('project', 'untitled')})")
     print(f"provider : {provider}   model: {model}   quality: {b_quality}   size: {b_size}   fidelity: {b_fidelity}")
@@ -345,6 +370,7 @@ def main() -> None:
 
         quality = img.get("quality", b_quality)
         size = img.get("size", b_size)  # per-image overrides already validated pre-loop
+        background = img.get("background", b_background)  # validated pre-loop
         use_refs = img.get("use_references", True) and bool(ref_paths)
         these_refs = ref_paths if use_refs else []
         full_prompt = f"{preamble}\n\n{prompt}" if preamble else prompt
@@ -360,6 +386,8 @@ def main() -> None:
 
         ref_tag = f"/{len(these_refs)}ref:{b_fidelity}" if fidelity_active else f"/{len(these_refs)}ref"
         tag = f"{quality}/{size}" + (ref_tag if these_refs else "/no-ref")
+        if background and background != "auto":
+            tag += f"/bg:{background}"
         if args.dry_run:
             print(f"  + {name}  [{tag}]  ~${est:.3f}")
             continue
@@ -373,6 +401,7 @@ def main() -> None:
                 quality=quality,
                 ref_paths=these_refs,
                 input_fidelity=b_fidelity,
+                background=background,
             )
             fd, tmp = tempfile.mkstemp(suffix=".png", dir=out_dir)
             try:
