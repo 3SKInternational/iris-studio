@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Build 4 weekly analytics feed — NOT INSTALLED YET.
+
+  This pulls the channel's per-video metrics and writes the channel-analyst feed
+  file. It is intentionally LEFT UNINSTALLED until 3SK Finance has published
+  videos with data (Build 3 live + ~1-2 weeks). Until then it would only write a
+  `blocked-no-videos` skeleton each week.
+
+  Install when videos are live:
+    cp scripts/com.iris.claude-code-analytics-pull.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-analytics-pull.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-analytics-pull   # test fire
+
+  After the pull writes the feed, dispatch the channel-analyst agent with the
+  written file's path for the diagnosis + routable fixes (Mon morning, fresh for
+  the weekly production cycle). run_job.sh handles logging + Telegram failure
+  alerts + the retry queue, same as every other scheduled job.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-analytics-pull</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
+		<string>analytics-pull</string>
+		<string>/Volumes/AI_Workspace/iris_studio/.venv/bin/python</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/analytics_pull.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/analytics-pull.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/analytics-pull.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>5</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+		<key>Weekday</key>
+		<integer>1</integer>
+	</dict>
+</dict>
+</plist>
