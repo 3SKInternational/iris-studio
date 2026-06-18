@@ -18,6 +18,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -41,6 +43,14 @@ CANVAS_W, CANVAS_H = 7680, 4320
 VIDEO_CODEC = ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
                "-pix_fmt", "yuv420p"]
 AUDIO_CODEC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+
+# Bump this whenever the per-shot render math changes (compose_filter, zoompan,
+# codecs, canvas/output dims, label burn-in). It is folded into every shot's
+# cache key, so a bump invalidates ALL cached segments and forces a clean
+# re-render — the safety valve that stops the cache serving stale pixels after a
+# pipeline change. (The ffmpeg binary identity is ALSO folded into the key
+# automatically, so an ffmpeg upgrade/keg-swap self-invalidates without a bump.)
+CACHE_VERSION = 1
 
 
 def _resolve_bin(name: str) -> str:
@@ -289,6 +299,62 @@ def render_shot(shot: Shot, font: str | None, draw_ok: bool,
     run(cmd, f"shot {shot.index:02d} render")
 
 
+# ---- Per-shot segment cache ----------------------------------------------
+# Content-addressed: a shot's rendered .mp4 is keyed by a hash of EVERYTHING
+# that determines its pixels + audio. Re-running after editing one image
+# re-renders only that shot (its key changed) and reuses every other segment
+# verbatim -> we never re-render the whole batch for a small fix.
+def _file_digest(path: Path) -> str:
+    """Streaming sha256 of a file's bytes (content, not path/mtime) so a swapped
+    image at the same path correctly invalidates its cached segment."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _ffmpeg_identity() -> str:
+    """Identity of the ffmpeg that will render — its resolved path + version
+    banner. Folded into the cache key so a binary swap (lean<->ffmpeg-full keg,
+    a brew upgrade that shifts x264/drawtext output) self-invalidates the cache
+    instead of silently serving pixels the new binary wouldn't produce."""
+    try:
+        out = subprocess.run([FFMPEG, "-hide_banner", "-version"],
+                             capture_output=True, text=True)
+        first = (out.stdout or "").splitlines()[0] if out.stdout else ""
+    except Exception:
+        first = ""
+    return f"{FFMPEG}|{FFPROBE}|{first}"
+
+
+def shot_cache_key(shot: Shot, font: str | None, draw_ok: bool,
+                   env_id: str) -> str:
+    """A digest over every input that changes the rendered segment. Caption text
+    is deliberately excluded — it only feeds the soft SRT, never the pixels.
+    `env_id` is the ffmpeg identity (see _ffmpeg_identity)."""
+    # Whether a label will actually be burned in (affects pixels); if it won't,
+    # the label text is irrelevant to the segment.
+    label_burns = bool(shot.onscreen_label and font and draw_ok)
+    payload = {
+        "cache_version": CACHE_VERSION,
+        "env": env_id,
+        "fps": FPS, "out": [OUT_W, OUT_H], "canvas": [CANVAS_W, CANVAS_H],
+        "vcodec": VIDEO_CODEC, "acodec": AUDIO_CODEC,
+        "image_sha": _file_digest(shot.image),
+        "audio_sha": (_file_digest(shot.audio) if shot.audio is not None else None),
+        "audio_start": round(shot.audio_start, 6),
+        "n_frames": shot.n_frames,
+        "motion": shot.motion,
+        "zoom": round(shot.zoom, 6),
+        "fit": shot.fit,
+        "label": (shot.onscreen_label if label_burns else ""),
+        "label_font": (font if label_burns else ""),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
 # ---- Captions -------------------------------------------------------------
 def chunk_caption(text: str) -> list[str]:
     """Split a scene's narration into readable 1-2 line cues."""
@@ -393,6 +459,13 @@ def main() -> None:
     ap.add_argument("--output", help="override output mp4 path")
     ap.add_argument("--keep-temp", action="store_true",
                     help="keep the per-shot temp files for inspection")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="render every shot fresh; ignore + don't write the "
+                         "segment cache (old all-shots behavior, for debugging)")
+    ap.add_argument("--cache-dir",
+                    help="override the per-shot segment cache dir "
+                         "(default: ~/.cache/3sk_assemble/<output-stem>, "
+                         "kept OUT of the git-tracked vault)")
     args = ap.parse_args()
 
     for tool in (FFMPEG, FFPROBE):
@@ -430,20 +503,96 @@ def main() -> None:
     print(f"[assemble] {len(shots)} shots, {total:.1f}s "
           f"({total/60:.2f} min) -> {out_mp4}")
 
+    # Per-shot segment cache: reuse unchanged shots, re-render only edited ones.
+    use_cache = not args.no_cache
+    cache_dir: Path | None = None
+    env_id = ""
+    lock_fd = None
+    if use_cache:
+        if args.cache_dir:
+            cache_dir = Path(os.path.expanduser(args.cache_dir)).resolve()
+        else:
+            base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+            cache_dir = (Path(base) / "3sk_assemble" / out_mp4.stem).resolve()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Single-writer lock per cache namespace: the prune step below deletes
+        # any segment this run doesn't reference, which would clobber a
+        # concurrent run sharing the same output stem (and its just-staged,
+        # not-yet-concatenated segments). Take an exclusive non-blocking lock;
+        # if another run holds it, fall back to a cache-less fresh render (safe,
+        # correct, just not incremental) rather than racing the prune.
+        lock_fd = os.open(str(cache_dir / ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            print("[assemble] WARN: another assemble run holds the cache lock "
+                  f"({cache_dir}) -> rendering fresh without the cache this run")
+            os.close(lock_fd)
+            lock_fd = None
+            use_cache = False
+
     tmp = Path(tempfile.mkdtemp(prefix="assemble_"))
+    rendered = reused = 0
     try:
+        if use_cache:
+            env_id = _ffmpeg_identity()
         shot_files: list[Path] = []
+        referenced: set[Path] = set()
         for shot in shots:
-            sf = tmp / f"shot_{shot.index:02d}.mp4"
-            print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
-                  f"{shot.motion} {shot.seg_dur:.1f}s")
-            render_shot(shot, font, draw_ok, sf)
-            shot_files.append(sf)
+            if use_cache:
+                key = shot_cache_key(shot, font, draw_ok, env_id)
+                seg = cache_dir / f"shot_{shot.index:02d}_{key[:24]}.mp4"
+                referenced.add(seg)
+                if seg.exists() and seg.stat().st_size > 0:
+                    print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
+                          f"{shot.motion} {shot.seg_dur:.1f}s  [cached]")
+                    reused += 1
+                    shot_files.append(seg)
+                    continue
+                print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
+                      f"{shot.motion} {shot.seg_dur:.1f}s  [render]")
+                # Stage INSIDE the cache dir (same filesystem) so os.replace is
+                # atomic and never raises EXDEV across volumes; the '.staging_'
+                # prefix keeps it out of the 'shot_*.mp4' reuse + prune globs. A
+                # killed render leaves only the staging file, cleaned up below.
+                staged = cache_dir / f".staging_{shot.index:02d}_{key[:24]}.mp4"
+                try:
+                    render_shot(shot, font, draw_ok, staged)
+                    os.replace(staged, seg)
+                finally:
+                    if staged.exists():
+                        staged.unlink(missing_ok=True)
+                rendered += 1
+                shot_files.append(seg)
+            else:
+                sf = tmp / f"shot_{shot.index:02d}.mp4"
+                print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
+                      f"{shot.motion} {shot.seg_dur:.1f}s")
+                render_shot(shot, font, draw_ok, sf)
+                shot_files.append(sf)
 
         concat_shots(shot_files, out_mp4, tmp)
         srt = build_srt(shots)
         out_srt.write_text(srt)
+
+        if use_cache:
+            # Prune segments in THIS output's cache namespace that this run no
+            # longer references (plus any orphaned staging files from a killed
+            # run), so the cache can't grow without bound across edits. The
+            # single-writer lock above makes full-namespace pruning safe.
+            pruned = 0
+            for f in cache_dir.glob("shot_*.mp4"):
+                if f not in referenced:
+                    f.unlink(missing_ok=True)
+                    pruned += 1
+            for f in cache_dir.glob(".staging_*.mp4"):
+                f.unlink(missing_ok=True)
+            print(f"[assemble] cache: {rendered} rendered, {reused} reused"
+                  + (f", {pruned} stale pruned" if pruned else "")
+                  + f"  ({cache_dir})")
     finally:
+        if lock_fd is not None:
+            os.close(lock_fd)  # releases the flock
         if args.keep_temp:
             print(f"[assemble] temp kept at {tmp}")
         else:
