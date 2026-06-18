@@ -434,6 +434,28 @@ DISPATCH_AGENTS: dict[str, dict] = {
         # reach the second brain at /Users/steve/Documents/3SK/ "02 - PERMANENT/" etc.
         "extra_add_dirs": ["/Users/steve/Documents/3SK"],
     },
+    # --- Added 2026-06-18: the Building Iris build-in-public content engine ---
+    # build-logger: turns work that ALREADY shipped (the bridge file + git history
+    # of the iris_studio repo + recent session digests) into build-in-public post
+    # drafts (X thread + newsletter blurb) for the Building Iris brand. The keystone
+    # of the Building Iris content line (Charter §4/§5) — proves the brand earns its
+    # place as an automated byproduct of existing work, not net-new human hours.
+    # DRAFTS ONLY — it never posts (publishing target is undecided pending the
+    # brand-split call, Charter §7.2). Redaction is fail-closed: it scrubs
+    # [AUTHOR]/[COMPANY]/[ASSISTANT]/[EMAIL]/[BOT]/[USER] to placeholders, runs the
+    # shared deterministic scrub (scripts/redact-book.py) on its own draft as a
+    # MANDATORY post-write pass, and DROPS any item it can't safely redact. It
+    # reads git via its own Bash tool (`git -C <repo> log`),
+    # which is NOT sandboxed by --add-dir, so no extra_add_dirs is needed — the
+    # bridge file + session digests it Reads all live inside WORKSPACE_DIR.
+    # deliverable_dir is build-logger's DEDICATED, non-nested dir (its own subtree
+    # under Build_Log) — never shared with another agent's dir, which avoids the
+    # newest-in-window mis-attribution class that bit packaging-strategist/
+    # asset-librarian above.
+    "build-logger": {
+        "timeout_seconds": 600,  # 10 min — Sonnet, reads bridge+git+digests, drafts 1-3 posts
+        "deliverable_dir": "BRANDS/Building_Iris/Build_Log/_drafts",
+    },
     # The 4 engineering agents (senior-systems-architect, senior-engineer,
     # skeptical-code-reviewer, performance-optimizer) are deliberately NOT in this
     # enum yet — their target is a codebase (typically /Volumes/AI_Workspace/iris_studio/),
@@ -616,6 +638,13 @@ Available subagents (agent_name -> what it does):
   a DECISION BRIEF (evidence for/against/nuance + the gaps to fill). Dispatch when
   Steve wants the full picture his own notes hold before a real call ("brief me on
   the ESP decision"). He can also trigger it directly with `/decision <q>`. ~15 min.
+- `build-logger` — the Building Iris build-in-public content engine: reads work
+  that already shipped (the bridge file + the iris_studio git history + recent
+  session digests) and drafts 1-3 build-in-public posts (an X thread + a newsletter
+  blurb each), scars-included voice. DRAFTS ONLY — never posts anywhere (publishing
+  target pending the brand-split call). Redaction is fail-closed. Dispatch when Steve
+  wants build-log content; optional arg = a window ("3 days") or an item to spotlight.
+  ~10 min.
 
 When you dispatch:
 1. Call `dispatch_subagent` with agent_name, a clear self-contained prompt, and

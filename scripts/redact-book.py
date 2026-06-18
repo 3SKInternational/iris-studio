@@ -72,6 +72,7 @@ CRED_PATTERNS = [
     (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED]"),          # Slack token
     (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED]"),                      # AWS access key id
     (r"\b\d{8,10}:AA[A-Za-z0-9_\-]{30,}\b", "[REDACTED]"),        # Telegram bot token
+    (r"(?i)\bclient_secret[A-Za-z0-9_\-]*\.json\b", "[REDACTED]"),  # OAuth client-secret filename
     (r"-----BEGIN[A-Z ]*PRIVATE KEY-----", "[REDACTED]"),         # PEM private key header
     # generic NAME=secret / NAME: secret assignments (keep the name, redact the value)
     (r"(?i)\b((?:api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|token))(\s*[:=]\s*)['\"]?[A-Za-z0-9_\-./+]{8,}['\"]?",
