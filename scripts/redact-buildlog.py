@@ -54,11 +54,22 @@ IPV6_PAT = (
 )
 s = re.sub(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "[IP]", s)
 s = re.sub(IPV6_PAT, "[IP]", s)
-s = re.sub(r"\b[A-Za-z0-9][A-Za-z0-9\-]*\.(?:local|internal|lan)\b", "[HOST]", s)
-s = re.sub(r"\bport\s+\d{1,5}\b", "port [PORT]", s, flags=re.IGNORECASE)
+s = re.sub(r"\b[A-Za-z0-9][A-Za-z0-9\-]*\.(?:local|internal|lan)\b", "[HOST]", s, flags=re.IGNORECASE)
+# Ports: the "port N" phrasing (any separator, incl. none — "port8080"/"port:8080") and a
+# port glued to an already-scrubbed [IP]/[HOST] or localhost ("[IP]:3000", "localhost:8080").
+# Runs AFTER the IP/host scrubs so those placeholders already exist. A bare ":3000" with no
+# host context is deliberately NOT collapsed (indistinguishable from a duration/count) — the
+# agent's prose redaction covers that; the residual check below mirrors exactly these forms.
+s = re.sub(r"\bport[\s:]*\d{1,5}\b", "port [PORT]", s, flags=re.IGNORECASE)
+s = re.sub(r"(\[IP\]|\[HOST\]|localhost):\d{1,5}\b", r"\1:[PORT]", s, flags=re.IGNORECASE)
 
 # 3) Internal infra compound tokens — NOT the public brand word "Iris". Longest/most-
-#    specific first so a short token can't pre-truncate a superstring.
+#    specific first so a short token can't pre-truncate a superstring. Matched CASE-
+#    INSENSITIVELY (via re.escape so the dots stay literal) because the residual check
+#    below is IGNORECASE: a case-sensitive scrub here would leave "IRIS_STUDIO"/"Iris.py"
+#    detected-but-never-substituted, which would make the agent's "re-run until OK" loop
+#    unconvergeable. None of these patterns matches the bare brand word "Iris" (all require
+#    an infra suffix/separator), so the public name stays intact.
 ordered = [
     ("3SKInternational/iris-studio", "[REPO]"),
     ("STEVE_CONTEXT", "[AUTHOR]_CONTEXT"),
@@ -76,7 +87,7 @@ ordered = [
     ("iris.py", "[APP]"),
 ]
 for a, b in ordered:
-    s = s.replace(a, b)
+    s = re.sub(re.escape(a), b, s, flags=re.IGNORECASE)
 
 # 4) CREDENTIAL redaction — MUST run before the company/person substring scrubs below.
 #    A naive "3SK -> [COMPANY]" or "<user-id> -> [USER_ID]" pass would otherwise corrupt
@@ -131,6 +142,7 @@ checks = [
     r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",                  # any IPv4
     IPV6_PAT,                                                   # any IPv6 (same source as scrub)
     r"\b[A-Za-z0-9][A-Za-z0-9\-]*\.(?:local|internal|lan)\b",  # any internal host
+    r"\bport[\s:]*\d", r"(?:\[IP\]|\[HOST\]|localhost):\d",     # ports (same forms as the scrub)
     r"iris[_\-]\w", r"iris\.(?:py|db|err|out|sh)", r"com\.iris", r"@iris",  # infra forms ONLY
     r"3sk",                                                     # company
     r"steve", r"\bste(?:ven?s?|phens?)\b", r"\barias\b",       # person (catches steve_* compounds)
