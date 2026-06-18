@@ -12,6 +12,13 @@ __pycache__/
 # Stray captured-output file from 2026-05-25 setup
 arrow
 
+# YouTube OAuth credentials (Builds 3+4) — NEVER commit. The downloaded Google
+# OAuth client secret + the captured authorized-user token (carries the
+# refresh_token). Same rule as .env: creds live on the Mini only, never the repo.
+client_secret*.json
+youtube_token.json
+*_token.json
+
 # Local logs (real logs live at ~/iris_studio/logs/)
 logs/
 

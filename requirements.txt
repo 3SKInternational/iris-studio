@@ -30,3 +30,28 @@ starlette==1.1.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 uvicorn==0.47.0
+
+# --- YouTube OAuth + Data API v3 + Analytics API (Autonomy Roadmap Builds 3+4) ---
+# Added 2026-06-18. Direct deps: google-api-python-client (Data/Analytics clients),
+# google-auth-oauthlib (InstalledAppFlow for the one-time studio@ consent),
+# google-auth-httplib2 (transport). The rest are their pinned transitives, exactly
+# as resolved into .venv (google-auth 2.55 uses the already-present `cryptography`,
+# so cachetools/rsa are intentionally absent).
+charset-normalizer==3.4.7
+google-api-core==2.31.0
+google-api-python-client==2.197.0
+google-auth==2.55.0
+google-auth-httplib2==0.4.0
+google-auth-oauthlib==1.4.0
+googleapis-common-protos==1.75.0
+httplib2==0.31.2
+oauthlib==3.3.1
+proto-plus==1.28.0
+protobuf==7.35.0
+pyasn1==0.6.3
+pyasn1_modules==0.4.2
+pyparsing==3.3.2
+requests==2.34.2
+requests-oauthlib==2.0.0
+uritemplate==4.2.0
+urllib3==2.7.0
