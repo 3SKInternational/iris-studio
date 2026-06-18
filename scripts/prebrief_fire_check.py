@@ -105,7 +105,7 @@ def collect_expected(now: datetime) -> list[Expected]:
     expected: list[Expected] = []
 
     # === Launchd cron jobs ===
-    if (t := _last_fire_daily(now, 2, 0)):
+    if (t := _last_fire_daily(now, 3, 0)):
         expected.append(Expected(
             "claude-code-nightly", t, "launchd_log",
             log_path=LOGS_DIR / "claude-code-nightly.log",
@@ -125,7 +125,7 @@ def collect_expected(now: datetime) -> list[Expected]:
             "claude-code-credential-check", t, "launchd_log",
             log_path=LOGS_DIR / "claude-code-credential-check.log",
         ))
-    if (t := _last_fire_weekly(now, {MON, THU}, 3, 0)):
+    if (t := _last_fire_weekly(now, {MON, THU}, 3, 30)):
         expected.append(Expected(
             "claude-code-automation-scan", t, "launchd_log",
             log_path=LOGS_DIR / "claude-code-automation-scan.log",
@@ -135,7 +135,7 @@ def collect_expected(now: datetime) -> list[Expected]:
             "db-backup", t, "db_backup_file",
             log_path=LOGS_DIR / "db-backup.log",
         ))
-    if (t := _last_fire_weekly(now, {SUN}, 3, 0)):
+    if (t := _last_fire_weekly(now, {SUN}, 3, 10)):
         expected.append(Expected(
             "log-rotate", t, "launchd_log",
             log_path=LOGS_DIR / "log-rotate.log",
@@ -158,12 +158,12 @@ def collect_expected(now: datetime) -> list[Expected]:
             "project-manager-weekly", t, "dispatch",
             agent_name="project-manager",
         ))
-    if (t := _last_fire_weekly(now, {WED}, 3, 0)):
+    if (t := _last_fire_weekly(now, {WED}, 2, 0)):
         expected.append(Expected(
             "youtube-researcher-weekly", t, "dispatch",
             agent_name="youtube-researcher",
         ))
-    if (t := _last_fire_monthly(now, 1, 3, 0)):
+    if (t := _last_fire_monthly(now, 1, 2, 0)):
         expected.append(Expected(
             "market-researcher-monthly", t, "dispatch",
             agent_name="market-researcher",

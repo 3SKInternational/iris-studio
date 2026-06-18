@@ -1,4 +1,4 @@
-Sunday Drive gardener at 03:00 AM ET, weekly — runs AFTER the 02:30 rclone backup (which completes in ~10 min) and well BEFORE the 04:30 hygiene job. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
+Sunday Drive gardener at 03:30 AM ET, weekly — runs AFTER the 03:00 rclone backup (which completes in ~10 min) and well BEFORE the 04:30 hygiene job. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
 
 Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` (latest entry) for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
 
@@ -31,9 +31,9 @@ Run `/opt/homebrew/bin/rclone lsf "gdrive:3SK International" --files-only` (top-
 - **If a file's destination is genuinely ambiguous, LEAVE IT and flag it in the report — do not guess.**
 
 ### Pass 2 — Verify backup health (READ-ONLY on the mirror)
-The scheduled backup (`com.iris.drive-sync`) fires Sun 02:30 — ~30 min before you run — so a healthy week leaves a fresh, COMPLETED entry from earlier this morning.
+The scheduled backup (`com.iris.drive-sync`) fires Sun 03:00 — ~30 min before you run — so a healthy week leaves a fresh, COMPLETED entry from earlier this morning.
 1. `tail -20 /Users/steve/iris_studio/logs/drive-sync.stdout.log`. Find the **LAST** `=== drive-sync start … ===` line and judge ONLY that most-recent run (do NOT accept "some earlier block has a done"). Health requires ALL three:
-   - its timestamp is within the last ~26 hours — i.e. today's 02:30 run actually fired. An older latest-start means the scheduled job didn't run at all → **FLAG**.
+   - its timestamp is within the last ~26 hours — i.e. today's 03:00 run actually fired. An older latest-start means the scheduled job didn't run at all → **FLAG**.
    - it is followed by a matching `=== drive-sync done … ===` line. A trailing `start` with NO `done` after it = a stalled/aborted run → **FLAG**.
    - there is NO `ERROR` / `Aborting` line after that last `start`.
    (Failure signature for reference: the 5/31 + 6/7 scheduled runs each logged `start` then `ERROR … Aborting` with no `done`. That exact shape = broken backup, even though a later manual run looks clean.)

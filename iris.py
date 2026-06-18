@@ -507,13 +507,15 @@ AUTONOMOUS_DISPATCHES: list[dict] = [
     {
         "name": "youtube-researcher-weekly",
         "agent_name": "youtube-researcher",
-        # weekly Wednesdays 03:00 ET — fresh YT channel intelligence mid-week,
+        # weekly Wednesdays 02:00 ET — fresh YT channel intelligence mid-week,
         # before the typical Thu-Sun script production push. Feeds
         # BRANDS/3SK_Finance/Channel_Intelligence/ which the channel content
         # agents (scriptwriter, thumbnail-coordinator, video-description-writer,
         # scene-image-prompt-generator) read at every dispatch as their
-        # freshness layer.
-        "trigger_kwargs": {"day_of_week": "wed", "hour": 3, "minute": 0},
+        # freshness layer. Runs at 02:00 (ahead of the 03:00 nightly) so the
+        # nightly's content work reads fresh intel, and so three heavy LLM jobs
+        # don't collide at 03:00 (de-staggered 6/18, Session 66).
+        "trigger_kwargs": {"day_of_week": "wed", "hour": 2, "minute": 0},
         "prompt": (
             "Weekly autonomous YouTube channel intelligence sweep. Read existing "
             "BRANDS/3SK_Finance/Channel_Intelligence/*.md to know what's already "
@@ -532,8 +534,10 @@ AUTONOMOUS_DISPATCHES: list[dict] = [
     {
         "name": "market-researcher-monthly",
         "agent_name": "market-researcher",
-        # monthly 1st @ 03:00 ET — between Claude Code's 02:00 nightly and Cowork's 03:05 pulse.
-        "trigger_kwargs": {"day": 1, "hour": 3, "minute": 0},
+        # monthly 1st @ 02:00 ET — ahead of the 03:00 nightly so the month's
+        # content work reads fresh market intel, and so the heavy LLM jobs stop
+        # colliding at 03:00 (de-staggered 6/18, Session 66).
+        "trigger_kwargs": {"day": 1, "hour": 2, "minute": 0},
         "prompt": (
             "Monthly autonomous research sweep. Read "
             "05_Research_and_Intelligence/Competitor_Analysis/_rotation.md — pick "
