@@ -1,0 +1,28 @@
+{
+  "project": "CTA",
+  "output_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Shared_Assets/CTA/_base",
+  "reference_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Character_Reference",
+  "reference_images": [
+    "Three_Reference_Sheet.png",
+    "Three_Age_Variations.png",
+    "Three_Wardrobe_Variations.png",
+    "Three_Formality_Variations.png",
+    "Three_Expressions.png"
+  ],
+  "style_preamble": "The attached images are the locked visual reference for a character named Three. The character MUST match these references exactly: same face, solid black dot eyes only (no iris, no whites, no highlights), same chibi proportions (oversized round head about one-third of total height, small compact torso, short stubby limbs), same flat 2D explainer-cartoon style — clean outlines, solid color fills, minimal flat shading. Do not drift toward realism, 3D, soft rendering, Pixar style, or detailed texture. Keep backgrounds to simple flat shapes with no surface texture or clutter. Hair is a smooth brushy cap, short and dark brown, no individual curls. Clean-shaven, no watch, no jewelry unless specified. Use the wardrobe, age, expression, and setting described below; keep everything else identical to the reference. CRITICAL: render NO text, letters, numbers, buttons, icons, or UI of any kind anywhere in the image — leave the specified negative-space areas completely empty flat color, because real text and buttons are composited on afterward.",
+  "defaults": {
+    "model": "gpt-image-2",
+    "quality": "medium",
+    "size": "2048x1152"
+  },
+  "images": [
+    {
+      "name": "CTA_midroll",
+      "prompt": "Three, age 30, smart-casual (charcoal crew-neck), standing in the LEFT third of the frame, turned slightly toward the viewer with a warm encouraging half-smile, one arm raised and open hand gesturing toward the empty RIGHT side of the frame (presenting an offscreen target). Lighting: flat stylized only, soft brand-blue ambient with a gentle warm key on his face. Graphic, NOT realistic. Environment: a clean flat brand-charcoal (#1F2A33) background with one subtle darker flat panel band filling the right two-thirds — NO objects, NO clutter. Leave the entire RIGHT HALF as empty flat color (a button is composited there later). Camera: medium, eye level, Three occupying the left third. Hold the reference: solid black dot eyes only, chibi proportions, flat 2D, no texture. Absolutely no text, numbers, icons, or buttons anywhere."
+    },
+    {
+      "name": "CTA_outro",
+      "prompt": "Three, age 30, smart-casual (charcoal crew-neck), standing in the LEFT third of the frame, facing the viewer with a warm grateful smile, BOTH arms raised and open hands gesturing welcomingly toward the empty RIGHT side of the frame (presenting three offscreen targets stacked vertically). Lighting: flat stylized only, soft brand-blue ambient with a gentle warm key on his face. Graphic, NOT realistic. Environment: a clean flat brand-charcoal (#1F2A33) background with one subtle darker flat vertical band filling the right third — NO objects, NO clutter. Leave the entire RIGHT THIRD as empty flat color (three stacked buttons are composited there later). Camera: medium, eye level, Three occupying the left third. Hold the reference: solid black dot eyes only, chibi proportions, flat 2D, no texture. Absolutely no text, numbers, icons, or buttons anywhere."
+    }
+  ]
+}

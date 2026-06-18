@@ -1,0 +1,16 @@
+{
+  "canvas": [2048, 1152],
+  "base_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Shared_Assets/CTA/_base",
+  "out_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Shared_Assets/CTA",
+  "defaults": {"weight": "bold", "align": "center", "anchor": "mm"},
+  "cards": {
+    "CTA_midroll": [
+      {"text": "SUBSCRIBE", "x": 0.72, "y": 0.50, "size": 96, "color": "white", "style": "pill", "pill_color": "red"}
+    ],
+    "CTA_outro": [
+      {"text": "LIKE", "x": 0.78, "y": 0.28, "size": 70, "color": "white", "style": "pill", "pill_color": "blue"},
+      {"text": "COMMENT", "x": 0.78, "y": 0.50, "size": 70, "color": "white", "style": "pill", "pill_color": "blue"},
+      {"text": "SUBSCRIBE", "x": 0.78, "y": 0.72, "size": 76, "color": "white", "style": "pill", "pill_color": "red"}
+    ]
+  }
+}

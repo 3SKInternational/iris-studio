@@ -269,6 +269,64 @@ def author_image_manifest(shots: list[dict], vid: str, images_out: Path) -> dict
 _MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left", "pan_up", "pan_down"]
 
 
+# --- shared reusable CTA segments ------------------------------------------
+# The subscribe/like/comment beat is identical in every video, so it is built
+# ONCE as fixed assets and dropped straight into the edit manifest. It never
+# enters the image manifest (no gpt-image-2 spend) or the VO kit (no TTS spend),
+# so we never pay to regenerate it — only a one-time local ffmpeg render per
+# video. Assets live under <vault>/Shared_Assets/CTA/ (vault-relative, so they
+# resolve under the manifest asset_dir exactly like any per-shot image/clip).
+# A missing asset is skipped with a warning, so a CTA that hasn't been generated
+# yet degrades to the pre-CTA output instead of breaking a build.
+CTA_DIR = "Shared_Assets/CTA"
+# The mid-roll bump is inserted right after this scene. The Universal Intro ends
+# ~scene 2 (cold-open hook + the "by the end of this video" promise), so the bump
+# lands just past the hook while retention is still high. The outro CTA is always
+# appended last.
+CTA_MIDROLL_AFTER_SCENE = 2
+CTA_SEGMENTS = {
+    "midroll": {
+        "image": f"{CTA_DIR}/CTA_midroll.png",
+        "vo_clip": f"{CTA_DIR}/CTA_midroll.mp3",
+        "motion": "zoom_in",
+        "caption_text": ("Quick thing before we keep going — if this is landing, "
+                         "subscribe. It's how the channel reaches the next person "
+                         "who needs it. Okay, back to it."),
+    },
+    "outro": {
+        "image": f"{CTA_DIR}/CTA_outro.png",
+        "vo_clip": f"{CTA_DIR}/CTA_outro.mp3",
+        "motion": "zoom_in",
+        "caption_text": ("And before you go: like this video, leave a comment, and "
+                         "subscribe so the next one finds you."),
+    },
+}
+
+
+def _cta_shot(asset_dir: Path, key: str, still: bool = False) -> dict | None:
+    """Build the edit-manifest shot for a shared CTA segment, or return None
+    (with a warning) when either fixed asset is missing — so a CTA that hasn't
+    been generated yet is silently omitted rather than hard-failing the
+    assembler. Caption text feeds only the soft SRT; the on-screen
+    subscribe/like/comment buttons are burned into the PNG itself."""
+    seg = CTA_SEGMENTS[key]
+    img = asset_dir / seg["image"]
+    vo = asset_dir / seg["vo_clip"]
+    missing = [p.name for p in (img, vo) if not p.is_file()]
+    if missing:
+        print(f"  ⚠ CTA {key} skipped — missing shared asset(s): "
+              f"{', '.join(missing)} (generate them once under {CTA_DIR}/).")
+        return None
+    return {
+        "image": seg["image"],
+        "vo_clip": seg["vo_clip"],
+        # Honor --still on the CTA beats too, so a "kill all motion drift" render
+        # has no Ken Burns anywhere (the scene shots already use "hold").
+        "motion": "hold" if still else seg["motion"],
+        "caption_text": seg["caption_text"],
+    }
+
+
 def _resolve_image(asset_dir: Path, images_rel: str, vid: str,
                    scene: int, sid: str, allow_fallback: bool) -> tuple[str, str | None]:
     """Pick the vault-relative image path for a shot.
@@ -297,7 +355,9 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
                          output_dir: Path, output_name: str,
                          allow_image_fallback: bool = False,
                          align: bool = False,
-                         fit: str | None = None) -> tuple[dict, bool, list[str], list[int], list[str]]:
+                         fit: str | None = None,
+                         still: bool = False,
+                         include_cta: bool = True) -> tuple[dict, bool, list[str], list[int], list[str]]:
     """Author the video_factory edit manifest.
 
     `allow_image_fallback` (set only for an explicit `--image-set`) lets a shot
@@ -358,7 +418,9 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             shot: dict = {
                 "image": image_rel,
                 "vo_clip": f"{vo_rel}/{vo_name}",
-                "motion": _MOTIONS[mi % len(_MOTIONS)],
+                # `still` locks every shot to a static frame (no Ken Burns) when
+                # the caller wants zero motion drift; otherwise cycle for variety.
+                "motion": "hold" if still else _MOTIONS[mi % len(_MOTIONS)],
                 "caption_text": text,
             }
             mi += 1
@@ -377,6 +439,28 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             out_shots.append(shot)
         if dur is None and k > 1:
             undetermined.append(scene)
+
+    # Inject the shared reusable CTA segments (built once, never regenerated): a
+    # mid-roll subscribe bump just after the Universal Intro, then the full
+    # like/comment/subscribe beat at the very end. Both reference fixed assets, so
+    # they add nothing to the billed image/VO stages. Insert the mid-roll first so
+    # its index (counted from the pre-CTA scene shots) is unaffected by the outro
+    # append.
+    if include_cta:
+        midroll = _cta_shot(asset_dir, "midroll", still=still)
+        if midroll is not None:
+            # Index of the first shot belonging to a scene past the threshold ==
+            # count of shots in scenes <= the threshold.
+            idx = sum(len(by_scene[s]) for s in by_scene
+                      if s <= CTA_MIDROLL_AFTER_SCENE)
+            if 0 < idx < len(out_shots):
+                out_shots.insert(idx, midroll)
+            else:
+                print(f"  ⚠ CTA midroll skipped — no scene boundary after scene "
+                      f"{CTA_MIDROLL_AFTER_SCENE} to place it (video too short?).")
+        outro = _cta_shot(asset_dir, "outro", still=still)
+        if outro is not None:
+            out_shots.append(outro)
 
     manifest = {
         "video": f"{vid}_v2 (orchestrated)",
@@ -421,6 +505,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fit", choices=["cover", "contain"], default=None,
                    help="Override the edit-manifest default fit. 'cover' = crop-to-fill "
                         "(V1's original look); 'contain' = blurred-fill, no crop (default).")
+    p.add_argument("--still", action="store_true",
+                   help="Lock every shot to a static frame (motion 'hold') — no Ken "
+                        "Burns pan/zoom. Use to kill on-screen motion drift.")
+    p.add_argument("--no-cta", action="store_true",
+                   help="Omit the shared reusable CTA segments (mid-roll subscribe "
+                        "bump + outro like/comment/subscribe). On by default; they "
+                        "reuse fixed assets and are never re-billed.")
     return p.parse_args()
 
 
@@ -499,7 +590,7 @@ def main() -> None:
         shots, cadence, kit, vid, vlt, images_rel, vo_rel,
         vlt / "Footage_and_Edits", f"{vid}_v2",
         allow_image_fallback=bool(args.image_set),
-        fit=args.fit,
+        fit=args.fit, still=args.still, include_cta=not args.no_cta,
     )
     # Key the edit manifest by BOTH its image set and its VO source so distinct
     # asset combinations (e.g. `_gen`+`_gen` vs `Video_01_HD`+hand-VO) never
@@ -553,7 +644,8 @@ def main() -> None:
             shots, cadence, kit, vid, vlt, images_rel, vo_rel,
             vlt / "Footage_and_Edits", f"{vid}_v2",
             allow_image_fallback=bool(args.image_set),
-            align=args.align, fit=args.fit,
+            align=args.align, fit=args.fit, still=args.still,
+            include_cta=not args.no_cta,
         )
         for fb in fallbacks:
             print(f"  ⚠ image fallback — {fb}")
