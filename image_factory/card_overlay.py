@@ -551,9 +551,9 @@ def main() -> None:
     ap.add_argument("spec", help="overlay spec JSON")
     ap.add_argument("--base-dir", help="dir of backplate PNGs (overrides spec.base_dir)")
     ap.add_argument("--out-dir", help="dir for composited PNGs (default: base-dir)")
-    ap.add_argument("--suffix", default="_text",
-                    help="appended to each output basename (default '_text'; "
-                         "'' keeps the name — then --out-dir must differ from base)")
+    ap.add_argument("--suffix", default=None,
+                    help="appended to each output basename (default: spec 'suffix' or "
+                         "'_text'; '' keeps the name — then --out-dir must differ from base)")
     ap.add_argument("--only", action="append", default=[],
                     help="composite only this card name (repeatable)")
     ap.add_argument("--dry-run", action="store_true",
@@ -602,11 +602,17 @@ def main() -> None:
     if not cards:
         die("spec has no 'cards'")
 
+    # CLI --suffix overrides the spec; otherwise honor a spec-level "suffix" so a
+    # generation spec is self-contained (no flag to forget). Default "_text".
+    suffix = args.suffix if args.suffix is not None else spec.get("suffix", "_text")
+    if not isinstance(suffix, str):
+        die("spec 'suffix' must be a string")
+
     base_dir = Path(os.path.expanduser(
         args.base_dir or spec.get("base_dir") or spec_path.parent)).resolve()
     out_dir = Path(os.path.expanduser(
         args.out_dir or spec.get("out_dir") or base_dir)).resolve()
-    if out_dir == base_dir and args.suffix == "":
+    if out_dir == base_dir and suffix == "":
         die("out-dir == base-dir and suffix is empty → would overwrite backplates; "
             "set --suffix or a separate --out-dir.")
 
@@ -636,12 +642,12 @@ def main() -> None:
     print(f"[card_overlay] spec {spec_path.name}  canvas {canvas[0]}x{canvas[1]}  "
           f"{len(names)} card(s)")
     print(f"[card_overlay] base {base_dir}")
-    print(f"[card_overlay] out  {out_dir}  (suffix {args.suffix!r})")
+    print(f"[card_overlay] out  {out_dir}  (suffix {suffix!r})")
 
     n_ok = 0
     for name in names:
         base_path = base_dir / f"{name}.png"
-        out_path = out_dir / f"{name}{args.suffix}.png"
+        out_path = out_dir / f"{name}{suffix}.png"
         n_el = len(cards[name])
         if args.dry_run:
             status = "OK" if base_path.is_file() else "MISSING backplate"

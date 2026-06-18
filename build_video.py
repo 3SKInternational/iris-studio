@@ -290,8 +290,8 @@ CTA_SEGMENTS = {
         "vo_clip": f"{CTA_DIR}/CTA_midroll.mp3",
         "motion": "zoom_in",
         "caption_text": ("Quick thing before we keep going — if this is landing, "
-                         "subscribe. It's how the channel reaches the next person "
-                         "who needs it. Okay, back to it."),
+                         "subscribe. It's the easiest way to make sure the next one "
+                         "reaches you. Okay, back to it."),
     },
     "outro": {
         "image": f"{CTA_DIR}/CTA_outro.png",
