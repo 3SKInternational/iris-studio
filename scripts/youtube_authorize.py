@@ -38,14 +38,17 @@ from pathlib import Path
 # beside .env at the repo root (both are .gitignored).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# The three scopes the roadmap needs. Order is irrelevant but kept stable so the
+# The scopes the roadmap needs. Order is irrelevant but kept stable so the
 # token's recorded scope set is comparable run-to-run.
 #   youtube.upload          -> Build 3: upload videos
-#   youtube                 -> Build 3: set thumbnails, schedule publish, captions
+#   youtube                 -> Build 3: set thumbnails, schedule publish
+#   youtube.force-ssl       -> Build 3: write captions (captions.insert REQUIRES
+#                              force-ssl; the plain `youtube` scope is not enough)
 #   yt-analytics.readonly   -> Build 4: CTR / retention / AVD metrics
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
     "https://www.googleapis.com/auth/yt-analytics.readonly",
 ]
 
@@ -238,6 +241,24 @@ def main(argv: list[str] | None = None) -> int:
 
     _save_token(creds, token_path)
     print(f"✅ Saved refresh token → {token_path} (chmod 600)")
+
+    # The unbundled consent screen lets the user UNCHECK individual scopes, so a
+    # "successful" consent can still mint a token missing the one we need most
+    # (force-ssl = caption writes). Assert it landed; a silent miss => later 403.
+    # Check GRANTED scopes (creds.granted_scopes = what the user actually consented
+    # to), NOT creds.scopes (what the flow REQUESTED — always our full SCOPES list,
+    # so it would never catch an unchecked box). No fallback to .scopes: if the token
+    # endpoint omits the granted set we'd rather warn (safe-side false positive) than
+    # silently miss a real gap.
+    ssl_scope = "https://www.googleapis.com/auth/youtube.force-ssl"
+    granted = set(getattr(creds, "granted_scopes", None) or [])
+    if ssl_scope not in granted:
+        _eprint(
+            "⚠️  WARNING: the minted token does NOT carry youtube.force-ssl — "
+            "caption uploads (captions.insert) WILL 403. You likely unchecked it "
+            "on the consent screen. Re-run with --force and leave every box "
+            f"checked. Granted scopes: {sorted(granted) or 'unknown'}"
+        )
 
     if args.no_verify:
         return 0

@@ -25,12 +25,17 @@ from pathlib import Path
 # Repo root = parent of this scripts/ dir (mirrors youtube_authorize.py).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Must match youtube_authorize.py exactly. Credentials.from_authorized_user_file
-# validates the on-disk token carries (at least) these scopes; a mismatch raises
-# and we surface a clear re-authorize message rather than a cryptic 403 later.
+# Must match youtube_authorize.py exactly. NOTE: from_authorized_user_file does
+# NOT validate granted-vs-requested scopes and does not raise on mismatch — the
+# list passed here just becomes creds.scopes. A scope the on-disk token was never
+# granted surfaces only at REFRESH time (invalid_scope -> RefreshError ->
+# YouTubeAuthError), never at load. So after WIDENING this list, re-run
+# youtube_authorize.py --force promptly: the old token keeps working until its
+# access token expires, after which the next refresh may fail until re-consent.
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
     "https://www.googleapis.com/auth/yt-analytics.readonly",
 ]
 
