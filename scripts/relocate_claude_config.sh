@@ -112,6 +112,33 @@ case "$mp" in
   /Volumes/AI_Workspace*) log "  ⚠ ~/.claude still resolves to the X9 volume ($mp) — unexpected, investigate." ;;
 esac
 
+# 7) Restore the remote-control daemon the SAFETY check (step 3) made you quit.
+#    com.iris.claude-remote holds open file handles under ~/.claude, so this script
+#    can only run with it down — but nothing was bringing it back, leaving Remote
+#    Control offline (and the playpen RELAY tile red) until someone noticed. Re-load
+#    it here so the relocation self-heals. Best-effort: never fail the (already
+#    successful) relocation just because the daemon couldn't be re-loaded.
+REMOTE_PLIST="$HOME/Library/LaunchAgents/com.iris.claude-remote.plist"
+REMOTE_TGT="gui/$(id -u)/com.iris.claude-remote"
+# `launchctl print <target>` is the canonical "is this service loaded?" probe — no
+# pipe, so no SIGPIPE race (unlike `launchctl list | grep`, which can misreport when
+# grep exits before list finishes writing).
+if [[ -f "$REMOTE_PLIST" ]]; then
+  if launchctl print "$REMOTE_TGT" >/dev/null 2>&1; then
+    log "→ restarting com.iris.claude-remote for the new config path…"
+    launchctl kickstart -k "$REMOTE_TGT" 2>/dev/null || true
+  else
+    log "→ re-loading com.iris.claude-remote (step 3 had you quit it)…"
+    launchctl bootstrap "gui/$(id -u)" "$REMOTE_PLIST" 2>/dev/null || true
+  fi
+  if launchctl print "$REMOTE_TGT" >/dev/null 2>&1; then
+    log "✓ com.iris.claude-remote re-loaded."
+  else
+    log "  ⚠ com.iris.claude-remote did NOT come back — load it manually:"
+    log "      launchctl bootstrap gui/\$(id -u) '$REMOTE_PLIST'"
+  fi
+fi
+
 log ""
 log "✓ ~/.claude is now a real directory on: $mp"
 log "✓ settings.json : $([[ -f "$LINK/settings.json" ]] && echo present || echo MISSING)"
