@@ -338,11 +338,16 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # TEXT — the levers that actually move CTR. thumbnail-coordinator owns the
     # IMAGE; this agent owns the words. Operationalizes the Discoverability_Playbook
     # against the "first-gen wealth" moat. Seed (scriptwriter's Thumbnail Concept)
-    # → finished package, the same expand-not-duplicate split. Writes beside the
-    # thumbnail brief in Thumbnails/ as Packaging_Video_NN.md.
+    # → finished package, the same expand-not-duplicate split.
+    # deliverable_dir is its OWN dir (sibling of Thumbnails, NOT nested under it):
+    # packaging is meant to run "alongside" thumbnail-coordinator, and a SHARED
+    # deliverable_dir lets _find_deliverable's newest-in-window scan return the
+    # other agent's file as this dispatch's deliverable (mis-attributed Telegram
+    # notification + status-hook read of the wrong file). A dedicated non-nested
+    # dir removes the collision with zero change to the shared detection logic.
     "packaging-strategist": {
         "timeout_seconds": 480,  # 8 min — read canon + draft 8-10 titles/hooks/text
-        "deliverable_dir": "BRANDS/3SK_Finance/Thumbnails",
+        "deliverable_dir": "BRANDS/3SK_Finance/Packaging",
     },
     "sponsor-outreach-drafter": {
         "timeout_seconds": 900,  # 15 min — light web research per sponsor + drafting
