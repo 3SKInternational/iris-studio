@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-retry</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/retry_runner.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<!-- Sweep the retry queue every 30 minutes. When the queue is empty this is a
+	     near-instant no-op; when a job has failed it replays it until it succeeds.
+	     StartInterval (not StartCalendarInterval) so the 30-min cadence is wall-
+	     clock-relative and resumes promptly after sleep/wake. -->
+	<key>StartInterval</key>
+	<integer>1800</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-retry.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-retry.stdout.log</string>
+	<!-- A replayed routine inherits THIS job's limits, so give the same file-
+	     descriptor headroom the heavy routines (e.g. vault-gardener) need; under
+	     launchd's default soft RLIMIT_NOFILE of 256 a recovered fd-heavy routine
+	     would fail again with "low max file descriptors". -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>

@@ -28,6 +28,10 @@
 
 set -uo pipefail
 
+# Capture the full invocation BEFORE we shift off the job name — the retry queue
+# replays this verbatim if the job fails.
+ORIG_ARGV=("$0" "$@")
+
 JOB="${1:?run_job: job name required}"
 shift || true
 if [ "$#" -eq 0 ]; then
@@ -39,12 +43,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NOTIFY="$SCRIPT_DIR/notify.sh"
 LOG="/Users/steve/iris_studio/logs/job-${JOB}.log"
 
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/retry_queue.sh"
+
 alert() {
     # Best-effort — never let a notify failure mask the job's own exit code.
     "$NOTIFY" "$1" || true
 }
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+
+# Serialize the job against itself so a 30-min retry replay can't overlap its own
+# scheduled fire. If another instance holds the lock, exit cleanly and leave the
+# retry marker for the holder to resolve. Fail-open if the lock can't be taken.
+if ! rq_acquire_lock "$JOB"; then
+    echo "run_job: '${JOB}' already running (lock held) — skipping this invocation" >> "$LOG"
+    exit 0
+fi
+trap 'rq_release_lock' EXIT
 
 TS_START="$(date '+%Y-%m-%d %H:%M %Z')"
 echo "run_job: '${JOB}' starting at ${TS_START} — $*" >> "$LOG"
@@ -55,16 +71,25 @@ rc=$?
 TS="$(date '+%Y-%m-%d %H:%M %Z')"
 
 if [ "$rc" -ne 0 ]; then
-    alert "🔴 launchd job '${JOB}' FAILED — exit code ${rc}.
+    # Red alert only on the original fire; retries are throttled by rq_record_failure.
+    if [ "${IRIS_RETRY:-0}" != "1" ]; then
+        alert "🔴 launchd job '${JOB}' FAILED — exit code ${rc}.
 Time: ${TS}
 Log tail:
 $(tail -n 4 "$LOG" 2>/dev/null || echo '(no log)')"
+    fi
+    # Enqueue/bump a retry marker so the 30-min sweep keeps trying until it runs.
+    rq_record_failure "$JOB" "infra" "exit code ${rc}" -- "${ORIG_ARGV[@]}"
     echo "run_job: '${JOB}' FAILED (exit ${rc}) at ${TS}" >> "$LOG"
     exit "$rc"
 fi
 
+# Success: clear any retry marker (emits the RECOVERED ping if it had been
+# failing). On the retry path that recovery ping is the signal, so suppress the
+# routine ✅ to avoid a duplicate.
+rq_clear_on_success "$JOB"
 echo "run_job: '${JOB}' completed ok at ${TS}" >> "$LOG"
-if [ "${JOB_QUIET_OK:-0}" != "1" ]; then
+if [ "${JOB_QUIET_OK:-0}" != "1" ] && [ "${IRIS_RETRY:-0}" != "1" ]; then
     alert "✅ launchd job '${JOB}' completed at $(date '+%H:%M %Z')."
 fi
 exit 0
