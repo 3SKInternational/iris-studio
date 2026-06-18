@@ -8,7 +8,11 @@
 # substitution pass AND the fail-closed residual check so they cannot drift; guarded I/O.
 import re, sys
 
-P = "/Users/steve/Documents/3SK/outputs/iris-studio-ebook/iris-studio-ebook.md"
+# Target book path: first CLI arg if given, else the flagship (backward compatible with
+# any caller that runs this bare). The nightly multi-book pipeline passes each maintained
+# book's path explicitly so every sellable book gets the same fail-closed scrub.
+DEFAULT_P = "/Users/steve/Documents/3SK/outputs/iris-studio-ebook/iris-studio-ebook.md"
+P = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_P
 try:
     with open(P, encoding="utf-8") as fh:
         s = fh.read()
