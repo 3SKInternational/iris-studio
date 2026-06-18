@@ -838,7 +838,13 @@ def cmd_spend_ok(sf: StateFile) -> int:
     once. NEVER reachable from --advance."""
     stages = sf.data["stages"]
     video = sf.data["video"]
-    reconcile_orphans(stages, video)
+    # A genuinely-live run surfaces as die() (exit 1) — same CLI contract as
+    # cmd_advance — so the billed path gives a clean "refusing to double-run …"
+    # message instead of a raw traceback, BEFORE any spend or state mutation.
+    try:
+        reconcile_orphans(stages, video)
+    except LiveRunError as e:
+        die(str(e))
     key = "5_images"
     s = stages[key]
     eff = effective_status(key, stages)
@@ -1136,10 +1142,12 @@ def cmd_advance_all(quiet_idle: bool = False) -> int:
                 # A stage is genuinely live (a real process still owns it) — skip,
                 # never abort. Benign: expected when a long stage spans the tick.
                 lines.append(("running", f"🏃 V{v}: a stage is genuinely live (left untouched)"))
-            except SystemExit as e:
+            except SystemExit:
                 # die() — corrupt/unreadable state file, video-id mismatch, etc.
-                # NOT benign: surface it so a broken state file can't read healthy.
-                lines.append(("blocked-stuck", f"⚠️ V{v}: state file unusable — {e}"))
+                # (the real reason is printed to stderr → launchd logs). NOT benign:
+                # surface it so a broken state file can't read as healthy.
+                lines.append(("blocked-stuck",
+                              f"⚠️ V{v}: state file unusable/corrupt (see logs) — needs you"))
                 any_news = True
             except Exception as e:
                 lines.append(("blocked-stuck", f"⚠️ V{v}: skipped after error — {e}"))

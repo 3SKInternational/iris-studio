@@ -208,8 +208,11 @@ class TestReconcileOrphans(unittest.TestCase):
         self.assertEqual(stages["1_script"]["status"], "ready")
         self.assertIsNone(stages["1_script"]["pid"])
 
-    def test_genuinely_live_run_aborts(self):
-        # Our OWN pid is alive and the start-token matches → genuinely live → die().
+    def test_genuinely_live_run_raises_liverunerror(self):
+        # Our OWN pid is alive and the start-token matches → genuinely live.
+        # reconcile_orphans now raises LiveRunError (NOT die()/SystemExit) so the
+        # fleet loop can tell a benign in-flight run apart from a corrupt state
+        # file. The per-video CLI wrapper converts it back to die() — see below.
         stages = _stages()
         my_pid = os.getpid()
         stages["1_script"]["status"] = "running"
@@ -217,8 +220,41 @@ class TestReconcileOrphans(unittest.TestCase):
         stages["1_script"]["pid_start_token"] = po._proc_start_token(my_pid)
         # started_at = now so it isn't timed-out.
         stages["1_script"]["started_at"] = po.now_iso()
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(po.LiveRunError):
             po.reconcile_orphans(stages, 1)
+
+    def test_cli_advance_still_surfaces_live_run_as_exit_1(self):
+        # The CLI contract is preserved: cmd_advance catches LiveRunError and
+        # die()s (SystemExit, exit 1) so a genuinely-live run is a hard CLI error,
+        # exactly as before the fleet refactor. advance_once is stubbed to raise.
+        old = po.advance_once
+        try:
+            def _raise(_sf):
+                raise po.LiveRunError("stage 1_script already running")
+            po.advance_once = _raise
+            with self.assertRaises(SystemExit) as cm:
+                po.cmd_advance(object())  # sf unused before advance_once raises
+            self.assertEqual(cm.exception.code, 1)
+        finally:
+            po.advance_once = old
+
+    def test_cli_spend_ok_surfaces_live_run_as_exit_1(self):
+        # Symmetry with cmd_advance on the BILLED path: a genuinely-live run is
+        # converted to die() (exit 1) by the guard at the TOP of cmd_spend_ok,
+        # before any _mark_running / save / generate_images spend. Stub
+        # reconcile_orphans to raise so we never touch real state or money.
+        class _SF:
+            data = {"stages": po.default_stages(), "video": 1}
+        old = po.reconcile_orphans
+        try:
+            def _raise(_stages, _video):
+                raise po.LiveRunError("stage 5_images already running")
+            po.reconcile_orphans = _raise
+            with self.assertRaises(SystemExit) as cm:
+                po.cmd_spend_ok(_SF())
+            self.assertEqual(cm.exception.code, 1)
+        finally:
+            po.reconcile_orphans = old
 
     def test_timed_out_running_resets_even_if_pid_alive(self):
         stages = _stages()
@@ -333,8 +369,14 @@ class TestAdvanceAllQuietIdle(unittest.TestCase):
         (state_dir / f"Video_{po.nn(video)}_pipeline.json").write_text(
             json.dumps(data, indent=2))
 
-    def _run(self, outcome, quiet_idle):
+    def _run(self, outcome, quiet_idle, stage="1_script"):
         sent = []
+        # The spy mirrors the real notify gate (drop force=False lines while
+        # SUPPRESS_NOTIFY is set) so a stray per-stage notify leaking during the
+        # fleet drain would be caught, not silently swallowed by the stub.
+        def _spy(msg, force=False):
+            if force or not po.SUPPRESS_NOTIFY:
+                sent.append(msg)
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td) / "state"
             ld = Path(td) / "locks"
@@ -344,8 +386,8 @@ class TestAdvanceAllQuietIdle(unittest.TestCase):
             try:
                 po.STATE_DIR = sd
                 po.LOCK_DIR = ld
-                po.advance_once = lambda sf: _FakeRes(outcome)
-                po.notify = lambda msg, force=False: sent.append(msg)
+                po.advance_once = lambda sf: _FakeRes(outcome, stage)
+                po.notify = _spy
                 rc = po.cmd_advance_all(quiet_idle=quiet_idle)
             finally:
                 (po.STATE_DIR, po.LOCK_DIR, po.advance_once, po.notify) = old
@@ -369,7 +411,10 @@ class TestAdvanceAllQuietIdle(unittest.TestCase):
                          "infra_skip must send the digest even under --quiet-idle")
 
     def test_ran_done_breaks_silence_under_quiet_idle(self):
-        rc, sent = self._run("ran_done", quiet_idle=True)
+        # Pass a real stage key so this drives the genuine ran_done path
+        # (ran.append(stage) → _video_summary_line joins it), not the generic
+        # exception fallback that a stage=None would trip.
+        rc, sent = self._run("ran_done", quiet_idle=True, stage="1_script")
         self.assertEqual(len(sent), 1)
 
 
