@@ -321,8 +321,27 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 1200,
         "deliverable_dir": "BRANDS/3SK_Finance/Scripts",
     },
+    # --- Added 2026-06-18: the skeptical reviewer pair for scriptwriter. ---
+    # script-reviewer: read-only second pass on a drafted script before Steve
+    # reads it (PASS/REVISE per dimension + line-level fixes). Pairs with
+    # scriptwriter exactly as skeptical-code-reviewer pairs with senior-engineer.
+    "script-reviewer": {
+        "timeout_seconds": 480,  # 8 min — read-only single-pass critique, no web
+        "deliverable_dir": "BRANDS/3SK_Finance/Scripts/_REVIEW_PREP",
+    },
     "thumbnail-coordinator": {
         "timeout_seconds": 300,  # 5 min — structured transformation, no research
+        "deliverable_dir": "BRANDS/3SK_Finance/Thumbnails",
+    },
+    # --- Added 2026-06-18: the CTR lever (titles + hooks + thumb-text) ---
+    # packaging-strategist owns the title, the cold-open hook, and the thumbnail
+    # TEXT — the levers that actually move CTR. thumbnail-coordinator owns the
+    # IMAGE; this agent owns the words. Operationalizes the Discoverability_Playbook
+    # against the "first-gen wealth" moat. Seed (scriptwriter's Thumbnail Concept)
+    # → finished package, the same expand-not-duplicate split. Writes beside the
+    # thumbnail brief in Thumbnails/ as Packaging_Video_NN.md.
+    "packaging-strategist": {
+        "timeout_seconds": 480,  # 8 min — read canon + draft 8-10 titles/hooks/text
         "deliverable_dir": "BRANDS/3SK_Finance/Thumbnails",
     },
     "sponsor-outreach-drafter": {
@@ -356,6 +375,21 @@ DISPATCH_AGENTS: dict[str, dict] = {
     "youtube-researcher": {
         "timeout_seconds": 1800,  # 30 min — multi-source web research + 5 file writes
         "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence",
+    },
+    # --- Added 2026-06-18: the inward-facing analytics counterpart ---
+    # channel-analyst: reads OUR own YouTube performance (CTR/retention/AVD/
+    # traffic/subs) and turns it into routable fixes for scriptwriter +
+    # packaging. Inward sibling to youtube-researcher (which reads the outside
+    # niche) — do not conflate. INPUT: until YouTube OAuth lands (Builds 3+4 of
+    # the YouTube Autonomy Roadmap) it has no live API; the dispatch prompt must
+    # carry a YouTube Studio analytics-export CSV path OR a pasted metrics block.
+    # That makes it most natural to invoke INTERACTIVELY / from Cowork with the
+    # export path in the prompt, not from a bare Telegram message — it's in the
+    # enum for completeness. Post-OAuth follow-on swaps the manual input for a
+    # live fetch; the analysis logic stays identical.
+    "channel-analyst": {
+        "timeout_seconds": 720,  # 12 min — read benchmarks + analyze one export + write
+        "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence/Analytics",
     },
     # --- Added 2026-05-31 (Session 15, P5-12 dispatcher-side batch) ---
     # expense-categorizer: scans studio@ Gmail for receipts, drafts Expense_Tracker
@@ -526,13 +560,28 @@ Available subagents (agent_name -> what it does):
   thumbnail/algorithm patterns) that feeds the channel content agents'
   freshness layer in BRANDS/3SK_Finance/Channel_Intelligence/. Runs weekly
   autonomously; dispatch ad-hoc for focused deep-dives. ~30 min.
+- `channel-analyst` — reads OUR OWN channel's analytics (CTR/retention/AVD/
+  traffic/subs) and turns them into routable fixes for scriptwriter + packaging.
+  Inward sibling of youtube-researcher (which reads the outside niche). REQUIRES
+  a YouTube Studio analytics-export CSV path OR a pasted metrics block in the
+  prompt (no live API until YouTube OAuth lands) — best invoked interactively /
+  from Cowork with the export, not a bare Telegram message. ~12 min.
 - `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~20 min.
+- `script-reviewer` — skeptical second pass on a drafted script before Steve reads
+  it (voice, banned vocab, number-spine, hook, VO density, structure/CTA, moat).
+  Read-only — writes a review, never edits the script. Dispatch right after
+  scriptwriter. ~8 min.
 - `scene-image-prompt-generator` — turns a script's scene blocks into paste-ready
   ChatGPT 5-field SCENE PROMPTs + verbatim Master Character Prompt v3. ~10 min.
 - `video-description-writer` — drafts a YouTube upload pack from a finished script
   (description, chapter timestamps, affiliate disclosure, hashtags, pinned). ~10 min.
 - `thumbnail-coordinator` — turns a script into a thumbnail brief (image-gen
-  prompt + title overlay spec). ~5 min.
+  prompt + title overlay spec). Owns the thumbnail IMAGE. ~5 min.
+- `packaging-strategist` — the CTR lever: 8-10 title variants (tagged by lever),
+  2 cold-open hooks, 3 thumbnail TEXT overlays + a per-title CTR rationale, all
+  against the Discoverability_Playbook and the "first-gen wealth" moat. Owns the
+  title/hook/thumb-text WORDS (thumbnail-coordinator owns the image). Dispatch
+  when a script/topic is set, before or alongside thumbnail-coordinator. ~8 min.
 - `sponsor-outreach-drafter` — drafts a personalized cold sponsor email. ~15 min.
 - `project-manager` — honest status read on the whole operation (what shipped,
   what's blocked, what needs Steve, where contract & reality drift). ~10 min.
