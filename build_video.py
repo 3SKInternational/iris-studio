@@ -279,11 +279,11 @@ _MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left", "pan_up", "pan_down"
 # A missing asset is skipped with a warning, so a CTA that hasn't been generated
 # yet degrades to the pre-CTA output instead of breaking a build.
 CTA_DIR = "Shared_Assets/CTA"
-# The mid-roll bump is inserted right after this scene. The Universal Intro ends
-# ~scene 2 (cold-open hook + the "by the end of this video" promise), so the bump
-# lands just past the hook while retention is still high. The outro CTA is always
-# appended last.
-CTA_MIDROLL_AFTER_SCENE = 2
+# The mid-roll bump is inserted right after this scene. The locked Universal Intro
+# runs scenes 1-3 (cold open → promise → tease, ending ~0:35), so injecting after
+# scene 3 drops the bump at the body's start — clear of the 0:15–0:30 high-attrition
+# window and without breaking the intro. The outro CTA is always appended last.
+CTA_MIDROLL_AFTER_SCENE = 3
 CTA_SEGMENTS = {
     "midroll": {
         "image": f"{CTA_DIR}/CTA_midroll.png",
@@ -511,7 +511,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-cta", action="store_true",
                    help="Omit the shared reusable CTA segments (mid-roll subscribe "
                         "bump + outro like/comment/subscribe). On by default; they "
-                        "reuse fixed assets and are never re-billed.")
+                        "reuse fixed assets and are never re-billed. STANDARD: pass "
+                        "--no-cta when re-assembling an ALREADY-PUBLISHED video, so a "
+                        "re-render doesn't retroactively change its cut/length.")
     return p.parse_args()
 
 
