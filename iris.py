@@ -137,6 +137,21 @@ _lint_spec = _importlib_util.spec_from_file_location(
 _agent_output_lint = _importlib_util.module_from_spec(_lint_spec)
 _lint_spec.loader.exec_module(_agent_output_lint)
 
+# scriptwriter post-dispatch docx hook helper. Same local-importlib pattern so
+# the scripts/ dir stays off sys.path. Best-effort: a load failure here must not
+# stop the daemon, so guard it and degrade to "no auto-docx" on any error.
+try:
+    _docx_spec = _importlib_util.spec_from_file_location(
+        "_script_to_docx", PROJECT_DIR / "scripts" / "script_to_docx.py"
+    )
+    _script_to_docx = _importlib_util.module_from_spec(_docx_spec)
+    _docx_spec.loader.exec_module(_script_to_docx)
+except Exception as _docx_load_exc:  # noqa: BLE001 - never block daemon boot
+    _script_to_docx = None
+    logging.getLogger("iris").warning(
+        f"script_to_docx helper unavailable (auto-docx disabled): {_docx_load_exc}"
+    )
+
 # Force Agent SDK to use the claude CLI OAuth (Max sub).
 ANTHROPIC_API_KEY_FALLBACK = os.environ.pop("ANTHROPIC_API_KEY", None)
 
@@ -2480,6 +2495,25 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
             await _ingest_expense_draft(d_id, deliverable)
         except Exception as exc:
             logger.warning(f"P5-12 ingest failed for dispatch {d_id}: {exc}")
+
+    # Build 4 docx hook (2026-06-19): when scriptwriter ships a script .md,
+    # auto-render a .docx beside it via pandoc so Steve's review copy exists
+    # without a manual conversion step. Best-effort: a failure (no pandoc,
+    # bad markdown) only logs — it never affects the dispatch outcome. Only the
+    # mechanical .docx is generated here; the _REVIEW_PREP skim view is a content
+    # derivation owned by the script-reviewer pair, not this hook.
+    if (status == "completed" and agent_name == "scriptwriter"
+            and deliverable and _script_to_docx is not None
+            and str(deliverable).lower().endswith(".md")
+            and "/_REVIEW_PREP/" not in str(deliverable)):
+        try:
+            loop = asyncio.get_event_loop()
+            docx_path = await loop.run_in_executor(
+                None, lambda: _script_to_docx.convert(deliverable)
+            )
+            logger.info(f"Build 4 docx hook: wrote {docx_path} for dispatch {d_id}")
+        except Exception as exc:
+            logger.warning(f"Build 4 docx hook failed for dispatch {d_id}: {exc}")
 
     # V1 — Semantic-status contract (2026-06-10): read the deliverable's
     # `status:` YAML frontmatter for ALL agents that produced a file.

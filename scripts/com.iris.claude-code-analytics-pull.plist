@@ -1,22 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Build 4 weekly analytics feed — NOT INSTALLED YET.
+  Build 4 weekly analytics FEEDBACK LOOP — installed 2026-06-19 (V1+V2 live).
 
-  This pulls the channel's per-video metrics and writes the channel-analyst feed
-  file. It is intentionally LEFT UNINSTALLED until 3SK Finance has published
-  videos with data (Build 3 live + ~1-2 weeks). Until then it would only write a
-  `blocked-no-videos` skeleton each week.
+  CLOSED LOOP, not just a data pull: this runs the `analytics-feedback` Claude
+  routine, which (1) runs analytics_pull.py to fetch our channel's real metrics
+  from the YouTube Analytics API, then (2) — ONLY when the feed has real data
+  (status: ok) — dispatches the channel-analyst agent to produce the routed
+  fixes for the content agents. A no-data week (pre-launch, or data still lagging
+  ~48-72h after publish) correctly skips the analyst and reports a clean no-op;
+  the analyst never runs on empty data and never fabricates.
 
-  Install when videos are live:
+  Runs via run_claude_job.sh (NOT run_job.sh): it's a `claude --print` routine, so
+  the SAME wrapper that every other claude-code job uses handles logging, the
+  ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and the retry queue.
+
+  Schedule: Monday 5:30 AM ET — diagnosis fresh before the weekly production cycle.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-analytics-pull 2>/dev/null
     cp scripts/com.iris.claude-code-analytics-pull.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-analytics-pull.plist
     launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-analytics-pull   # test fire
-
-  After the pull writes the feed, dispatch the channel-analyst agent with the
-  written file's path for the diagnosis + routable fixes (Mon morning, fresh for
-  the weekly production cycle). run_job.sh handles logging + Telegram failure
-  alerts + the retry queue, same as every other scheduled job.
 -->
 <plist version="1.0">
 <dict>
@@ -25,10 +30,8 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/bash</string>
-		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
-		<string>analytics-pull</string>
-		<string>/Volumes/AI_Workspace/iris_studio/.venv/bin/python</string>
-		<string>/Volumes/AI_Workspace/iris_studio/scripts/analytics_pull.py</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh analytics-pull /Volumes/AI_Workspace/iris_studio/routines/analytics-feedback.prompt</string>
 	</array>
 	<key>RunAtLoad</key>
 	<false/>
