@@ -55,10 +55,12 @@ from upload_video import (  # noqa: E402
     MAX_TAGS_CHARS,
     MAX_TITLE,
     PLACEHOLDER_RE,
+    _resolve_path,
     die,
     normalize_id,
     parse_desc_pack,
     resolve_thumbnail,
+    set_captions,
     set_thumbnail,
     vault,
     write_receipt,
@@ -94,6 +96,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--set-thumbnail", action="store_true",
                    help="Also re-resolve + set the thumbnail (default: leave the existing one).")
     p.add_argument("--thumbnail", help="Explicit thumbnail path (implies --set-thumbnail).")
+    p.add_argument("--captions", help="Override the .srt path for the caption refresh.")
+    p.add_argument("--no-captions", action="store_true",
+                   help="Skip the idempotent caption (re)attach on publish.")
     p.add_argument("--token", help="Override path to youtube_token.json.")
     p.add_argument("--dry-run", action="store_true",
                    help="Validate + print the plan; touch no network.")
@@ -252,6 +257,18 @@ def main() -> None:
     if thumb:
         set_thumbnail(youtube, video_id, thumb)
 
+    # Idempotent caption (re)attach: captions live on the videoId, so a successful
+    # publish is a safe point to guarantee the timed track is present. set_captions
+    # is list→update/insert (no duplicate) and non-fatal (a caption hiccup never
+    # sinks a good publish). Skipped if --no-captions or the SRT isn't there.
+    captions_set = False
+    if not args.no_captions:
+        srt = _resolve_path(args.captions, vlt, f"Footage_and_Edits/{vid}_v2.srt")
+        if srt.is_file():
+            captions_set = set_captions(youtube, video_id, srt)
+        else:
+            print(f"  ℹ no captions ({srt.name} missing) — skipping caption attach.")
+
     # 4) refresh the receipt (keep prior fields; stamp the publish).
     out = dict(receipt or {})
     out.update({
@@ -265,9 +282,12 @@ def main() -> None:
         "tags": tags,
         "pinned_comment": meta.get("pinned_comment") or out.get("pinned_comment"),
         "thumbnail_set": bool(thumb) or out.get("thumbnail_set", False),
+        "captions_set": captions_set or out.get("captions_set", False),
         "last_published_at": datetime.now(timezone.utc).isoformat(),
         "published_via": "publish_video.py",
     })
+    if captions_set:
+        out["captions_updated_at"] = datetime.now(timezone.utc).isoformat()
     write_receipt(receipt_path, out)
     print(f"\n✅ receipt → {receipt_path}")
     if meta.get("pinned_comment"):

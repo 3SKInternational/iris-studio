@@ -222,31 +222,102 @@ def _backoff(retries: int, why: str) -> int:
     return retries
 
 
-def set_captions(youtube, video_id: str, srt: Path) -> None:
-    from googleapiclient.http import MediaFileUpload
-    from googleapiclient.errors import HttpError
+def find_managed_caption_track(youtube, video_id: str, lang: str = "en",
+                               name: str = "English") -> str | None:
+    """Return the id of an existing OWNED caption track to replace, or None.
 
-    try:
-        youtube.captions().insert(
+    captions.list only returns tracks this channel can manage. We skip ASR
+    (auto-generated) tracks — they aren't updatable and aren't "ours" — and match
+    the language so a re-run replaces our track instead of stacking a second one.
+    Prefers an exact name match, else any non-ASR track in the language.
+    """
+    resp = youtube.captions().list(part="snippet", videoId=video_id).execute()
+    base = lang.lower().split("-")[0]
+    candidates = []
+    for it in resp.get("items", []):
+        sn = it.get("snippet", {})
+        if (sn.get("trackKind") or "").lower() == "asr":
+            continue
+        if (sn.get("language") or "").lower().split("-")[0] != base:
+            continue
+        candidates.append(it)
+    if not candidates:
+        return None
+    for it in candidates:
+        if (it.get("snippet", {}).get("name") or "") == name:
+            return it["id"]
+    return candidates[0]["id"]
+
+
+def upsert_captions(youtube, video_id: str, srt: Path, lang: str = "en",
+                    name: str = "English") -> str:
+    """Idempotently attach the timed SRT as the video's caption track.
+
+    captions.list first → captions.update the existing owned track in place (no
+    duplicate) or captions.insert a new one. sync=False: our SRT is already timed,
+    so YouTube must NOT re-sync it. Returns "insert" or "update". Raises HttpError
+    on an API failure and FileNotFoundError if the SRT is missing — callers decide
+    whether that is fatal.
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    srt = Path(srt)
+    if not srt.is_file():
+        raise FileNotFoundError(f"caption file not found: {srt}")
+    existing = find_managed_caption_track(youtube, video_id, lang=lang, name=name)
+    media = MediaFileUpload(str(srt), mimetype="application/octet-stream")
+    if existing:
+        youtube.captions().update(
             part="snippet",
-            body={
-                "snippet": {
-                    "videoId": video_id,
-                    "language": "en",
-                    "name": "English",
-                    "isDraft": False,
-                }
-            },
-            media_body=MediaFileUpload(str(srt), mimetype="application/octet-stream"),
+            body={"id": existing, "snippet": {"name": name, "isDraft": False}},
+            media_body=media,
+            sync=False,
         ).execute()
-        print(f"  ✅ captions set from {srt.name}")
-    except HttpError as exc:
-        print(f"  ⚠ caption upload failed (video is up; add manually): {exc}", file=sys.stderr)
+        return "update"
+    youtube.captions().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "videoId": video_id,
+                "language": lang,
+                "name": name,
+                "isDraft": False,
+            }
+        },
+        media_body=media,
+        sync=False,
+    ).execute()
+    return "insert"
 
 
-def set_thumbnail(youtube, video_id: str, thumb: Path) -> None:
+def set_captions(youtube, video_id: str, srt: Path) -> bool:
+    """Non-fatal idempotent caption attach for the upload/publish flows.
+
+    A caption failure must NEVER sink a successful video upload/publish — including
+    a transient network error from the captions.list/insert/update calls (which are
+    NOT HttpError), so this catches broadly and only warns. Returns True iff the
+    track was attached, so callers record the real result rather than assuming it.
+    The standalone upload_captions.py wraps upsert_captions() directly and DOES
+    surface errors with a non-zero exit.
+    """
+    try:
+        action = upsert_captions(youtube, video_id, srt)
+        verb = "inserted" if action == "insert" else "updated"
+        print(f"  ✅ captions {verb} from {Path(srt).name}")
+        return True
+    except Exception as exc:  # best-effort side channel — never crash the run.
+        print(f"  ⚠ caption upload failed ({type(exc).__name__}: {exc}); video is up, "
+              "add captions manually.", file=sys.stderr)
+        return False
+
+
+def set_thumbnail(youtube, video_id: str, thumb: Path) -> bool:
+    """Non-fatal thumbnail set; returns True iff it succeeded.
+
+    Like set_captions, this must never crash a successful upload/publish — a
+    transient network error here is NOT HttpError, so catch broadly and warn.
+    """
     from googleapiclient.http import MediaFileUpload
-    from googleapiclient.errors import HttpError
 
     mime = "image/png" if thumb.suffix.lower() == ".png" else "image/jpeg"
     try:
@@ -254,8 +325,11 @@ def set_thumbnail(youtube, video_id: str, thumb: Path) -> None:
             videoId=video_id, media_body=MediaFileUpload(str(thumb), mimetype=mime)
         ).execute()
         print(f"  ✅ thumbnail set from {thumb.name}")
-    except HttpError as exc:
-        print(f"  ⚠ thumbnail set failed (video is up; add manually): {exc}", file=sys.stderr)
+        return True
+    except Exception as exc:  # best-effort side channel — never crash the run.
+        print(f"  ⚠ thumbnail set failed ({type(exc).__name__}: {exc}); video is up, "
+              "add it manually.", file=sys.stderr)
+        return False
 
 
 def write_receipt(path: Path, data: dict) -> None:
@@ -414,14 +488,11 @@ def main() -> None:
     url = f"https://youtu.be/{video_id}"
     print(f"  videoId: {video_id}  →  {url}")
 
-    if have_srt and not args.no_captions:
-        set_captions(youtube, video_id, srt)
-    elif not have_srt:
-        print(f"  ⚠ no captions ({srt.name} missing) — add manually.")
-    if thumb and not args.no_thumbnail:
-        set_thumbnail(youtube, video_id, thumb)
-
-    write_receipt(receipt, {
+    # Persist the receipt NOW — the video is live and its id is the only thing a
+    # re-run needs to avoid a duplicate upload. The caption/thumbnail steps below
+    # are best-effort side channels; writing the receipt first means a hiccup in
+    # them can never cost us the video_id. We rewrite with their real results after.
+    receipt_data = {
         "video": vid,
         "video_id": video_id,
         "url": url,
@@ -430,12 +501,22 @@ def main() -> None:
         "publish_at": status_part.get("publishAt"),
         "category_id": str(args.category),
         "tags": tags,
-        "captions_set": have_srt and not args.no_captions,
-        "thumbnail_set": bool(thumb) and not args.no_thumbnail,
+        "captions_set": False,
+        "thumbnail_set": False,
         "pinned_comment": meta.get("pinned_comment"),
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "source_file": str(video_file),
-    })
+    }
+    write_receipt(receipt, receipt_data)
+
+    if have_srt and not args.no_captions:
+        receipt_data["captions_set"] = set_captions(youtube, video_id, srt)
+    elif not have_srt:
+        print(f"  ⚠ no captions ({srt.name} missing) — add manually.")
+    if thumb and not args.no_thumbnail:
+        receipt_data["thumbnail_set"] = set_thumbnail(youtube, video_id, thumb)
+
+    write_receipt(receipt, receipt_data)
     print(f"\n✅ receipt → {receipt}")
     if meta.get("pinned_comment"):
         print("  ℹ pinned-comment text saved to the receipt — pin it manually in "
