@@ -332,6 +332,89 @@ def set_thumbnail(youtube, video_id: str, thumb: Path) -> bool:
         return False
 
 
+# --- caption sweep (verify-and-backfill across all uploaded videos) ---------
+
+def iter_upload_receipts(vlt: Path):
+    """Yield (video_label, video_id, receipt_path, receipt_dict) for every upload
+    receipt that carries a YouTube video_id. These receipts are the canonical map
+    of the videos WE uploaded (and therefore can caption — each maps to a known
+    SRT). A malformed receipt is skipped, not fatal."""
+    for rp in sorted((vlt / "Production_Kits").glob("*_youtube_upload.json")):
+        try:
+            data = json.loads(rp.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        video_id = data.get("video_id")
+        if not video_id:
+            continue
+        label = data.get("video") or rp.stem.replace("_youtube_upload", "")
+        yield label, video_id, rp, data
+
+
+def sweep_captions(youtube, vlt: Path, *, force: bool = False,
+                   only: str | None = None, dry_run: bool = False) -> dict:
+    """Verify the English caption track on every uploaded video; add where missing.
+
+    For each upload receipt: captions.list (cheap). If our managed English track is
+    already present → SKIP (no re-upload) unless force=True (then update in place).
+    If absent → insert the timed SRT. This is the safety net behind the inline
+    attach: a brand-new upload can still be processing when its inline caption
+    insert runs, so it may miss; the next sweep catches the straggler while skipping
+    every video that's already fine. Per-video best-effort — one error never aborts
+    the sweep. Returns a summary dict.
+    """
+    summary = {"checked": 0, "added": 0, "updated": 0, "skipped": 0,
+               "no_srt": 0, "errors": 0}
+    only_label = normalize_id(only)[0] if only else None
+    for label, video_id, rp, data in iter_upload_receipts(vlt):
+        if only_label and label != only_label:
+            continue
+        summary["checked"] += 1
+        srt = vlt / "Footage_and_Edits" / f"{label}_v2.srt"
+        try:
+            existing = find_managed_caption_track(youtube, video_id)
+        except Exception as exc:  # network/API blip — skip this one, keep sweeping.
+            print(f"  ⚠ {label} ({video_id}): caption check failed "
+                  f"({type(exc).__name__}: {exc})", file=sys.stderr)
+            summary["errors"] += 1
+            continue
+        if existing and not force:
+            print(f"  ✓ {label} ({video_id}): captions present — skip")
+            summary["skipped"] += 1
+            continue
+        if not srt.is_file():
+            print(f"  ⚠ {label} ({video_id}): no SRT at {srt.name} — can't add captions",
+                  file=sys.stderr)
+            summary["no_srt"] += 1
+            continue
+        if dry_run:
+            verb = "update" if existing else "add"
+            print(f"  • {label} ({video_id}): would {verb} captions from {srt.name}")
+            summary["updated" if existing else "added"] += 1
+            continue
+        try:
+            action = upsert_captions(youtube, video_id, srt)
+        except Exception as exc:
+            print(f"  ⚠ {label} ({video_id}): caption upload failed "
+                  f"({type(exc).__name__}: {exc})", file=sys.stderr)
+            summary["errors"] += 1
+            continue
+        verb = "updated" if action == "update" else "added"
+        print(f"  ✅ {label} ({video_id}): captions {verb} from {srt.name}")
+        summary["updated" if action == "update" else "added"] += 1
+        data.update({
+            "captions_set": True,
+            "captions_action": action,
+            "captions_source": str(srt),
+            "captions_updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        try:
+            write_receipt(rp, data)
+        except OSError:
+            pass  # receipt is a convenience stamp; never fail the sweep over it.
+    return summary
+
+
 def write_receipt(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -360,6 +443,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--allow-placeholders", action="store_true",
                    help="Permit unresolved [AFFILIATE LINK]/[WORKSHEET LINK] in a public/scheduled upload.")
     p.add_argument("--no-captions", action="store_true", help="Skip caption upload.")
+    p.add_argument("--no-caption-sweep", action="store_true",
+                   help="Skip the post-upload verify-and-backfill caption sweep over all videos.")
     p.add_argument("--no-thumbnail", action="store_true", help="Skip thumbnail set.")
     p.add_argument("--token", help="Override path to youtube_token.json.")
     p.add_argument("--dry-run", action="store_true",
@@ -523,6 +608,22 @@ def main() -> None:
               "Studio (the Data API can't pin comments).")
     if args.privacy == "private" and not publish_at:
         print("  ℹ uploaded PRIVATE — review in Studio, then publish (the review gate).")
+
+    # Post-upload safety net: sweep EVERY uploaded video and fill any missing
+    # caption track (skip the ones already captioned — including the one we just
+    # attached inline). This heals a straggler whose inline insert failed because
+    # the video was still processing. Best-effort — a sweep hiccup never affects
+    # this upload's success. Opt out with --no-caption-sweep.
+    if not args.no_caption_sweep:
+        print("\n>>> verifying captions across all uploaded videos…")
+        try:
+            s = sweep_captions(youtube, vlt)
+            print(f"  caption sweep: {s['checked']} checked · {s['added']} added · "
+                  f"{s['updated']} updated · {s['skipped']} present · "
+                  f"{s['no_srt']} missing-srt · {s['errors']} errors")
+        except Exception as exc:  # never let the sweep sink a good upload.
+            print(f"  ⚠ caption sweep skipped ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
 
 
 if __name__ == "__main__":
