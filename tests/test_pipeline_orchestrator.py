@@ -554,5 +554,214 @@ class TestStalenessFromLastProgress(unittest.TestCase):
         self.assertIn("V1", line)
 
 
+class _Proc:
+    """Minimal stand-in for subprocess.CompletedProcess."""
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FakeSF:
+    def __init__(self, stages, video=3):
+        self.data = {"stages": stages, "video": video}
+        self.saved = 0
+
+    def save(self):
+        self.saved += 1
+
+
+class TestImageVerdictParse(unittest.TestCase):
+    """_parse_image_verdict: the FILE → verdict extraction the gates rely on."""
+
+    def test_each_verdict_token(self):
+        for tok in ("SHIP", "SHIP WITH FIXES", "HOLD-SPEND", "REVISE"):
+            self.assertEqual(po._parse_image_verdict(f"VERDICT: {tok}\n"), tok)
+
+    def test_case_and_decoration_insensitive(self):
+        self.assertEqual(po._parse_image_verdict("**VERDICT:** ship with fixes"),
+                         "SHIP WITH FIXES")
+        self.assertEqual(po._parse_image_verdict("Verdict - Hold-Spend"), "HOLD-SPEND")
+
+    def test_most_severe_wins_when_multiple_present(self):
+        # A file that quotes both a SHIP example and the real HOLD-SPEND verdict
+        # must resolve to the blocking one.
+        txt = "Example verdict line: SHIP.\n\nVERDICT: HOLD-SPEND — fix prompts.\n"
+        self.assertEqual(po._parse_image_verdict(txt), "HOLD-SPEND")
+
+    def test_rubric_echo_on_verdict_line_resolves_to_most_blocking(self):
+        # The money-leak the parser MUST defend: a single VERDICT line that echoes
+        # all four rubric choices must NOT parse as bare SHIP (leftmost match) —
+        # it must fail safe to the most-blocking token present.
+        self.assertEqual(
+            po._parse_image_verdict("VERDICT: SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE"),
+            "HOLD-SPEND")
+
+    def test_two_tokens_after_one_verdict_label_picks_blocking(self):
+        self.assertEqual(
+            po._parse_image_verdict("VERDICT: SHIP, then on reflection HOLD-SPEND"),
+            "HOLD-SPEND")
+        self.assertEqual(
+            po._parse_image_verdict("VERDICT: SHIP then REVISE"), "REVISE")
+
+    def test_ship_with_fixes_not_downgraded_to_ship(self):
+        # The long phrase must be tokenized whole, never as a bare SHIP.
+        self.assertEqual(po._parse_image_verdict("VERDICT: SHIP WITH FIXES"),
+                         "SHIP WITH FIXES")
+
+    def test_token_only_counts_on_a_verdict_line(self):
+        # A token buried in prose/shot findings with no 'verdict' on the line is
+        # ignored, so a per-shot "REVISE this crop" note can't flip a SHIP file.
+        txt = ("Shot 03 finding: REVISE this crop later.\n"
+               "Overall VERDICT: SHIP\n")
+        self.assertEqual(po._parse_image_verdict(txt), "SHIP")
+
+    def test_no_verdict_line_is_none(self):
+        self.assertIsNone(po._parse_image_verdict("no verdict here"))
+        self.assertIsNone(po._parse_image_verdict(""))
+        # 'verdict' present but no recognizable token → None (→ UNAVAILABLE path).
+        self.assertIsNone(po._parse_image_verdict("VERDICT: pending review"))
+
+
+class TestRunImageReviewMissingAgent(unittest.TestCase):
+    def test_missing_agent_file_is_unavailable_not_crash(self):
+        old = po.AGENTS_DIR
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                po.AGENTS_DIR = Path(d)  # no image-reviewer.md inside
+                verdict, vrel, detail = po.run_image_review("prompts", 3)
+            self.assertEqual(verdict, "UNAVAILABLE")
+            self.assertIn("Video_03_Image_Review.md", vrel)
+            self.assertIn("not found", detail)
+        finally:
+            po.AGENTS_DIR = old
+
+
+class TestSpendOkImageGate(unittest.TestCase):
+    """Pass A: the pre-spend PROMPTS gate inside cmd_spend_ok."""
+
+    def _ready_stages(self):
+        # 5_images deps == ['2_review']; mark it done so deps_done is True.
+        return _mark_done(_stages(), "2_review")
+
+    def _patch_common(self):
+        """Neutralize side effects unrelated to the gate; return restore fn."""
+        saved = (po.reconcile_orphans, po.vault_abs, po.notify,
+                 po.subprocess.run, po.run_image_review)
+
+        def _noop_reconcile(_stages, _video):
+            return None
+
+        # manifest_abs must .exists() → return an obviously-present path.
+        existing = _MODULE_PATH  # this test file's sibling: a real file
+
+        def _fake_vault_abs(rel):
+            return existing
+
+        po.reconcile_orphans = _noop_reconcile
+        po.vault_abs = _fake_vault_abs
+        po.notify = lambda *a, **k: None
+
+        def restore():
+            (po.reconcile_orphans, po.vault_abs, po.notify,
+             po.subprocess.run, po.run_image_review) = saved
+        return restore
+
+    def test_hold_spend_refuses_spend(self):
+        restore = self._patch_common()
+        try:
+            called = {"gen": False}
+
+            def _spy_run(*a, **k):
+                called["gen"] = True
+                return _Proc(0)
+            po.subprocess.run = _spy_run
+            po.run_image_review = lambda mode, video: ("HOLD-SPEND", "rel", "off-model")
+            sf = _FakeSF(self._ready_stages())
+            rc = po.cmd_spend_ok(sf)
+            self.assertEqual(rc, 2)
+            self.assertFalse(called["gen"], "must NOT shell generate_images on HOLD-SPEND")
+        finally:
+            restore()
+
+    def test_unavailable_fails_open_and_spends(self):
+        restore = self._patch_common()
+        try:
+            called = {"gen": False}
+
+            def _spy_run(*a, **k):
+                called["gen"] = True
+                return _Proc(0, stdout="generated")
+            po.subprocess.run = _spy_run
+            po.run_image_review = lambda mode, video: ("UNAVAILABLE", "rel", "reviewer down")
+            sf = _FakeSF(self._ready_stages())
+            rc = po.cmd_spend_ok(sf)
+            self.assertEqual(rc, 0)
+            self.assertTrue(called["gen"], "fail-open must proceed to the billed spend")
+        finally:
+            restore()
+
+    def test_force_skips_gate_entirely(self):
+        restore = self._patch_common()
+        try:
+            called = {"gen": False, "review": False}
+
+            def _spy_run(*a, **k):
+                called["gen"] = True
+                return _Proc(0, stdout="generated")
+            po.subprocess.run = _spy_run
+
+            def _no_review(mode, video):
+                called["review"] = True
+                return ("HOLD-SPEND", "rel", "should be skipped")
+            po.run_image_review = _no_review
+            sf = _FakeSF(self._ready_stages())
+            rc = po.cmd_spend_ok(sf, force=True)
+            self.assertEqual(rc, 0)
+            self.assertFalse(called["review"], "--force must NOT run the review gate")
+            self.assertTrue(called["gen"], "--force still spends")
+        finally:
+            restore()
+
+
+class TestAssembleImageGate(unittest.TestCase):
+    """Pass B: the pre-assemble RENDERS gate inside run_script_stage."""
+
+    def test_revise_refuses_assembly(self):
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            called = {"build": False}
+
+            def _spy_run(*a, **k):
+                called["build"] = True
+                return _Proc(0)
+            po.subprocess.run = _spy_run
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video: ("REVISE", "rel", "off-model render")
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertFalse(ok)
+            self.assertIn("REVISE", msg)
+            self.assertFalse(called["build"], "must NOT build the cut on REVISE")
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+    def test_unavailable_fails_open_and_builds(self):
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            called = {"build": False}
+
+            def _spy_run(*a, **k):
+                called["build"] = True
+                return _Proc(0, stdout="assembled")
+            po.subprocess.run = _spy_run
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video: ("UNAVAILABLE", "rel", "reviewer down")
+            ok, _msg = po.run_script_stage("6_assemble", 3)
+            self.assertTrue(ok, "fail-open must still assemble")
+            self.assertTrue(called["build"])
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

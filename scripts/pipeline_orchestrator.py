@@ -580,6 +580,18 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     assemble.py itself). MUST pass --assemble; MUST NEVER pass --images/--vo."""
     if key != "6_assemble":
         return False, f"no script executor for stage {key}"
+    # Pass B — pre-assemble RENDERS review. A REVISE verdict means an off-model
+    # or garbled rendered PNG is present: refuse to build it into the cut. This
+    # returns False, so it consumes a normal retry (bounded by MAX_FAILS) and
+    # eventually parks for Steve rather than looping forever. Fail-OPEN: if the
+    # reviewer itself can't run, assemble anyway (assembly is free) and warn.
+    verdict, vrel, detail = run_image_review("renders", video)
+    if verdict == "REVISE":
+        return False, (f"image-reviewer REVISE on the rendered images — refusing to "
+                       f"assemble. Fix/regen per {vrel} ({detail}).")
+    if verdict == "UNAVAILABLE":
+        notify(f"⚠️ Video {video}: image-reviewer could not run the pre-assemble "
+               f"renders review ({detail}) — assembling anyway (fail-open).")
     cfg = RUN_TABLE[key]
     vid = f"Video_{nn(video)}"
     cmd = [
@@ -596,6 +608,94 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, f"build_video.py exited {proc.returncode}: {(proc.stderr or '')[-500:]}"
     return True, (proc.stdout or "").strip()[-300:]
+
+
+# === Image-review gate (image-reviewer subagent) ==========================
+# Pass A: pre-spend PROMPTS review inside cmd_spend_ok — blocks a billed batch
+#         whose prompts are off-model / garble-risk (HOLD-SPEND).
+# Pass B: pre-assemble RENDERS review inside run_script_stage — blocks a cut
+#         built from off-model / garbled rendered PNGs (REVISE).
+IMAGE_REVIEWER_AGENT = "image-reviewer"
+IMAGE_REVIEW_TIMEOUT = 900
+
+# Severity rank: a verdict FILE legitimately carries several tokens (the agent
+# writes a canonical "VERDICT:" line AND a per-shot table; a line may also echo
+# the rubric "SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE"). We must NOT trust
+# regex leftmost-match to pick the blocking one — `re.search` returns the first
+# POSITION, not the most-severe token. Instead we scan every VERDICT-bearing
+# line, collect all tokens, and FAIL SAFE toward the most-blocking one. A false
+# block is cheap (Steve --force overrides, or assembly retries); a false SHIP
+# bills real money / ships an off-model cut. Alternation lists the long phrase
+# BEFORE its "SHIP" substring so the tokenizer consumes "SHIP WITH FIXES" whole.
+_VERDICT_RANK = {"HOLD-SPEND": 4, "REVISE": 3, "SHIP WITH FIXES": 2, "SHIP": 1}
+_VERDICT_TOKEN_RE = re.compile(
+    r"\b(HOLD-SPEND|SHIP WITH FIXES|REVISE|SHIP)\b", re.IGNORECASE)
+
+
+def _image_review_verdict_rel(video: int) -> str:
+    return f"{VAULT_REL}/Raw_Assets/Image_Factory/_REVIEW/Video_{nn(video)}_Image_Review.md"
+
+
+def _parse_image_verdict(text: str) -> str | None:
+    """Most-severe verdict token across all VERDICT-bearing lines, or None.
+
+    Only lines that mention 'verdict' are scanned, so prose/shot-finding text
+    that happens to contain a token elsewhere can't flip the result; among those
+    lines the highest-severity token wins (fail-safe toward blocking)."""
+    best, best_rank = None, 0
+    for line in (text or "").splitlines():
+        if "verdict" not in line.lower():
+            continue
+        for m in _VERDICT_TOKEN_RE.finditer(line):
+            tok = m.group(1).upper()
+            r = _VERDICT_RANK[tok]
+            if r > best_rank:
+                best, best_rank = tok, r
+    return best
+
+
+def run_image_review(mode: str, video: int) -> tuple[str, str, str]:
+    """Dispatch image-reviewer and read back its verdict file.
+
+    mode: "prompts" (Pass A, pre-spend) | "renders" (Pass B, pre-assemble).
+    Returns (verdict, verdict_rel, detail). verdict is one of
+    SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE, or the sentinel "UNAVAILABLE"
+    when the reviewer could not run or emitted no parseable VERDICT line — the
+    caller decides fail-open vs fail-closed on UNAVAILABLE per its gate.
+    The verdict FILE is the source of truth; stdout is only a fallback parse."""
+    verdict_rel = _image_review_verdict_rel(video)
+    agent_file = AGENTS_DIR / f"{IMAGE_REVIEWER_AGENT}.md"
+    if not agent_file.exists():
+        return "UNAVAILABLE", verdict_rel, f"agent definition not found at {agent_file}"
+    v = f"Video_{nn(video)}"
+    label = "A (PROMPTS, pre-spend)" if mode == "prompts" else "B (RENDERS, pre-assemble)"
+    prompt = (
+        f"Run image-reviewer MODE {label} for {v} (3SK Finance). mode:{mode}. "
+        f"Verify the canonical billed image manifest (and rendered PNGs in renders "
+        f"mode) against the Master Character Prompt v3, the On-Model Verification "
+        f"Protocol, and the Background & Color Standard. WRITE your verdict to "
+        f"{verdict_rel} including a 'VERDICT:' line "
+        f"(SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE)."
+    )
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", IMAGE_REVIEWER_AGENT,
+           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+           "--", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=IMAGE_REVIEW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "UNAVAILABLE", verdict_rel, f"timed out after {IMAGE_REVIEW_TIMEOUT}s"
+    if proc.returncode != 0:
+        return "UNAVAILABLE", verdict_rel, \
+            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+    verdict_abs = vault_abs(verdict_rel)
+    text = ""
+    if verdict_abs and verdict_abs.exists():
+        text = verdict_abs.read_text(encoding="utf-8", errors="replace")
+    verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
+    if verdict is None:
+        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in file or stdout"
+    return verdict, verdict_rel, f"{mode} verdict {verdict}"
 
 
 def stage_artifact_path(key: str, video: int) -> str | None:
@@ -832,10 +932,13 @@ def cmd_status(sf: StateFile) -> int:
     return 0
 
 
-def cmd_spend_ok(sf: StateFile) -> int:
+def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     """Decision 4 (C1): the ONLY billed-spend path. Confirms stage 5 is ready,
-    confirms the scene manifest exists, then shells generate_images.py exactly
-    once. NEVER reachable from --advance."""
+    confirms the scene manifest exists, runs the pre-spend image-review gate,
+    then shells generate_images.py exactly once. NEVER reachable from --advance.
+
+    force=True (CLI --force only; the Telegram /pipeline spend-ok path never sets
+    it) skips the pre-spend image-review gate as a Steve override."""
     stages = sf.data["stages"]
     video = sf.data["video"]
     # A genuinely-live run surfaces as die() (exit 1) — same CLI contract as
@@ -872,6 +975,38 @@ def cmd_spend_ok(sf: StateFile) -> int:
         print(line)
         notify(line)
         return 2
+
+    # Pass A — pre-spend PROMPTS review. Blocking by default: a HOLD-SPEND
+    # verdict refuses the billed batch until the prompts are fixed. --force
+    # (CLI-only) skips the gate. Fail-OPEN on reviewer infra: if the reviewer
+    # itself can't run, do NOT block the billed path on review tooling — warn
+    # and proceed (the human still authorized this spend explicitly).
+    if force:
+        print(f"⏭️  Video {video}: --force — skipping pre-spend image-review gate.")
+    else:
+        verdict, vrel, detail = run_image_review("prompts", video)
+        if verdict == "HOLD-SPEND":
+            s["note"] = f"spend held: image-reviewer HOLD-SPEND ({vrel})"
+            sf.save()
+            line = (f"🛑 Video {video}: image-reviewer HOLD-SPEND on the image prompts "
+                    f"— refusing to spend. Fix per {vrel}, then re-run spend-ok "
+                    f"(or override with --force). ({detail})")
+            print(line)
+            notify(line)
+            return 2
+        if verdict == "UNAVAILABLE":
+            line = (f"⚠️ Video {video}: image-reviewer could not run the pre-spend "
+                    f"prompts review ({detail}) — proceeding with spend (fail-open). "
+                    f"Eyeball the prompts manually.")
+            print(line)
+            notify(line)
+        else:
+            line = f"✅ Video {video}: image-reviewer pre-spend verdict {verdict} ({vrel})."
+            print(line)
+            # SHIP WITH FIXES still spends (fixes are low-cost text/vocab), but
+            # surface it on Telegram so the required fixes don't hide in the file.
+            if verdict == "SHIP WITH FIXES":
+                notify(line + " Low-cost fixes noted — apply post-render.")
 
     out_rel = f"Raw_Assets/Video_{nn(video)}_HD"      # build_video reads same dir
     out_abs = vault_abs(f"{VAULT_REL}/{out_rel}")
@@ -1204,6 +1339,9 @@ def main() -> int:
                    help="FLEET: read-only status digest across every video. No --video.")
     p.add_argument("--title", help="Title for --init.")
     p.add_argument("--force-init", action="store_true", help="Overwrite an existing state file on --init.")
+    p.add_argument("--force", action="store_true",
+                   help="With --spend-ok: skip the pre-spend image-review gate (Steve override). "
+                        "CLI-only; the Telegram /pipeline spend-ok path never sets it.")
     p.add_argument("--quiet-idle", action="store_true",
                    help="With --advance-all: suppress the Telegram digest when no stage executed "
                         "this run (for a frequent cron cadence). No effect on other commands.")
@@ -1233,7 +1371,7 @@ def main() -> int:
         if args.advance:
             return cmd_advance(sf)
         if args.spend_ok:
-            return cmd_spend_ok(sf)
+            return cmd_spend_ok(sf, force=args.force)
         if args.force_reset:
             return cmd_force_reset(sf)
     return 0
