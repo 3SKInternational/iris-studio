@@ -120,6 +120,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
@@ -262,6 +263,44 @@ _RECEIPT_DATE_RE = re.compile(
     r"(?P<iso>\d{4}-\d{1,2}-\d{1,2})"
     r"|(?P<us>\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
 )
+
+# === Telegram media send/receive (2026-06-19) ===
+# Bidirectional media for the daemon. Outbound covers three trigger paths that
+# all funnel through one shared send core (send_media_to_chat):
+#   1. internal helper  — send_photo_to_steve / send_file_to_steve, callable by
+#      any scheduled job / pipeline stage that already holds `bot`.
+#   2. external-script CLI — scripts/tg_send.sh drops a JSON job into OUTBOX_DIR;
+#      a 10s APScheduler interval job (drain_outbox) sends + deletes it. A local
+#      FILE queue, deliberately NOT a network listener (hard rule).
+#   3. LLM chat tool — the cloud model emits a `[[SEND_FILE: <path|url>]]`
+#      sentinel; handle_message post-processes it through the vault-containment
+#      guard (_safe_vault_path) before sending. Interactive turns only.
+# Inbound: photos without a RECEIPT: caption + any document download into
+# INBOX_MEDIA_DIR and log a Quick Capture line (capture-only; Cowork files it).
+# Telegram bot-API ceilings: sendPhoto ≤ 10 MB, sendDocument ≤ 50 MB. Oversize
+# images fall back to document; oversize documents raise (caller surfaces it).
+PHOTO_MAX_BYTES = 10 * 1024 * 1024
+DOC_MAX_BYTES = 50 * 1024 * 1024
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+TELEGRAM_CAPTION_MAX = 1024  # Telegram caption hard limit
+# Local file queue the daemon watches (logs already live under this dir).
+OUTBOX_DIR = Path("/Users/steve/iris_studio/outbox")
+OUTBOX_DRAIN_INTERVAL_SECONDS = 10
+# Generic inbound media (non-RECEIPT photos + documents) land here, under the
+# daemon's own capture surface in _Iris_Memory — NOT under 02_Finance/Receipts/
+# (that subtree is the RECEIPT-photo pipeline's, which stays untouched). The
+# matching Quick Capture line lets Cowork-Iris file each item next session.
+INBOX_MEDIA_DIR = WORKSPACE_DIR / "_Iris_Memory" / "Telegram_Inbound"
+# Sentinel the cloud model emits to push a file to Steve mid-reply. ASCII (the
+# model emits it reliably); honored only on cloud turns, only for paths
+# resolving inside WORKSPACE_DIR or http(s) URLs (see _safe_vault_path).
+# The capture class EXCLUDES ']' (not a lazy `.+?`), AND there is no `\s*`
+# directly before the group: either of those alone still leaves a quantifier
+# pair (`\s*` vs `[^\]]+`, both matching whitespace) that an unterminated
+# `[[SEND_FILE:` + long whitespace run drives into O(n²) backtracking, freezing
+# the event loop. With neither, the match is linear. Any leading whitespace in
+# the captured path is removed by .strip() at the call site.
+_SEND_FILE_RE = re.compile(r"\[\[\s*SEND_FILE\s*:([^\]]+)\]\]", re.IGNORECASE)
 
 # === Cloud (Tier 3) config ===
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
@@ -678,6 +717,25 @@ When you dispatch:
 
 Do NOT dispatch for things you can answer directly. Do NOT dispatch the same work
 twice. If unsure which agent fits, ask Steve a one-line clarifying question.
+
+---
+
+# === SENDING STEVE A FILE ===
+
+When Steve asks you to send him a file or image that exists in the vault ("send
+me the V1 thumbnail", "text me that PDF"), end your reply with a sentinel line:
+
+    [[SEND_FILE: /Users/steve/Documents/3SK/outputs/<relative>/<file>]]
+
+One sentinel per file; you may include several. Rules:
+- The path MUST be an absolute path INSIDE the vault
+  (/Users/steve/Documents/3SK/outputs/...) or an http(s) URL. Anything else is
+  refused by a containment guard — never try to send system paths.
+- The daemon strips the sentinel from your reply before Steve sees it and sends
+  the actual file, so write a normal short sentence ("Here's the V1 thumbnail:")
+  THEN the sentinel on its own line.
+- Only emit it when you are confident the file exists at that path. If you're not
+  sure of the exact path, say so and ask — don't guess a sentinel.
 """
 
 # === Local (Tier 1) config ===
@@ -3168,6 +3226,118 @@ async def regenerate_daily_briefing_file() -> bool:
         return False
 
 
+# ============================================================
+# Telegram media — shared send core + outbox queue + path guard
+# ============================================================
+
+def _is_url(s: str) -> bool:
+    low = s.lower()
+    return low.startswith("http://") or low.startswith("https://")
+
+
+def _safe_vault_path(src: str) -> str:
+    """Containment guard for UNTRUSTED senders (the cloud chat tool). Allows any
+    http(s) URL (Telegram fetches it) or a local path that resolves INSIDE
+    WORKSPACE_DIR — anything else raises PermissionError so the model can't
+    exfiltrate arbitrary disk paths (e.g. /etc/passwd). The internal helper and
+    the CLI are trusted local callers and bypass this guard."""
+    if _is_url(src):
+        return src
+    rp = Path(src).resolve()
+    if not rp.is_relative_to(WORKSPACE_DIR.resolve()):
+        raise PermissionError(f"refused path outside vault: {src}")
+    return str(rp)
+
+
+async def send_media_to_chat(bot, chat_id: int, src: str, caption: str | None = None,
+                             as_document: bool = False) -> None:
+    """Send an image or file to a Telegram chat. `src` is an absolute local path
+    or an http(s) URL. Images go as a photo unless oversize or as_document=True;
+    everything else goes as a document. Raises on missing file / oversize doc."""
+    cap = (caption or "")[:TELEGRAM_CAPTION_MAX] or None
+    if _is_url(src):
+        ext = Path(src.split("?")[0]).suffix.lower()
+        if not as_document and ext in IMAGE_EXTS:
+            await bot.send_photo(chat_id=chat_id, photo=src, caption=cap)
+        else:
+            await bot.send_document(chat_id=chat_id, document=src, caption=cap)
+        return
+    p = Path(src)
+    if not p.is_file():
+        raise FileNotFoundError(f"send_media_to_chat: not a file: {src}")
+    size = p.stat().st_size
+    is_img = p.suffix.lower() in IMAGE_EXTS
+    send_as_photo = is_img and not as_document and size <= PHOTO_MAX_BYTES
+    with p.open("rb") as fh:
+        if send_as_photo:
+            await bot.send_photo(chat_id=chat_id, photo=fh, caption=cap)
+        else:
+            if size > DOC_MAX_BYTES:
+                raise ValueError(
+                    f"File too large for Telegram ({size} bytes > {DOC_MAX_BYTES}): {src}"
+                )
+            await bot.send_document(chat_id=chat_id, document=fh, caption=cap,
+                                    filename=p.name)
+
+
+async def send_photo_to_steve(bot, src: str, caption: str | None = None) -> None:
+    """Internal helper (trusted caller): push an image to Steve's private chat.
+    In a private chat chat_id == user_id, so the first allowlisted id is the
+    target — same trick _post_init uses for the briefing destination."""
+    await send_media_to_chat(bot, next(iter(ALLOWED_USER_IDS)), src, caption,
+                             as_document=False)
+
+
+async def send_file_to_steve(bot, src: str, caption: str | None = None) -> None:
+    """Internal helper (trusted caller): push a file (as a document) to Steve."""
+    await send_media_to_chat(bot, next(iter(ALLOWED_USER_IDS)), src, caption,
+                             as_document=True)
+
+
+async def drain_outbox(bot) -> None:
+    """APScheduler interval job: send every queued JSON job in OUTBOX_DIR, then
+    delete it. Each job = {"src": ..., "caption": ..., "as_document": bool}.
+    A failed job moves to OUTBOX_DIR/.failed/ with the exception logged — the
+    loop NEVER raises (a crash here would kill the scheduler thread). Jobs come
+    from trusted local scripts, so they bypass the vault-containment guard."""
+    if not ALLOWED_USER_IDS:
+        return
+    target = next(iter(ALLOWED_USER_IDS))
+    for job in sorted(OUTBOX_DIR.glob("*.json")):
+        try:
+            spec = json.loads(job.read_text(encoding="utf-8"))
+            await send_media_to_chat(bot, target, spec["src"],
+                                     spec.get("caption"),
+                                     bool(spec.get("as_document", False)))
+            job.unlink()
+            logger.info(f"outbox: sent + cleared {job.name} (src={spec.get('src')})")
+        except Exception as exc:
+            logger.error(f"outbox job {job.name} failed: {exc}")
+            try:
+                failed = OUTBOX_DIR / ".failed"
+                failed.mkdir(exist_ok=True)
+                job.rename(failed / job.name)
+            except Exception as move_exc:
+                logger.error(f"outbox: could not quarantine {job.name}: {move_exc}")
+
+
+def _extract_send_file_directives(text: str) -> tuple[str, list[str]]:
+    """Pull every `[[SEND_FILE: <path|url>]]` sentinel out of a model reply.
+    Returns (cleaned_text, [sources]). Cleaned text has the sentinels removed
+    and collapsed blank lines tidied so the prose reads naturally."""
+    # Cheap substring guard: skip the regex entirely for the ~always case where
+    # the reply has no sentinel (also avoids any regex work on huge replies).
+    if "SEND_FILE" not in text.upper():
+        return text, []
+    sources = [m.group(1).strip() for m in _SEND_FILE_RE.finditer(text)]
+    if not sources:
+        return text, []
+    cleaned = _SEND_FILE_RE.sub("", text)
+    # Tidy: collapse 3+ newlines left behind, trim trailing whitespace per line.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, sources
+
+
 async def send_morning_briefing(bot, chat_id: int) -> None:
     """Daily scheduled job: regenerate DAILY_BRIEFING.md from current state, then generate + send the Telegram brief."""
     logger.info(f"Morning briefing job firing for chat_id={chat_id}")
@@ -3207,6 +3377,12 @@ async def _post_init(application) -> None:
     _telegram_bot = application.bot
     if _dispatch_semaphore is None:
         _dispatch_semaphore = asyncio.Semaphore(DISPATCH_MAX_CONCURRENT)
+    # Telegram media outbox: ensure the local file queue dir exists so external
+    # scripts (scripts/tg_send.sh) can drop jobs even before the first drain.
+    try:
+        OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning(f"Could not create outbox dir {OUTBOX_DIR}: {exc}")
     await _reconcile_orphaned_dispatches()
     if not ALLOWED_USER_IDS:
         logger.warning(
@@ -3268,6 +3444,19 @@ async def _post_init(application) -> None:
             id=f"autonomous_{entry['name']}",
             replace_existing=True,
         )
+    # Telegram media outbox drain — every 10s scan OUTBOX_DIR for queued JSON
+    # send-jobs (dropped by scripts/tg_send.sh / any external script) and ship
+    # them. drain_outbox never raises, so a bad job can't stall the scheduler.
+    _scheduler.add_job(
+        drain_outbox,
+        IntervalTrigger(seconds=OUTBOX_DRAIN_INTERVAL_SECONDS, timezone=TIMEZONE),
+        kwargs={"bot": application.bot},
+        id="outbox_drain",
+        replace_existing=True,
+        # Don't let missed drains pile up into a burst; one catch-up is enough.
+        max_instances=1,
+        coalesce=True,
+    )
     _scheduler.start()
     job = _scheduler.get_job("morning_briefing")
     next_run = job.next_run_time if job else None
@@ -3796,6 +3985,65 @@ async def ask_iris(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
 # Telegram handlers
 # ============================================================
 
+async def _file_inbound_media(update: Update, tg_file, suffix: str, kind: str,
+                              caption: str) -> tuple[Path, Path]:
+    """Download an already-fetched Telegram File into INBOX_MEDIA_DIR and log a
+    Quick Capture line so Cowork-Iris files it next session. Capture-only: the
+    daemon is read-only on the vault except its own inbound dir. Returns
+    (abs_dest, vault_relative_dest). Raises on download / write failure."""
+    user = update.effective_user
+    username = user.username or user.first_name
+    INBOX_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    safe_suffix = suffix if suffix.startswith(".") else (f".{suffix}" if suffix else ".bin")
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    dest = INBOX_MEDIA_DIR / f"{stamp}_{kind}{safe_suffix}"
+    if dest.exists():  # same-second collision — keep both
+        dest = INBOX_MEDIA_DIR / f"{stamp}_{kind}_{uuid.uuid4().hex[:4]}{safe_suffix}"
+    await tg_file.download_to_drive(custom_path=str(dest))
+    rel = dest.relative_to(WORKSPACE_DIR)
+    cap = (caption or "").strip()
+    note = f"{cap} [file: {rel}]".strip() if cap else f"Inbound {kind} [file: {rel}]"
+    # Honor a real Quick Capture prefix in the caption (e.g. a DECISION: pdf);
+    # otherwise label it MEDIA: so Cowork-Iris routes by the file + note.
+    qc_prefix = _detect_quick_capture(cap) or "MEDIA:"
+    await save_quick_capture(qc_prefix, note, user.id, username)
+    return dest, rel
+
+
+async def handle_document_message(update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inbound document handler (2026-06-19). Any document Steve sends downloads
+    into INBOX_MEDIA_DIR and logs a Quick Capture line. Capture-only — Cowork
+    files it properly next session. Fail-closed on the allowlist, like text."""
+    user = update.effective_user
+    username = user.username or user.first_name
+    if user.id not in ALLOWED_USER_IDS:
+        logger.warning(f"BLOCKED unauthorized document: user_id={user.id} @{username}")
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    caption = (update.message.caption or "").strip()
+    suffix = Path(doc.file_name or "").suffix or ".bin"
+    logger.info(
+        f"From @{username} (document): {doc.file_name!r} "
+        f"({doc.file_size} bytes), caption={caption[:60]!r}"
+    )
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        _, rel = await _file_inbound_media(update, tg_file, suffix, "document", caption)
+        await update.message.reply_text(
+            f"📎 Saved `{rel.name}` and logged to Quick Capture — "
+            f"Cowork-Iris files it properly next session."
+        )
+    except Exception as exc:
+        logger.exception(f"inbound document capture failed: {exc}")
+        await update.message.reply_text(
+            f"Got the document but couldn't save it: {exc}\n"
+            "It's still in this Telegram chat — Cowork-Iris can grab it from there."
+        )
+
+
 async def handle_photo_message(update: Update,
                                context: ContextTypes.DEFAULT_TYPE) -> None:
     """A4 (Redesign Night 4, 2026-06-13). Telegram photo handler — when the
@@ -3813,16 +4061,27 @@ async def handle_photo_message(update: Update,
         return
     caption = (update.message.caption or "").strip()
     if not caption.upper().startswith("RECEIPT:"):
+        # Non-RECEIPT photo: capture it to the inbound dir + Quick Capture
+        # (2026-06-19) instead of rejecting. RECEIPT-captioned photos still go
+        # through the richer expense-draft pipeline below.
         logger.info(
-            f"A4: photo from @{username} without RECEIPT: caption ignored "
+            f"Non-RECEIPT photo from @{username} → inbound capture "
             f"(caption preview: {caption[:60]!r})"
         )
-        await update.message.reply_text(
-            "📸 Got a photo, but no `RECEIPT:` caption — I only auto-route "
-            "receipt photos right now. Add a caption like "
-            "`RECEIPT: $7.23 UPS fax service` and resend, or describe what "
-            "you want me to do with it in a text message."
-        )
+        try:
+            tg_file = await context.bot.get_file(update.message.photo[-1].file_id)
+            _, rel = await _file_inbound_media(update, tg_file, ".jpg", "photo", caption)
+            await update.message.reply_text(
+                f"📸 Saved `{rel.name}` and logged to Quick Capture — "
+                f"Cowork-Iris files it next session. "
+                f"(Caption a photo `RECEIPT: $7.23 vendor` to auto-draft an expense.)"
+            )
+        except Exception as exc:
+            logger.exception(f"inbound photo capture failed: {exc}")
+            await update.message.reply_text(
+                f"Got the photo but couldn't save it: {exc}\n"
+                "It's still in this Telegram chat."
+            )
         return
     logger.info(
         f"From @{username} (photo): RECEIPT capture, caption={caption!r}"
@@ -4153,8 +4412,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info(f"To @{username} (tier={tier}): {response[:100]}")
 
-    for i in range(0, len(response), TELEGRAM_MAX_MSG):
-        await update.message.reply_text(response[i : i + TELEGRAM_MAX_MSG])
+    # Chat-tool file send (2026-06-19): honor any `[[SEND_FILE: <path|url>]]`
+    # sentinels the cloud model emitted (taught only on interactive cloud turns
+    # via DISPATCHER_MODE_SUFFIX). Only cloud-tier replies are parsed — the local
+    # models were never taught the protocol, so skip them entirely. Strip the
+    # sentinels from the prose, send the prose, then push each file through the
+    # vault-containment guard — the model can only send files from inside
+    # WORKSPACE_DIR or http(s) URLs.
+    send_srcs: list[str] = []
+    if tier.startswith("cloud"):
+        response, send_srcs = _extract_send_file_directives(response)
+
+    if response:
+        for i in range(0, len(response), TELEGRAM_MAX_MSG):
+            await update.message.reply_text(response[i : i + TELEGRAM_MAX_MSG])
+
+    for src in send_srcs:
+        try:
+            safe = _safe_vault_path(src)
+            await send_media_to_chat(context.bot, update.effective_chat.id, safe)
+            logger.info(f"chat-tool SEND_FILE delivered: {src}")
+        except Exception as exc:
+            logger.warning(f"chat-tool SEND_FILE refused/failed for {src!r}: {exc}")
+            await update.message.reply_text(f"⚠️ Couldn't send that file ({src}): {exc}")
 
 
 # ============================================================
@@ -4263,6 +4543,13 @@ def main() -> None:
         f"Fixed-shape, NOT model-routable. Script: {PIPELINE_SCRIPT}."
     )
     logger.info(
+        f"Telegram media: ENABLED. Outbound via send_photo_to_steve/send_file_to_steve "
+        f"(internal), {OUTBOX_DIR}/*.json file-queue drained every "
+        f"{OUTBOX_DRAIN_INTERVAL_SECONDS}s (scripts/tg_send.sh enqueues), and a gated "
+        f"`[[SEND_FILE: ...]]` chat sentinel (vault-contained). Inbound: non-RECEIPT "
+        f"photos + documents → {INBOX_MEDIA_DIR.relative_to(WORKSPACE_DIR)}/ + Quick Capture."
+    )
+    logger.info(
         "OAuth-aware error reply: ENABLED. Auth failures surface a 'run claude login' hint to Steve via Telegram."
     )
     logger.info(
@@ -4304,6 +4591,9 @@ def main() -> None:
     # route through handle_photo_message → _handle_receipt_photo → draft +
     # /approve. Non-RECEIPT photos get a soft hint and are ignored.
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    # Inbound documents (2026-06-19): download → _Iris_Memory/Telegram_Inbound/
+    # + Quick Capture line. Capture-only; Cowork-Iris files it next session.
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
     app.add_error_handler(_on_telegram_error)
     logger.info(
         "Iris (Telegram daemon — Tier 1 local Llama 3.1 8B + Tier 3 cloud Haiku 4.5 via Max OAuth + "
