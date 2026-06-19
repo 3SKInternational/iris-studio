@@ -22,7 +22,7 @@ JOB="${1:?run_claude_job: job name required}"
 PROMPT_FILE="${2:?run_claude_job: prompt file required}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NOTIFY="$SCRIPT_DIR/notify.sh"
+NOTIFY="${NOTIFY_BIN:-$SCRIPT_DIR/notify.sh}"  # NOTIFY_BIN overridable for self-tests
 LOG="/Users/steve/iris_studio/logs/claude-code-${JOB}.log"
 VAULT="/Users/steve/Documents/3SK/outputs"
 CLAUDE="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"  # CLAUDE_BIN overridable for self-tests
@@ -52,6 +52,43 @@ $(tail -n 4 "$LOG" 2>/dev/null || echo '(no log)')"
     # Enqueue (or bump) a retry marker so the 30-min sweep keeps trying until it runs.
     rq_record_failure "$JOB" "claude" "$reason" -- "${ORIG_ARGV[@]}"
     exit "$rc"
+}
+
+# Does the given text name an OS-level access/permission denial that means the
+# routine BOOTED AND RAN (exit 0) but could not do its work? Reads stdin so it
+# can scan either the agent's one-line ROUTINE_INCOMPLETE reason or the whole run
+# output. Tokens are deliberately the *technical* incident strings the agents
+# actually emit when blocked — `EPERM`, the literal "Operation not permitted",
+# any spelling of "Full Disk Access", and the `~/.claude/session-env` mkdir EPERM
+# that kills the Bash harness wholesale. These are specific enough that ordinary
+# routine prose (or a book chapter merely *describing* an outage) won't match,
+# while every real 2026-06 blocker (DQ-15 session-env EPERM + DQ-17 volume FDA)
+# does. Matching here is what converts a silently-cleared INCOMPLETE into a
+# retryable failure so the 30-min sweep re-fires the job the moment access returns.
+_iris_infra_denied() {
+    grep -qiE 'EPERM|Operation not permitted|Full.?Disk.?Access|session-env'
+}
+
+# A routine ran (exit 0) but an OS access/permission grant blocked its real work.
+# Treat it like the auth/credit case: enqueue for the 30-min retry sweep instead
+# of clearing the marker (the bug this fixes: ROUTINE_INCOMPLETE used to call
+# rq_clear_on_success, so an FDA/EPERM-blocked job never re-ran once the grant was
+# restored — it waited for its next daily/weekly fire, losing that run). Red alert
+# only on the original fire; retries stay throttled via rq_record_failure.
+# $1 = short detail string for the alert/log (the matched reason or output).
+infra_block() {
+    local detail="$1"
+    if [ "${IRIS_RETRY:-0}" != "1" ]; then
+        alert "🔴 launchd job '${JOB}' BLOCKED — OS access/permission denied. The routine ran but couldn't do its work.
+Likely Full Disk Access / TCC on the vault or the AI_Workspace volume, or the ~/.claude/session-env EPERM.
+FIX: restore the grant (System Settings ▸ Privacy & Security ▸ Full Disk Access) or relocate the affected path onto the internal disk. NOTE: an FDA grant is keyed to claude's version-pinned Caskroom path, so it silently breaks on the next \`claude\` cask update — re-grant after upgrades.
+The 30-min auto-retry will re-run this job automatically once access returns — no manual re-run needed.
+Time: ${TS}
+Detail: ${detail}"
+    fi
+    rq_record_failure "$JOB" "infra" "OS access/permission denied (TCC/FDA or ~/.claude/session-env)" -- "${ORIG_ARGV[@]}"
+    echo "run_claude_job: '${JOB}' INFRA-BLOCKED (access denied) at ${TS} — enqueued for retry" >> "$LOG"
+    exit 1
 }
 
 # Serialize this job against itself: if its own scheduled fire and a retry-sweep
@@ -110,9 +147,18 @@ TS="$(date '+%Y-%m-%d %H:%M %Z')"
 # COMPLETE's substring — ordering is load-bearing.
 case "$LAST_LINE" in
     ROUTINE_INCOMPLETE*)
-        # The agent DID run (exit 0) — the "couldn't run" condition is resolved,
-        # so clear any retry marker (recovery ping if it had been failing). The
-        # ⚠️ below still tells Steve it wasn't fully done.
+        # FIRST: if the incompleteness reason names an OS access/permission denial
+        # (TCC/Full-Disk-Access on the vault or AI_Workspace volume, or the
+        # ~/.claude/session-env EPERM), the job ran but was BLOCKED — enqueue it for
+        # the retry sweep instead of clearing the marker, so it re-runs the moment
+        # the grant returns. Without this, an FDA/EPERM outage just pinged ⚠️ once
+        # and waited for the next daily/weekly fire. infra_block exits.
+        if printf '%s\n' "$LAST_LINE" | _iris_infra_denied; then
+            infra_block "$LAST_LINE"
+        fi
+        # Otherwise the agent DID run (exit 0) — the "couldn't run" condition is
+        # resolved, so clear any retry marker (recovery ping if it had been
+        # failing). The ⚠️ below still tells Steve it wasn't fully done.
         rq_clear_on_success "$JOB"
         REASON="$(printf '%s' "$LAST_LINE" | sed 's/^ROUTINE_INCOMPLETE:*[[:space:]]*//')"
         alert "⚠️ launchd job '${JOB}' ran but is NOT fully done.
@@ -161,8 +207,20 @@ Detail: ${DETAIL}"
             echo "run_claude_job: '${JOB}' AUTH/CREDIT FAILURE at ${TS} — needs \`claude login\` on the Mini" >> "$LOG"
             exit 1
         fi
-        # Ran (exit 0) but no sentinel — the agent executed, so the "couldn't run"
-        # condition is resolved: clear any retry marker, then warn as before.
+        # Next: an OS access/permission denial (TCC/FDA or session-env EPERM) can
+        # also leave no sentinel — the agent may have been blocked before it could
+        # emit one. Same treatment as the INCOMPLETE branch: enqueue for retry
+        # rather than clear. Scanned only here (after the COMPLETE/INCOMPLETE cases
+        # have already matched and returned), so a job that finished and merely
+        # *mentioned* these tokens in its output cannot reach this scan.
+        if _iris_infra_denied < "$RUN_OUT"; then
+            infra_block "$(grep -iE 'EPERM|Operation not permitted|Full.?Disk.?Access|session-env' "$RUN_OUT" | head -2 | tr '\n' ' ' | sed -e $'s/\033\\[[0-9;]*m//g' -e 's/[[:space:]]\\+/ /g' -e 's/[[:space:]]*$//')"
+        fi
+        # Ran (exit 0) but no sentinel and no infra-denial token — the agent
+        # executed, so the "couldn't run" condition is resolved: clear any retry
+        # marker, then warn as before. (Accepted limitation: an infra block whose
+        # narration names none of the tokens degrades to this benign ⚠️ with no
+        # retry — inherent to classifying from prose, and no worse than before.)
         rq_clear_on_success "$JOB"
         alert "⚠️ launchd job '${JOB}' finished (exit 0) but emitted no completion signal — may not be fully done. Check the log."
         echo "run_claude_job: '${JOB}' completed WITHOUT sentinel at ${TS}" >> "$LOG"
