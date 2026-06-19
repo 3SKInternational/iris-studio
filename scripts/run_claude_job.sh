@@ -69,6 +69,21 @@ _iris_infra_denied() {
     grep -qiE 'EPERM|Operation not permitted|Full.?Disk.?Access|session-env'
 }
 
+# Signature of the Claude CLI dying at STARTUP — before the routine could run —
+# under launchd: it aborts with "error: An unknown error occurred, possibly due to
+# low max file descriptors (Unexpected)" and exits non-zero. The routine never
+# executes, so there is never a completion sentinel. This is TRANSIENT and
+# self-heals: the 30-min retry sweep re-fires the job and it completes clean
+# minutes later. Treating it as a hard FAILED produced a daily false red alarm
+# (root-caused 2026-06-19 from vault-gardener's persistent dashboard "warn") even
+# though the very next retry already recovered. The match is the exact CLI string
+# (specific enough that ordinary routine prose can't trip it); the caller also
+# guards on "no completion sentinel" so a routine that actually finished can never
+# be misclassified here. Reads stdin like _iris_infra_denied.
+_iris_startup_died() {
+    grep -qiE 'An unknown error occurred.*low max file descriptors'
+}
+
 # A routine ran (exit 0) but an OS access/permission grant blocked its real work.
 # Treat it like the auth/credit case: enqueue for the 30-min retry sweep instead
 # of clearing the marker (the bug this fixes: ROUTINE_INCOMPLETE used to call
@@ -88,6 +103,23 @@ Detail: ${detail}"
     fi
     rq_record_failure "$JOB" "infra" "OS access/permission denied (TCC/FDA or ~/.claude/session-env)" -- "${ORIG_ARGV[@]}"
     echo "run_claude_job: '${JOB}' INFRA-BLOCKED (access denied) at ${TS} — enqueued for retry" >> "$LOG"
+    exit 1
+}
+
+# A transient Claude CLI STARTUP abort (see _iris_startup_died): the process died
+# before the routine ran, but it self-heals on the next sweep. Enqueue it for the
+# 30-min retry (so the routine actually runs) but stay SILENT on this original fire
+# — NO red alert — because firing one is the false alarm we're killing. The retry
+# path keeps its own escalation: if the CLI is genuinely wedged, rq_record_failure
+# fires its throttled "still failing" pings (attempt 2, then every ~3h); if it was
+# a one-off, the retry succeeds and rq_clear_on_success emits a single honest
+# "✅ RECOVERED" ping. Either way no red FAILED ping on the transient case.
+# $1 = short detail string for the log. Exits 1 (launchd still sees the fire fail,
+# which is accurate — the routine did not run on this fire).
+startup_retry() {
+    local detail="$1"
+    rq_record_failure "$JOB" "claude" "Claude CLI startup abort (low max file descriptors / Unexpected) — transient, auto-retrying" -- "${ORIG_ARGV[@]}"
+    echo "run_claude_job: '${JOB}' STARTUP-ABORT (fd/Unexpected) at $(date '+%Y-%m-%d %H:%M %Z') — silent, enqueued for retry: ${detail}" >> "$LOG"
     exit 1
 }
 
@@ -124,8 +156,30 @@ trap 'rm -f "$RUN_OUT"; rq_release_lock' EXIT
 "$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG" | tee "$RUN_OUT" >/dev/null
 rc=${PIPESTATUS[0]}
 
-# 1) Process died / non-zero exit → hard failure.
+# 1) Process died / non-zero exit → hard failure — with ONE carve-out: the Claude
+#    CLI's transient STARTUP abort ("...low max file descriptors (Unexpected)")
+#    that kills the process before the routine can run. It emits no completion
+#    sentinel and self-heals on the next 30-min retry, so a red FAILED alert on it
+#    is a false alarm (the vault-gardener dashboard "warn", root-caused 2026-06-19).
+#    Route just that one signature to the silent retry path. Guard on "no sentinel":
+#    if the routine actually finished (ROUTINE_COMPLETE/INCOMPLETE on its last line)
+#    and THEN exited non-zero, that's a real failure — fall through to fail().
 if [ "$rc" -ne 0 ]; then
+    NZ_LAST="$(grep -vE '^[[:space:]]*$' "$RUN_OUT" | tail -1 | tr -d '\r' \
+        | sed -e $'s/\033\\[[0-9;]*m//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    case "$NZ_LAST" in
+        ROUTINE_COMPLETE*|ROUTINE_INCOMPLETE*) : ;;  # finished, then exited nonzero → real failure
+        *)
+            # Scope the fd-match to the LAST line (where a genuine startup abort
+            # actually prints it) — not the whole body — so a routine that merely
+            # quotes this string mid-run and then crashes with a DIFFERENT error
+            # can't be silently swallowed. The real CLI abort emits the fd error as
+            # its terminal output, so this still catches every true case.
+            if printf '%s\n' "$NZ_LAST" | _iris_startup_died; then
+                startup_retry "exit $rc — CLI startup abort (low max file descriptors / Unexpected); routine never ran"
+            fi
+            ;;
+    esac
     fail "$rc" "exit code $rc (process died / non-zero)"
 fi
 
