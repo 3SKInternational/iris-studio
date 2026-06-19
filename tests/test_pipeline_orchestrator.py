@@ -645,9 +645,15 @@ class TestSpendOkImageGate(unittest.TestCase):
         return _mark_done(_stages(), "2_review")
 
     def _patch_common(self):
-        """Neutralize side effects unrelated to the gate; return restore fn."""
+        """Neutralize side effects unrelated to the gate; return restore fn.
+
+        Pass A now enters the gate through run_prompt_review_loop (the closed
+        review→fix→re-review loop), so that — not run_image_review — is what the
+        gate tests stub. Leaving the loop real would fire the prompt-fixer
+        subprocess on a HOLD-SPEND verdict; the loop's own behaviour is covered
+        by TestPromptReviewLoop instead."""
         saved = (po.reconcile_orphans, po.vault_abs, po.notify,
-                 po.subprocess.run, po.run_image_review)
+                 po.subprocess.run, po.run_prompt_review_loop)
 
         def _noop_reconcile(_stages, _video):
             return None
@@ -664,7 +670,7 @@ class TestSpendOkImageGate(unittest.TestCase):
 
         def restore():
             (po.reconcile_orphans, po.vault_abs, po.notify,
-             po.subprocess.run, po.run_image_review) = saved
+             po.subprocess.run, po.run_prompt_review_loop) = saved
         return restore
 
     def test_hold_spend_refuses_spend(self):
@@ -676,11 +682,70 @@ class TestSpendOkImageGate(unittest.TestCase):
                 called["gen"] = True
                 return _Proc(0)
             po.subprocess.run = _spy_run
-            po.run_image_review = lambda mode, video: ("HOLD-SPEND", "rel", "off-model")
+            po.run_prompt_review_loop = lambda video, manifest_rel: (
+                "HOLD-SPEND", "rel", "off-model")
             sf = _FakeSF(self._ready_stages())
             rc = po.cmd_spend_ok(sf)
             self.assertEqual(rc, 2)
             self.assertFalse(called["gen"], "must NOT shell generate_images on HOLD-SPEND")
+        finally:
+            restore()
+
+    def test_revise_refuses_spend(self):
+        # The allow-list guard: a REVISE (or any non-SHIP, non-UNAVAILABLE) verdict
+        # reaching Pass A must fail CLOSED. A deny-list `else: spend` leaked REVISE
+        # straight to a billed spend — this pins that regression shut.
+        restore = self._patch_common()
+        try:
+            called = {"gen": False}
+
+            def _spy_run(*a, **k):
+                called["gen"] = True
+                return _Proc(0)
+            po.subprocess.run = _spy_run
+            po.run_prompt_review_loop = lambda video, manifest_rel: (
+                "REVISE", "rel", "off-model render")
+            sf = _FakeSF(self._ready_stages())
+            rc = po.cmd_spend_ok(sf)
+            self.assertEqual(rc, 2)
+            self.assertFalse(called["gen"], "REVISE must NOT shell generate_images")
+        finally:
+            restore()
+
+    def test_unexpected_verdict_fails_closed(self):
+        # Defense in depth: a token the gate doesn't recognize must block, not spend.
+        restore = self._patch_common()
+        try:
+            called = {"gen": False}
+
+            def _spy_run(*a, **k):
+                called["gen"] = True
+                return _Proc(0)
+            po.subprocess.run = _spy_run
+            po.run_prompt_review_loop = lambda video, manifest_rel: (
+                "MAYBE", "rel", "garbage verdict")
+            sf = _FakeSF(self._ready_stages())
+            rc = po.cmd_spend_ok(sf)
+            self.assertEqual(rc, 2)
+            self.assertFalse(called["gen"], "an unrecognized verdict must fail closed")
+        finally:
+            restore()
+
+    def test_ship_with_fixes_spends(self):
+        restore = self._patch_common()
+        try:
+            called = {"gen": False}
+
+            def _spy_run(*a, **k):
+                called["gen"] = True
+                return _Proc(0, stdout="generated")
+            po.subprocess.run = _spy_run
+            po.run_prompt_review_loop = lambda video, manifest_rel: (
+                "SHIP WITH FIXES", "rel", "low-cost vocab fixes")
+            sf = _FakeSF(self._ready_stages())
+            rc = po.cmd_spend_ok(sf)
+            self.assertEqual(rc, 0)
+            self.assertTrue(called["gen"], "SHIP WITH FIXES is spendable")
         finally:
             restore()
 
@@ -693,7 +758,8 @@ class TestSpendOkImageGate(unittest.TestCase):
                 called["gen"] = True
                 return _Proc(0, stdout="generated")
             po.subprocess.run = _spy_run
-            po.run_image_review = lambda mode, video: ("UNAVAILABLE", "rel", "reviewer down")
+            po.run_prompt_review_loop = lambda video, manifest_rel: (
+                "UNAVAILABLE", "rel", "reviewer down")
             sf = _FakeSF(self._ready_stages())
             rc = po.cmd_spend_ok(sf)
             self.assertEqual(rc, 0)
@@ -711,10 +777,10 @@ class TestSpendOkImageGate(unittest.TestCase):
                 return _Proc(0, stdout="generated")
             po.subprocess.run = _spy_run
 
-            def _no_review(mode, video):
+            def _no_review(video, manifest_rel):
                 called["review"] = True
                 return ("HOLD-SPEND", "rel", "should be skipped")
-            po.run_image_review = _no_review
+            po.run_prompt_review_loop = _no_review
             sf = _FakeSF(self._ready_stages())
             rc = po.cmd_spend_ok(sf, force=True)
             self.assertEqual(rc, 0)
@@ -737,7 +803,8 @@ class TestAssembleImageGate(unittest.TestCase):
                 return _Proc(0)
             po.subprocess.run = _spy_run
             po.notify = lambda *a, **k: None
-            po.run_image_review = lambda mode, video: ("REVISE", "rel", "off-model render")
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "REVISE", "rel", "off-model render")
             ok, msg = po.run_script_stage("6_assemble", 3)
             self.assertFalse(ok)
             self.assertIn("REVISE", msg)
@@ -755,12 +822,154 @@ class TestAssembleImageGate(unittest.TestCase):
                 return _Proc(0, stdout="assembled")
             po.subprocess.run = _spy_run
             po.notify = lambda *a, **k: None
-            po.run_image_review = lambda mode, video: ("UNAVAILABLE", "rel", "reviewer down")
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "UNAVAILABLE", "rel", "reviewer down")
             ok, _msg = po.run_script_stage("6_assemble", 3)
             self.assertTrue(ok, "fail-open must still assemble")
             self.assertTrue(called["build"])
         finally:
             (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+
+class TestCanonicalManifest(unittest.TestCase):
+    """canonical_manifest_rel: the ONE billed manifest the reviewer audits, the
+    fixer edits, and generate_images bills must all agree on."""
+
+    def test_default_is_image_factory_hd_batch(self):
+        rel = po.canonical_manifest_rel(7)
+        self.assertEqual(
+            rel,
+            f"{po.VAULT_REL}/Raw_Assets/Image_Factory/manifests/video_07_hd.json")
+
+    def test_none_stages_uses_default(self):
+        self.assertTrue(po.canonical_manifest_rel(3, None).endswith(
+            "manifests/video_03_hd.json"))
+
+    def test_state_override_wins(self):
+        stages = po.default_stages()
+        stages["5_images"]["scene_manifest"] = "custom/path/v9.json"
+        self.assertEqual(po.canonical_manifest_rel(9, stages), "custom/path/v9.json")
+
+    def test_missing_override_key_falls_back(self):
+        # A stage map with no 'scene_manifest' field must not crash.
+        self.assertTrue(po.canonical_manifest_rel(1, po.default_stages()).endswith(
+            "video_01_hd.json"))
+
+
+class TestPromptReviewLoop(unittest.TestCase):
+    """run_prompt_review_loop: the CLOSED review→fix→re-review feedback loop at
+    the PROMPTS gate (image analogue of scriptwriter↔script-reviewer). Stubs
+    run_image_review with a scripted verdict sequence + run_prompt_fixer."""
+
+    def _patch(self, verdicts, fixer=None):
+        """verdicts: list consumed one per run_image_review call. fixer: stub for
+        run_prompt_fixer (defaults to a successful no-op). Returns (restore, calls)
+        where calls records review/fix invocation counts."""
+        saved = (po.run_image_review, po.run_prompt_fixer)
+        calls = {"review": 0, "fix": 0}
+        seq = list(verdicts)
+
+        def _review(mode, video, manifest_rel=None):
+            calls["review"] += 1
+            v = seq[min(calls["review"] - 1, len(seq) - 1)]
+            return v, f"rel{calls['review']}", f"detail {v}"
+
+        def _default_fixer(video, verdict_rel, manifest_rel):
+            calls["fix"] += 1
+            return True, "fixed"
+
+        def _wrapped_fixer(video, verdict_rel, manifest_rel):
+            calls["fix"] += 1
+            return fixer(video, verdict_rel, manifest_rel)
+
+        po.run_image_review = _review
+        po.run_prompt_fixer = _wrapped_fixer if fixer else _default_fixer
+
+        def restore():
+            (po.run_image_review, po.run_prompt_fixer) = saved
+        return restore, calls
+
+    def test_clean_first_pass_no_fix(self):
+        restore, calls = self._patch(["SHIP"])
+        try:
+            verdict, vrel, detail = po.run_prompt_review_loop(3, "m.json")
+            self.assertEqual(verdict, "SHIP")
+            self.assertEqual(calls["review"], 1)
+            self.assertEqual(calls["fix"], 0, "a clean first pass must not invoke the fixer")
+        finally:
+            restore()
+
+    def test_ship_with_fixes_does_not_trigger_loop(self):
+        # SHIP WITH FIXES is spendable — it must NOT trigger a fix dispatch.
+        restore, calls = self._patch(["SHIP WITH FIXES"])
+        try:
+            verdict, _vrel, _detail = po.run_prompt_review_loop(3, "m.json")
+            self.assertEqual(verdict, "SHIP WITH FIXES")
+            self.assertEqual(calls["fix"], 0)
+        finally:
+            restore()
+
+    def test_hold_then_ship_fixes_once_and_clears(self):
+        # HOLD-SPEND → fix → re-review SHIP: exactly one fix, two reviews, clears.
+        restore, calls = self._patch(["HOLD-SPEND", "SHIP"])
+        try:
+            verdict, _vrel, detail = po.run_prompt_review_loop(3, "m.json")
+            self.assertEqual(verdict, "SHIP")
+            self.assertEqual(calls["review"], 2)
+            self.assertEqual(calls["fix"], 1)
+            self.assertIn("auto-fix attempt", detail)
+        finally:
+            restore()
+
+    def test_persistent_hold_stops_at_max_attempts(self):
+        # Always HOLD-SPEND: loop must stop at IMAGE_REVIEW_MAX_FIX_ATTEMPTS fixes
+        # (not loop forever) and return the blocking verdict for the human gate.
+        restore, calls = self._patch(["HOLD-SPEND"])
+        try:
+            verdict, _vrel, _detail = po.run_prompt_review_loop(3, "m.json")
+            self.assertEqual(verdict, "HOLD-SPEND")
+            self.assertEqual(calls["fix"], po.IMAGE_REVIEW_MAX_FIX_ATTEMPTS)
+            # one initial review + one re-review per fix attempt
+            self.assertEqual(calls["review"], po.IMAGE_REVIEW_MAX_FIX_ATTEMPTS + 1)
+        finally:
+            restore()
+
+    def test_fixer_cannot_run_stops_loop(self):
+        # If the fixer itself can't run, the loop must STOP (not re-review) and
+        # surface the blocking verdict — never silently proceed toward spend.
+        restore, calls = self._patch(
+            ["HOLD-SPEND"], fixer=lambda v, vr, m: (False, "agent missing"))
+        try:
+            verdict, _vrel, detail = po.run_prompt_review_loop(3, "m.json")
+            self.assertEqual(verdict, "HOLD-SPEND")
+            self.assertEqual(calls["fix"], 1)
+            self.assertEqual(calls["review"], 1, "must not re-review after a failed fix")
+            self.assertIn("could not run", detail)
+        finally:
+            restore()
+
+    def test_unavailable_ends_loop_immediately(self):
+        restore, calls = self._patch(["UNAVAILABLE"])
+        try:
+            verdict, _vrel, _detail = po.run_prompt_review_loop(3, "m.json")
+            self.assertEqual(verdict, "UNAVAILABLE")
+            self.assertEqual(calls["fix"], 0)
+            self.assertEqual(calls["review"], 1)
+        finally:
+            restore()
+
+
+class TestRunPromptFixerMissingAgent(unittest.TestCase):
+    def test_missing_agent_file_does_not_run(self):
+        old = po.AGENTS_DIR
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                po.AGENTS_DIR = Path(d)  # no scene-image-prompt-generator.md inside
+                ran, detail = po.run_prompt_fixer(3, "vrel", "m.json")
+            self.assertFalse(ran)
+            self.assertIn("not found", detail)
+        finally:
+            po.AGENTS_DIR = old
 
 
 if __name__ == "__main__":
