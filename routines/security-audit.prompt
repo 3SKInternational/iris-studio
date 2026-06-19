@@ -1,0 +1,23 @@
+Weekly security posture audit at 04:00 AM ET on Sundays.
+
+Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` (latest entry) for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
+
+**Dispatch the `security-auditor` subagent** (via the Task tool) to run a FULL live audit. Its complete operating spec lives in `/Users/steve/.claude/agents/security-auditor.md` — it knows the method; do not re-specify it. Pass the subagent a prompt that says: run a full live security posture audit now as a SCHEDULED routine — execute every axis (vault secret-leak sweep, git-history scan across iris-studio AND every repo under ~/iris_mcps, credential-file permissions including the .bak stale-token copies, public-network/tunnel exposure, Syncthing state, launchd com.iris.* integrity, light dependency check); write the dated report to `/Users/steve/Documents/3SK/outputs/06_CEO/Security_Audits/YYYY-MM-DD_security_audit.md` (today's ISO date); append the verdict + any 🔴/🟠 lines to `/Users/steve/Documents/3SK/outputs/INBOX.md` via `cat >>`; fire `scripts/notify.sh` for CONFIRMED criticals only; redact every secret to last-4 in both the report and any alert.
+
+When the subagent returns, read its summary and decide the completion signal below from its `status:` and verdict.
+
+**Drift watch (do NOT duplicate the monthly credential-check):** this audit owns posture/exposure; the 1st-of-month `credential-check` routine owns rotation-age. If the auditor surfaces something rotation-age-shaped, note it but don't re-rank — that's the other routine's lane.
+
+**Bridge file:** append a 2-line bridge summary to `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` ONLY if the verdict is 🔴 EXPOSED or any 🟠 high was found. Skip for a clean ✅ SECURE week.
+
+**Append to today's daily note (per-agent-sections convention).** After your primary task, append ONE bullet to `_Iris_Memory/Daily/YYYY-MM-DD.md` (today's ISO date) under the `## 🤖 Claude Code intra-day log` section. Format: `HH:MM — security audit → <verdict>, <n> findings (report path)`. If the daily note doesn't exist yet, create it from `01_Operating_Docs/Templates/Daily_Note_Template.md` and fill the frontmatter date/day fields. Do NOT edit Cowork's `## 📝 Cowork-Iris intra-day log` section.
+
+---
+
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the audit ran and the report was written. NOTE: a 🔴 EXPOSED or ⚠️ HARDEN verdict is still `ROUTINE_COMPLETE` — the *audit itself* succeeded; the findings are the deliverable, not a routine failure.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the audit could not run or was only partial (subagent returned `status: blocked-*` / `partial-*`, a path was inaccessible, or a step was skipped).
+
+Do NOT echo the subagent's full report as your final output — your last line must be the bare sentinel and nothing after it (the wrapper reads only the parent's last line). Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.
