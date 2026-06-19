@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ADAPTS loop weekly SELF-IMPROVEMENT scan — installed 2026-06-19.
+
+  Closes the loop the channel was missing: the system already LEARNS (analytics
+  pull + channel-analyst, youtube-researcher intel, script/image-reviewer
+  verdicts, lint flags) but those findings died in reports nobody acted on. This
+  runs the `adaptation-scan` Claude routine, which (1) dispatches the
+  `adaptation-proposer` agent to read those signals and DRAFT surgical, cited
+  edits to whitelisted agent prompts / content-standard docs, then (2) pushes any
+  drafted proposals to Steve's Telegram so he can one-tap `/adapt approve <id>`
+  or `/adapt reject <id>`. The proposer NEVER applies — the deterministic apply
+  core (scripts/adaptation.py), invoked only by Steve's /adapt approval in the
+  iris.py daemon, performs the edit. A week with no signal clearing the bar
+  correctly drafts ZERO proposals and reports a clean no-op.
+
+  Runs via run_claude_job.sh (NOT run_job.sh): it's a `claude --print` routine, so
+  the SAME wrapper that every other claude-code job uses handles logging, the
+  ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and the retry queue.
+
+  Schedule: Thursday 4:30 AM ET — after the week's analytics (Mon 5:30) and
+  youtube-researcher intel (Wed 3:00) have landed, so the proposer reasons over
+  fresh signals; a free overnight slot between vault-gardener (4:10) and
+  pipeline-heartbeat (4:50).
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-adaptation-scan 2>/dev/null
+    cp scripts/com.iris.claude-code-adaptation-scan.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-adaptation-scan.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-adaptation-scan   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-adaptation-scan</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh adaptation-scan /Volumes/AI_Workspace/iris_studio/routines/adaptation-scan.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/adaptation-scan.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/adaptation-scan.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+		<key>Weekday</key>
+		<integer>4</integer>
+	</dict>
+</dict>
+</plist>

@@ -153,6 +153,20 @@ except Exception as _docx_load_exc:  # noqa: BLE001 - never block daemon boot
         f"script_to_docx helper unavailable (auto-docx disabled): {_docx_load_exc}"
     )
 
+# ADAPTS loop apply core. Same local-importlib pattern. Best-effort: a load
+# failure must not stop the daemon, so guard it and degrade to "no /adapt".
+try:
+    _adapt_spec = _importlib_util.spec_from_file_location(
+        "_adaptation", PROJECT_DIR / "scripts" / "adaptation.py"
+    )
+    _adaptation = _importlib_util.module_from_spec(_adapt_spec)
+    _adapt_spec.loader.exec_module(_adaptation)
+except Exception as _adapt_load_exc:  # noqa: BLE001 - never block daemon boot
+    _adaptation = None
+    logging.getLogger("iris").warning(
+        f"adaptation apply core unavailable (/adapt disabled): {_adapt_load_exc}"
+    )
+
 # Force Agent SDK to use the claude CLI OAuth (Max sub).
 ANTHROPIC_API_KEY_FALLBACK = os.environ.pop("ANTHROPIC_API_KEY", None)
 
@@ -2380,6 +2394,116 @@ async def _handle_approve_command(update, chat_id: str, run_id: str) -> None:
     )
 
 
+async def _handle_adapt_command(update, chat_id: str, subcommand: str, arg: str) -> None:
+    """Handle `/adapt [list|show <id>|approve <id>|reject <id> [reason]]`.
+
+    The ADAPTS-loop one-tap gate. The adaptation-proposer agent DRAFTS proposals
+    into 06_CEO/Adaptations/queue/; Steve reviews here and approves/rejects. The
+    actual file edit is performed by the deterministic apply core
+    (scripts/adaptation.py) — never by the LLM proposer. This handler only routes
+    Steve's decision to that core; the core re-validates the allowlist and the
+    exact-once match at apply time.
+    """
+    if _adaptation is None:
+        await update.message.reply_text(
+            "⚠️ Adaptation apply core failed to load — /adapt is disabled. "
+            "Check the daemon logs for the import error."
+        )
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async def _run(fn, *args):
+        return await loop.run_in_executor(None, lambda: fn(*args))
+
+    AdaptError = _adaptation.AdaptError
+
+    if subcommand in ("", "list"):
+        try:
+            props = await _run(_adaptation.list_proposals)
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Couldn't list proposals: {exc}")
+            return
+        if not props:
+            await update.message.reply_text(
+                "📭 No pending adaptation proposals. The queue is clean."
+            )
+            return
+        lines = [f"📋 {len(props)} pending adaptation proposal(s):", ""]
+        for p in props:
+            tgt = _vault_rel(p.target) if p.target else "(no target)"
+            conf = p.meta.get("confidence", "?")
+            lines.append(f"• `{p.pid}` [{conf}] → {tgt}")
+            lines.append(f"   {p.summary}")
+        lines.append("")
+        lines.append("Review one: `/adapt show <id>` · then `/adapt approve <id>` or `/adapt reject <id> [reason]`")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if subcommand == "show":
+        if not arg:
+            await update.message.reply_text("Usage: /adapt show <id>")
+            return
+        pid = arg.split(None, 1)[0]
+        try:
+            body = await _run(_adaptation.show_proposal, pid)
+        except AdaptError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Couldn't show `{pid}`: {exc}")
+            return
+        await update.message.reply_text(body)
+        return
+
+    if subcommand == "approve":
+        if not arg:
+            await update.message.reply_text("Usage: /adapt approve <id>")
+            return
+        pid = arg.split(None, 1)[0]
+        try:
+            res = await _run(_adaptation.apply_proposal, pid)
+        except AdaptError as exc:
+            await update.message.reply_text(f"❌ Not applied: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Apply failed for `{pid}`: {exc}")
+            return
+        await update.message.reply_text(
+            f"✅ Applied `{res['pid']}`.\n"
+            f"📝 {res['summary']}\n"
+            f"📂 Target: `{_vault_rel(res['target'])}`\n"
+            f"💾 Backup: `{Path(res['backup']).name}`\n"
+            "The next dispatch of that agent/standard will use the new text."
+        )
+        return
+
+    if subcommand == "reject":
+        if not arg:
+            await update.message.reply_text("Usage: /adapt reject <id> [reason]")
+            return
+        parts = arg.split(None, 1)
+        pid = parts[0]
+        reason = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            res = await _run(_adaptation.reject_proposal, pid, reason)
+        except AdaptError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Reject failed for `{pid}`: {exc}")
+            return
+        suffix = f" (reason: {reason})" if reason else ""
+        await update.message.reply_text(
+            f"🗑️ Rejected `{res['pid']}`{suffix}.\n📝 {res['summary']}"
+        )
+        return
+
+    await update.message.reply_text(
+        "Usage: /adapt [list | show <id> | approve <id> | reject <id> [reason]]"
+    )
+
+
 async def _update_dispatch(d_id, **fields):
     await _db_call(_update_dispatch_sync, d_id, fields)
 
@@ -4306,6 +4430,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         run_id = rest.split(None, 1)[0]
         logger.info(f"From @{username} (/approve {run_id}): filling Paste-ready CSV")
         await _handle_approve_command(update, chat_id, run_id)
+        return
+
+    # ADAPTS loop one-tap gate — `/adapt [list|show <id>|approve <id>|reject <id>]`.
+    # adaptation-proposer drafts proposals; Steve reviews + approves here; the
+    # deterministic apply core (scripts/adaptation.py) performs the edit. The
+    # proposer never edits a file directly — that separation is the safety model.
+    if stripped_text.lower() in ("/adapt", "!adapt") or stripped_text.lower().startswith(("/adapt ", "!adapt ")):
+        rest = stripped_text[len("/adapt"):].strip()
+        parts = rest.split(None, 1)
+        subcommand = parts[0].lower() if parts else "list"
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        logger.info(f"From @{username} (/adapt {subcommand} {arg})")
+        await _handle_adapt_command(update, chat_id, subcommand, arg)
         return
 
     # Second-brain capture (2026-06-16): `BRAIN: <thought>` (or NOTE:/ZK:) lands
