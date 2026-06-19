@@ -116,6 +116,57 @@ def parse_shot_list(path: Path) -> tuple[list[dict], dict[int, float]]:
     return shots, cadence
 
 
+# --- editorial cut-anchor directive (optional) -----------------------------
+# A shot list may carry an explicit, machine-read cut-anchor line per multi-shot
+# scene so picture cuts land on the editorially intended narrative beats instead
+# of an even-sentence split. Format (anywhere in the file, one per scene):
+#
+#   > ✂️ Cut-anchors: 4 | "median American at" | "the market returns about" | …
+#
+# i.e. the scene number, then the k-1 boundary phrases (verbatim spoken
+# substrings) for a k-shot scene, pipe-separated and double-quoted. Under
+# --align the orchestrator maps each phrase to the moment it is actually spoken
+# (forced alignment) and cuts there. The directive is OPTIONAL and SAFE: absent,
+# unparseable, wrong count, or unresolved -> the scene keeps today's timing. The
+# human-facing `@ "spoken line"` hints in the 🎬 Edit: prose remain the source of
+# truth a person reads; this line is the same intent in a form a parser can trust
+# (the prose markers are incomplete — final-shot cuts are often unmarked and
+# tile-pans carry multiple @ per shot — so they can't be parsed reliably).
+_CUT_ANCHOR_RE = re.compile(
+    r"Cut-anchors:\s*(\d+)\s*((?:\|\s*\"[^\"]+\"\s*)+)", re.IGNORECASE)
+_ANCHOR_PHRASE_RE = re.compile(r"\"([^\"]+)\"")
+
+
+def parse_cut_anchors(text: str) -> dict[int, list[str]]:
+    """scene_number -> [boundary phrases] from any Cut-anchors directive lines."""
+    # Normalize smart/curly double quotes so an editor's autocorrected “…” (the
+    # default in Obsidian/Docs) still parses instead of silently disabling the
+    # directive — the phrases are matched on straight ASCII quotes.
+    text = text.replace("“", '"').replace("”", '"')
+    out: dict[int, list[str]] = {}
+    for m in _CUT_ANCHOR_RE.finditer(text):
+        scene = int(m.group(1))
+        phrases = [p.strip() for p in _ANCHOR_PHRASE_RE.findall(m.group(2)) if p.strip()]
+        if phrases:
+            out[scene] = phrases
+    # A line that says "Cut-anchors:" but whose scene didn't parse is a typo'd
+    # directive (wrong quoting, missing scene number). Surface it instead of
+    # silently falling back, so an editor doesn't believe a broken line took
+    # effect. Gate on whether the scene actually landed in `out` (not a per-line
+    # regex re-match) so a directive that legitimately wraps across lines — which
+    # the full-text finditer above still parses — does not false-warn.
+    for ln in text.splitlines():
+        if "cut-anchors:" not in ln.lower():
+            continue
+        sm = re.search(r"cut-anchors:\s*(\d+)", ln, re.IGNORECASE)
+        if sm and int(sm.group(1)) in out:
+            continue  # this scene's directive parsed (possibly across lines)
+        clipped = ln.strip()
+        clipped = clipped[:90] + "…" if len(clipped) > 90 else clipped
+        print(f'  ⚠ Cut-anchors line did not parse (need: N | "phrase" | …): {clipped}')
+    return out
+
+
 # --- VO kit parsing (captions) --------------------------------------------
 
 _KIT_BLOCK_RE = re.compile(r"^##\s+Scene\s+(\d+)\s*(?:->|→)\s*`([^`]+\.mp3)`[^\n]*\n", re.MULTILINE)
@@ -227,6 +278,79 @@ def aligned_internal_cuts(caption: str, cap_parts: list[tuple[str, float]],
     return cuts
 
 
+# Normalization for matching an editorial anchor phrase against the aligned word
+# stream: strip everything but [a-z0-9] so "$6,400" / "8%" in a directive match
+# the scripted word tokens "$6,400." / "8%" the aligner emits. (Mirrors the
+# proven one-off scripts/realign_video02_cuts.py logic.)
+_ANCHOR_NORM = re.compile(r"[^a-z0-9]+")
+
+
+def _anorm(t: str) -> str:
+    return _ANCHOR_NORM.sub("", t.lower())
+
+
+def _atoks(phrase: str) -> list[str]:
+    return [n for n in (_anorm(x) for x in phrase.split()) if n]
+
+
+def _find_subseq(words_norm: list[str], anchor: list[str], start: int) -> int | None:
+    """First index >= start where `anchor` matches as a contiguous run, else None."""
+    n = len(anchor)
+    if n == 0:
+        return None
+    for i in range(start, len(words_norm) - n + 1):
+        if words_norm[i:i + n] == anchor:
+            return i
+    return None
+
+
+def anchored_internal_cuts(caption: str, anchors: list[str], dur: float,
+                           vo_path: Path) -> tuple[list[float], list[str]] | None:
+    """Cut times + re-sliced captions from explicit editorial phrase anchors.
+
+    For a k-shot scene with k-1 anchor phrases: map each phrase to the time it is
+    actually spoken (forced-alignment word stream) and return the k-1 internal
+    boundary times PLUS the caption re-sliced at those boundaries (so the soft SRT
+    the assembler builds from caption_text stays matched to the new picture cuts).
+    Returns None — the caller falls back to the even-split / proportional timing —
+    on ANY failure: no VO, low-confidence alignment, an anchor that doesn't
+    resolve, anchors out of order, or non-increasing cuts. So the directive can
+    only ever sharpen timing, never break assembly.
+    """
+    if not anchors or dur is None or dur <= 0 or not vo_path.is_file():
+        return None
+    am = _align_module()
+    try:
+        result = am.load_or_align(vo_path, caption)
+    except SystemExit:
+        return None  # align_vo.die() on a bad clip must not abort the build
+    words = result.get("words") or []
+    if not words or result.get("match_rate", 0.0) < _MIN_MATCH_RATE:
+        return None
+    words_norm = [_anorm(w.get("text", "")) for w in words]
+    cuts: list[float] = []
+    idx = 1  # a boundary can't sit at word 0
+    for ph in anchors:
+        pos = _find_subseq(words_norm, _atoks(ph), idx)
+        if pos is None:
+            return None
+        cuts.append(round(float(words[pos]["start"]), 3))
+        idx = pos + 1
+    bounds = [0.0, *cuts, dur]
+    if any(bounds[j] >= bounds[j + 1] for j in range(len(bounds) - 1)):
+        return None
+    # Re-slice the caption: each scripted word joins the shot whose [lo, hi) window
+    # holds its spoken start (the last window runs to clip end).
+    captions: list[str] = []
+    for j in range(len(bounds) - 1):
+        lo, hi = bounds[j], bounds[j + 1]
+        is_last = j == len(bounds) - 2
+        chunk = [w.get("text", "") for w in words
+                 if lo <= float(w["start"]) < hi or (is_last and float(w["start"]) >= hi)]
+        captions.append(re.sub(r"\s+", " ", " ".join(chunk)).strip())
+    return cuts, captions
+
+
 # --- duration probing ------------------------------------------------------
 
 def ffprobe_seconds(mp3: Path) -> float | None:
@@ -252,8 +376,18 @@ def author_image_manifest(shots: list[dict], vid: str, images_out: Path) -> dict
     images = []
     for s in shots:
         entry = {"name": f"{vid}_Shot_{s['id']}", "prompt": s["prompt"]}
-        if s["no_char"]:
-            entry["use_references"] = False
+        # GENERIC-CHARACTER GUARD (2026-06-18): we deliberately do NOT strip the
+        # locked "Three" reference sheets, even on shots tagged "no character".
+        # Withholding the references is exactly what let gpt-image-2 hallucinate a
+        # GENERIC stranger onto Video_02's end screen (Shot_13a): a no-ref
+        # end-screen "card" prompt still rendered a person, and with no reference
+        # in context that person was off-model. Keeping the sheets attached costs
+        # ~$0.006/image but GUARANTEES that any human the model draws is
+        # conditioned on Three — so a generic character can't be generated. The
+        # PROMPT text (not ref-stripping) is what controls whether a character
+        # appears at all, so `use_references` is left at its default (True) for
+        # every shot; nothing sets it False here. (The `no_char` flag is retained
+        # in the shot model for reporting but no longer changes reference wiring.)
         images.append(entry)
     return {
         "project": vid,
@@ -357,7 +491,8 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
                          align: bool = False,
                          fit: str | None = None,
                          still: bool = False,
-                         include_cta: bool = True) -> tuple[dict, bool, list[str], list[int], list[str]]:
+                         include_cta: bool = True,
+                         edit_anchors: dict[int, list[str]] | None = None) -> tuple[dict, bool, list[str], list[int], list[str]]:
     """Author the video_factory edit manifest.
 
     `allow_image_fallback` (set only for an explicit `--image-set`) lets a shot
@@ -370,6 +505,12 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     aligned cleanly silently keeps the proportional split, so --align only ever
     sharpens timing. `fit` overrides the manifest's default fit ("contain" when
     unset); pass "cover" to keep V1's original crop-to-fill look.
+
+    `edit_anchors` (from parse_cut_anchors): optional per-scene editorial cut
+    phrases. When --align is on and a scene supplies exactly k-1 anchors that all
+    resolve, picture cuts land on those narrative beats (and the caption is
+    re-sliced to match) instead of the even-sentence boundaries — falling back to
+    the even-split/proportional timing on any miss.
 
     Returns (manifest, all_vo_present, image_fallbacks, undetermined_scenes,
     align_notes). `undetermined_scenes` lists multi-shot scenes whose per-shot
@@ -401,17 +542,33 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             dur = cadence.get(scene)  # fallback: shot-list cadence table
         caption = kit.get(scene, {}).get("caption", "")
         cap_parts = split_scene(caption, k)
-        # Real-speech cut times (k-1 internal boundaries) when --align is on and
-        # the scene aligns cleanly; None means keep the proportional estimate.
-        align_cuts = None
+        # Cut timing, in order of preference (only when --align is on and k > 1):
+        #   1. explicit editorial Cut-anchors mapped to real spoken time
+        #      (+ caption re-sliced at those cuts);
+        #   2. even-sentence word boundaries mapped to real spoken time;
+        #   3. the caption character-proportion estimate.
+        # Each step falls back to the next on any failure, so timing only sharpens.
+        anchor_cuts = None      # k-1 boundary times from editorial anchors
+        anchor_caps = None      # per-shot caption re-slice that matches anchor_cuts
+        align_cuts = None       # k-1 boundary times from even-split alignment
         if align and dur is not None and k > 1:
-            align_cuts = aligned_internal_cuts(caption, cap_parts, dur, vo_path)
-            align_notes.append(
-                f"scene {scene}: real-speech cut timing ({k} shots)" if align_cuts is not None
-                else f"scene {scene}: alignment unavailable/low-confidence — kept proportional timing")
+            a = (edit_anchors or {}).get(scene)
+            if a and len(a) == k - 1:
+                res = anchored_internal_cuts(caption, a, dur, vo_path)
+                if res is not None:
+                    anchor_cuts, anchor_caps = res
+            if anchor_cuts is not None:
+                align_notes.append(f"scene {scene}: editorial cut-anchors ({k} shots)")
+            else:
+                align_cuts = aligned_internal_cuts(caption, cap_parts, dur, vo_path)
+                align_notes.append(
+                    f"scene {scene}: real-speech cut timing ({k} shots)" if align_cuts is not None
+                    else f"scene {scene}: alignment unavailable/low-confidence — kept proportional timing")
         cum = 0.0  # cumulative fraction of the clip consumed by prior shots
         for i, s in enumerate(scene_shots):
             text, weight = cap_parts[i]
+            if anchor_caps is not None:           # caption re-sliced at the anchors
+                text = anchor_caps[i]
             image_rel, fb = _resolve_image(asset_dir, images_rel, vid, scene, s["id"], allow_image_fallback)
             if fb:
                 fallbacks.append(fb)
@@ -425,9 +582,11 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             }
             mi += 1
             if dur is not None and k > 1:
-                if align_cuts is not None:
-                    # Real word-boundary times: [0, cut1, …, cut(k-1), clip end].
-                    bounds = [0.0, *align_cuts, dur]
+                fixed_cuts = anchor_cuts if anchor_cuts is not None else align_cuts
+                if fixed_cuts is not None:
+                    # Word-boundary times: [0, cut1, …, cut(k-1), clip end]. From
+                    # editorial anchors when present, else even-split alignment.
+                    bounds = [0.0, *fixed_cuts, dur]
                     shot["start"] = round(bounds[i], 3)
                     if i < k - 1:                       # tail omits end -> clip end
                         shot["end"] = round(bounds[i + 1], 3)
@@ -555,6 +714,7 @@ def main() -> None:
     vo_out = vlt / f"Voice_Files/{vid}_gen"
 
     shots, cadence = parse_shot_list(shot_list)
+    edit_anchors = parse_cut_anchors(shot_list.read_text(encoding="utf-8"))
     kit = parse_kit(vo_kit)
 
     # Warn if the kit and shot list disagree on which scenes exist — a mismatch
@@ -593,6 +753,7 @@ def main() -> None:
         vlt / "Footage_and_Edits", f"{vid}_v2",
         allow_image_fallback=bool(args.image_set),
         fit=args.fit, still=args.still, include_cta=not args.no_cta,
+        edit_anchors=edit_anchors,
     )
     # Key the edit manifest by BOTH its image set and its VO source so distinct
     # asset combinations (e.g. `_gen`+`_gen` vs `Video_01_HD`+hand-VO) never
@@ -647,7 +808,7 @@ def main() -> None:
             vlt / "Footage_and_Edits", f"{vid}_v2",
             allow_image_fallback=bool(args.image_set),
             align=args.align, fit=args.fit, still=args.still,
-            include_cta=not args.no_cta,
+            include_cta=not args.no_cta, edit_anchors=edit_anchors,
         )
         for fb in fallbacks:
             print(f"  ⚠ image fallback — {fb}")
