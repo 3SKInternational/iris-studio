@@ -1,0 +1,13 @@
+{
+  "canvas": [2048, 1152],
+  "base_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Raw_Assets/Video_02_fix_staging",
+  "out_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Raw_Assets/Video_02_fix_staging",
+  "suffix": "_text",
+  "defaults": {"weight": "bold", "align": "center", "anchor": "mm"},
+  "cards": {
+    "Video_02_Shot_13a": [
+      {"text": "NEXT VIDEO", "x": 0.19, "y": 0.20, "size": 48, "color": "charcoal"},
+      {"text": "SUBSCRIBE", "x": 0.83, "y": 0.76, "size": 48, "color": "red"}
+    ]
+  }
+}
