@@ -72,7 +72,8 @@ def main() -> None:
     print(
         f"\nsummary: {summary['checked']} checked · {summary['added']} added · "
         f"{summary['updated']} updated · {summary['skipped']} present/skipped · "
-        f"{summary['no_srt']} missing-srt · {summary['errors']} errors"
+        f"{summary['no_srt']} missing-srt · {summary['transient']} transient · "
+        f"{summary['errors']} errors"
     )
     # Non-zero exit on any per-video error so a scheduled run surfaces a real problem
     # (the launchd wrapper turns a non-zero exit into a Telegram alert).

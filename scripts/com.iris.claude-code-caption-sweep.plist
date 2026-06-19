@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-caption-sweep</string>
+	<!-- DRAFT (not yet deployed) — caption verify-and-backfill sweep.
+	     Runs scripts/sweep_captions.py once daily at a quiet slot. For every video
+	     with an upload receipt it does a cheap captions.list (~50 units): if our
+	     managed "English" track is present it SKIPS; if missing it attaches the
+	     timed SRT (~400 units). Idempotent — never duplicates a track, never lets
+	     YouTube re-sync (sync=false).
+
+	     Why scheduled AND inline: upload_video.py already runs this same sweep
+	     immediately after each upload, but a brand-new video can still be
+	     processing when its inline insert fires (which then silently fails). This
+	     daily pass catches that straggler later, while skipping every video that's
+	     already fine. Captions don't drift on their own, so daily (not hourly) is
+	     enough — heals a same-day straggler by next morning, no redundant
+	     list-storms in steady state.
+
+	     Routed through run_job.sh: sweep_captions.py exits 1 only on a real
+	     per-video API error (quota/scope/HTTP) — that becomes a 🔴 Telegram alert
+	     and a retry-queue marker. A missing-SRT video exits 0 (benign, no alert),
+	     matching the script's exit contract. JOB_QUIET_OK=1 suppresses the routine
+	     daily ✅ so steady-state runs stay silent; only failures ping Steve.
+
+	     Interpreter: the repo .venv python3 (NOT system python3) — the sweep imports
+	     google-api-python-client / google-auth, which live in the venv. The OAuth
+	     token is read from REPO_ROOT/youtube_token.json (gitignored, 0600), resolved
+	     from the module path, so cwd is irrelevant; WorkingDirectory is set for
+	     parity only. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
+		<string>caption-sweep</string>
+		<string>/Volumes/AI_Workspace/iris_studio/.venv/bin/python3</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/sweep_captions.py</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Volumes/AI_Workspace/iris_studio</string>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Silence the routine daily ✅; failures (exit 1) still alert via run_job. -->
+		<key>JOB_QUIET_OK</key>
+		<string>1</string>
+	</dict>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-caption-sweep.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-caption-sweep.stdout.log</string>
+	<!-- Daily at 04:35 local (ET) — a free slot between vault-gardener (04:10),
+	     credential-check (04:15), pipeline-heartbeat (04:50) and pre-brief (05:00). -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>35</integer>
+	</dict>
+	<!-- Parity with the suite: google-api client + MCP-style fd use can exceed
+	     launchd's default soft RLIMIT_NOFILE of 256. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>

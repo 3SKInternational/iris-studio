@@ -334,6 +334,20 @@ def set_thumbnail(youtube, video_id: str, thumb: Path) -> bool:
 
 # --- caption sweep (verify-and-backfill across all uploaded videos) ---------
 
+def _is_transient_api_error(exc: Exception) -> bool:
+    """True for a blip worth waiting out — a network/SSL/timeout error, or an HTTP
+    5xx/429 — versus a HARD error (quota 403, bad scope 401/403, 404, config) that
+    needs Steve's attention. The daily sweep pages only on hard errors; a transient
+    one is logged and left for the next sweep (or the inline post-upload attach) to
+    heal, so a one-off hiccup never red-alerts an unattended run."""
+    from googleapiclient.errors import HttpError  # lazy: keep import cost off cold paths
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        return status in RETRIABLE_STATUS or status == 429
+    # ConnectionError, socket.timeout, ssl.SSLError, TimeoutError all subclass OSError.
+    return isinstance(exc, OSError)
+
+
 def iter_upload_receipts(vlt: Path):
     """Yield (video_label, video_id, receipt_path, receipt_dict) for every upload
     receipt that carries a YouTube video_id. These receipts are the canonical map
@@ -361,10 +375,14 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
     attach: a brand-new upload can still be processing when its inline caption
     insert runs, so it may miss; the next sweep catches the straggler while skipping
     every video that's already fine. Per-video best-effort — one error never aborts
-    the sweep. Returns a summary dict.
+    the sweep. Errors are split: a HARD error (quota/scope/4xx) counts toward
+    ``errors`` (drives a non-zero exit → Telegram alert on the scheduled job); a
+    transient network/5xx/429 blip counts toward ``transient`` only (logged, left
+    for the next sweep to heal) so an unattended run never pages on a hiccup.
+    Returns a summary dict.
     """
     summary = {"checked": 0, "added": 0, "updated": 0, "skipped": 0,
-               "no_srt": 0, "errors": 0}
+               "no_srt": 0, "transient": 0, "errors": 0}
     only_label = normalize_id(only)[0] if only else None
     for label, video_id, rp, data in iter_upload_receipts(vlt):
         if only_label and label != only_label:
@@ -373,10 +391,13 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
         srt = vlt / "Footage_and_Edits" / f"{label}_v2.srt"
         try:
             existing = find_managed_caption_track(youtube, video_id)
-        except Exception as exc:  # network/API blip — skip this one, keep sweeping.
+        except Exception as exc:  # API/network failure — skip this one, keep sweeping.
+            transient = _is_transient_api_error(exc)
+            kind = "transient" if transient else "errors"
             print(f"  ⚠ {label} ({video_id}): caption check failed "
-                  f"({type(exc).__name__}: {exc})", file=sys.stderr)
-            summary["errors"] += 1
+                  f"({'transient ' if transient else ''}{type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+            summary[kind] += 1
             continue
         if existing and not force:
             print(f"  ✓ {label} ({video_id}): captions present — skip")
@@ -395,9 +416,12 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
         try:
             action = upsert_captions(youtube, video_id, srt)
         except Exception as exc:
+            transient = _is_transient_api_error(exc)
+            kind = "transient" if transient else "errors"
             print(f"  ⚠ {label} ({video_id}): caption upload failed "
-                  f"({type(exc).__name__}: {exc})", file=sys.stderr)
-            summary["errors"] += 1
+                  f"({'transient ' if transient else ''}{type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+            summary[kind] += 1
             continue
         verb = "updated" if action == "update" else "added"
         print(f"  ✅ {label} ({video_id}): captions {verb} from {srt.name}")
@@ -620,7 +644,8 @@ def main() -> None:
             s = sweep_captions(youtube, vlt)
             print(f"  caption sweep: {s['checked']} checked · {s['added']} added · "
                   f"{s['updated']} updated · {s['skipped']} present · "
-                  f"{s['no_srt']} missing-srt · {s['errors']} errors")
+                  f"{s['no_srt']} missing-srt · {s['transient']} transient · "
+                  f"{s['errors']} errors")
         except Exception as exc:  # never let the sweep sink a good upload.
             print(f"  ⚠ caption sweep skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
