@@ -275,6 +275,11 @@ def main() -> None:
     if not kit_path.is_file():
         die(f"kit not found: {kit_path}")
     blocks = parse_kit(kit_path)
+    # parse_kit dies on zero scene headers, but a kit whose headers all carry empty
+    # narration parses to an empty list — which would otherwise fall through to the
+    # "nothing to do" exit 0 below and silently produce no mp3s. Treat it as fatal.
+    if not blocks:
+        die(f"{kit_path.name} has scene headers but no narration text under any of them.")
 
     voice_id = args.voice_id or load_dotenv_value(script_dir, "ELEVENLABS_VOICE_ID") or DEFAULT_VOICE_ID
     model = args.model or DEFAULT_MODEL

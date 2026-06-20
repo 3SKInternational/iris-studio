@@ -66,6 +66,21 @@ def vault() -> Path:
     return Path(os.path.expanduser(os.environ.get("SK_VAULT", DEFAULT_VAULT))).resolve()
 
 
+def _vo_generated_blocks(vo_kit: Path) -> list[dict]:
+    """The exact [{scene, filename, text}] generate_vo would write for this kit.
+
+    Loaded from generate_vo's own parser so the post-stage artifact check can never
+    drift from what the generator actually produces (it skips empty-narration blocks
+    and keeps break-only ones; a second local parser would diverge on both). Only
+    called after a clean VO run, so its parse can't newly fail here."""
+    import importlib.util
+    path = REPO / "vo_factory" / "generate_vo.py"
+    spec = importlib.util.spec_from_file_location("generate_vo", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.parse_kit(vo_kit)
+
+
 def normalize_id(raw: str) -> tuple[str, str]:
     """'Video_01' | '01' | '1' -> ('Video_01', '01')."""
     m = re.search(r"(\d+)", raw)
@@ -825,19 +840,45 @@ def main() -> None:
             run([sys.executable, str(vo_gen), str(vo_kit), "--output", str(vo_out), "--dry-run"], label="VO cost preview")
         return
 
+    # Trust-but-verify: a generation subprocess that exits 0 without writing its
+    # artifacts would mark a stage "done" with nothing on disk, and a scheduled
+    # runner (run_claude_job.sh, watchdog.sh, pipeline_orchestrator) trusts that
+    # exit code to advance the pipeline. After any clean stage we confirm the
+    # expected files actually exist; a missing artifact forces a non-zero exit.
+    def _missing(label: str, paths: list[Path]) -> list[str]:
+        gone = [p for p in paths if not (p.is_file() and p.stat().st_size > 0)]
+        if gone:
+            print(f"error: {label} stage exited 0 but {len(gone)} expected "
+                  f"artifact(s) are missing/empty: {[str(p) for p in gone]}",
+                  file=sys.stderr)
+        return gone
+
     rc = 0
     if do_images:
         cmd = [sys.executable, str(img_gen), str(img_manifest_path)]
         if args.force:
             cmd.append("--force")
-        rc |= run(cmd, label="STAGE images (billed)")
+        img_rc = run(cmd, label="STAGE images (billed)")
+        rc |= img_rc
+        if img_rc == 0:
+            want = [images_out / f"{img['name']}.png" for img in img_manifest["images"]]
+            if want and _missing("images", want):
+                rc |= 1
     if do_vo:
         if not vo_kit.is_file():
             die(f"VO kit not found: {vo_kit}")
         cmd = [sys.executable, str(vo_gen), str(vo_kit), "--output", str(vo_out)]
         if args.force:
             cmd.append("--force")
-        rc |= run(cmd, label="STAGE vo (billed)")
+        vo_rc = run(cmd, label="STAGE vo (billed)")
+        rc |= vo_rc
+        if vo_rc == 0:
+            # Verify against generate_vo's OWN parser so the expected set is exactly
+            # the clips it writes — it skips empty-narration blocks but keeps
+            # break-only ones, a divergence build_video's caption parser would miss.
+            want = [vo_out / b["filename"] for b in _vo_generated_blocks(vo_kit)]
+            if want and _missing("vo", want):
+                rc |= 1
     if do_assemble:
         # Re-author the edit manifest now that VO clips should exist (exact
         # durations). With --align this is where local forced alignment runs, so
@@ -861,7 +902,12 @@ def main() -> None:
                 f"timing (missing VO mp3 AND no cadence entry): {undetermined}. "
                 "Generate the VO clips (or add cadence entries) first.")
         write_json(edit_manifest_path, edit_manifest)
-        rc |= run([sys.executable, str(assembler), str(edit_manifest_path)], label="STAGE assemble (free)")
+        asm_rc = run([sys.executable, str(assembler), str(edit_manifest_path)], label="STAGE assemble (free)")
+        rc |= asm_rc
+        if asm_rc == 0:
+            out_mp4 = vlt / "Footage_and_Edits" / f"{vid}_v2.mp4"
+            if _missing("assemble", [out_mp4]):
+                rc |= 1
 
     if rc:
         raise SystemExit(1)
