@@ -114,6 +114,7 @@ RUN_TABLE: dict[str, dict] = {
     "5_images":      {"kind": "billed", "agent": None,                       "timeout": 3600},
     "6_assemble":    {"kind": "script", "agent": None,                       "timeout": 1800},
     "7_packaging":   {"kind": "agent",  "agent": "packaging-strategist",     "timeout": 480},
+    "8_thumbnail":   {"kind": "script", "agent": None,                       "timeout": 600},
     "9_description": {"kind": "agent",  "agent": "video-description-writer",  "timeout": 600},
     "11_analyze":    {"kind": "agent",  "agent": "channel-analyst",          "timeout": 720},
 }
@@ -121,9 +122,14 @@ RUN_TABLE: dict[str, dict] = {
 # Human-artifact gates that CAN auto-promote needs-steve→done when a real
 # artifact lands on disk (non-empty AND fresher than deps). Only gates with a
 # fixed, unambiguous on-disk artifact convention are listed. Gates NOT here
-# (3 vo_expand, 8 thumbnail, 10 publish) have no fixed local artifact path, so
-# they NEVER auto-promote — Steve clears them by hand-editing status:done (the
+# (3 vo_expand, 10 publish) have no fixed local artifact path, so they NEVER
+# auto-promote — Steve clears them by hand-editing status:done (the
 # always-available manual exit). The orchestrator never guesses.
+# NOTE on 8 thumbnail: for videos initialised AFTER 2026-06-20 it is an
+# orchestrator-run $0 script-stage (the thumbnail ART renders inside the stage-5
+# billed batch, then card_overlay.py burns the title text), so it advances via
+# --advance, not via this promote table. Legacy in-flight state files that still
+# carry 8 as a steve-gate keep the manual hand-edit exit — unchanged.
 #   path_tmpl: vault-relative, "NN" is the zero-padded video number
 #   kind: "dir" (≥1 file of `ext`, total size>0) | "file" (size>0)
 GATE_ARTIFACTS: dict[str, dict] = {
@@ -308,7 +314,11 @@ def default_stages() -> dict:
         "5_images":      _stage("steve",        True,  ["2_review"]),
         "6_assemble":    _stage("orchestrator", False, ["4_vo_record", "5_images"]),
         "7_packaging":   _stage("orchestrator", False, ["2_review"]),
-        "8_thumbnail":   _stage("steve",        True,  ["7_packaging"]),
+        # Thumbnail ART renders in the stage-5 billed batch (Video_NN_Thumbnail_A/_B
+        # entries in video_NN_hd.json, already cleared by the stage-5 RENDERS gate);
+        # this stage is the $0 deterministic title-text burn (card_overlay.py). Needs
+        # BOTH the rendered art (5_images) and the approved overlay text (7_packaging).
+        "8_thumbnail":   _stage("orchestrator", False, ["5_images", "7_packaging"]),
         "9_description": _stage("orchestrator", False, ["2_review"]),
         "10_publish":    _stage("steve",        True,  ["6_assemble", "8_thumbnail", "9_description"]),
         "11_analyze":    _stage("orchestrator", False, ["10_publish"]),
@@ -600,8 +610,11 @@ def _stage_prompt(key: str, video: int) -> str:
 
 
 def run_script_stage(key: str, video: int) -> tuple[bool, str]:
-    """Stage 6 assemble: a SINGLE build_video.py --assemble call (it drives
-    assemble.py itself). MUST pass --assemble; MUST NEVER pass --images/--vo."""
+    """Local $0 factory stages. Stage 6 assemble: a SINGLE build_video.py
+    --assemble call. Stage 8 thumbnail: a SINGLE card_overlay.py title-text burn.
+    MUST pass --assemble; MUST NEVER pass --images/--vo."""
+    if key == "8_thumbnail":
+        return run_thumbnail_overlay_stage(video)
     if key != "6_assemble":
         return False, f"no script executor for stage {key}"
     # Pass B — pre-assemble RENDERS review, pinned to the SAME billed manifest the
@@ -642,6 +655,104 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, f"build_video.py exited {proc.returncode}: {(proc.stderr or '')[-500:]}"
     return True, (proc.stdout or "").strip()[-300:]
+
+
+def _warn_thumbnail_name_drift(video: int, manifest_abs: Path) -> None:
+    """$0 pre-spend guard: if the stage-8 overlay spec exists, warn when it defines
+    a thumbnail card with no matching image entry in the billed manifest (the names
+    must agree or stage 8 parks after spend). Best-effort and silent on any read
+    error or when the spec isn't authored yet — never blocks the billed path."""
+    spec_abs = ROOT / f"image_factory/thumb_overlay_v{nn(video)}.json"
+    if not spec_abs.exists():
+        return
+    try:
+        spec_cards = set(json.loads(spec_abs.read_text()).get("cards", {}))
+        manifest_names = {
+            img.get("name") for img in json.loads(manifest_abs.read_text()).get("images", [])
+        }
+    except (json.JSONDecodeError, OSError):
+        return
+    missing = sorted(c for c in spec_cards if c not in manifest_names)
+    if missing:
+        notify(f"⚠️ Video {video}: overlay spec card(s) {missing} have no matching image "
+               f"entry in the billed manifest — stage-8 thumbnail burn would park for "
+               f"these. Fix the name(s) before spending, or the variant won't render.")
+
+
+def run_thumbnail_overlay_stage(video: int) -> tuple[bool, str]:
+    """Stage 8 thumbnail: a deterministic, $0 title-text burn — NO generation,
+    NO billing. The thumbnail ART (Video_NN_Thumbnail_A/_B.png) was rendered in
+    the SAME stage-5 billed batch as the scene shots (scene-image-prompt-generator
+    appends those entries to video_NN_hd.json) and has already cleared the stage-5
+    RENDERS on-model gate, so by here it sits in Raw_Assets/Video_NN_HD. Assembly
+    ignores it (build_video pulls only `<vid>_Shot_<id>.png` named in the shot
+    list, never `<vid>_Thumbnail_*`). This stage composites the packaging-approved
+    title text onto that art via card_overlay.py (PIL) into Thumbnails/Video_NN_gen.
+
+    Missing inputs return False so the stage parks for a human (after the normal
+    retry budget) rather than silently advancing publish with no thumbnail:
+      - overlay spec absent  -> thumbnail-coordinator never emitted it
+      - thumbnail art absent -> the stage-5 batch lacked the Thumbnail entries
+    """
+    vid = f"Video_{nn(video)}"
+    spec_rel = f"image_factory/thumb_overlay_v{nn(video)}.json"
+    spec_abs = ROOT / spec_rel
+    if not spec_abs.exists():
+        return False, (f"thumbnail overlay spec missing ({spec_rel}); thumbnail-coordinator "
+                       f"must emit it from the approved packaging title text.")
+    try:
+        spec_cards = set(json.loads(spec_abs.read_text()).get("cards", {}))
+    except (json.JSONDecodeError, OSError) as e:
+        return False, f"thumbnail overlay spec {spec_rel} unreadable: {e}"
+    art_dir = vault_abs(f"{VAULT_REL}/Raw_Assets/{vid}_HD")
+    # Burn ONLY the variants whose backplate actually rendered (excluding any
+    # already-composited *_FINAL) AND that the spec defines a card for. card_overlay
+    # hard-fails both on a missing backplate AND on an --only name absent from the
+    # spec, so intersect the two; if the intersection is empty, park for a human.
+    rendered = {
+        p.stem for p in (art_dir.glob(f"{vid}_Thumbnail_*.png") if art_dir else [])
+        if not p.stem.endswith("_FINAL")
+    }
+    backplates = sorted(rendered & spec_cards)
+    if not backplates:
+        return False, (f"no overlay-able thumbnail variant for {vid}: rendered backplates "
+                       f"{sorted(rendered) or '[]'} vs spec cards {sorted(spec_cards) or '[]'}. "
+                       f"The stage-5 batch must render Video_NN_Thumbnail entries whose names "
+                       f"match the {spec_rel} card keys.")
+    out_abs = vault_abs(f"{VAULT_REL}/Thumbnails/{vid}_gen")
+    out_abs.mkdir(parents=True, exist_ok=True)
+    cfg = RUN_TABLE["8_thumbnail"]
+    cmd = [
+        sys.executable, "image_factory/card_overlay.py", str(spec_abs),
+        "--base-dir", str(art_dir), "--out-dir", str(out_abs), "--suffix", "_FINAL",
+    ]
+    for name in backplates:
+        cmd += ["--only", name]
+    try:
+        proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
+                              text=True, timeout=cfg["timeout"])
+    except subprocess.TimeoutExpired:
+        return False, f"card_overlay.py timed out after {cfg['timeout']}s"
+    if proc.returncode != 0:
+        return False, f"card_overlay.py exited {proc.returncode}: {(proc.stderr or '')[-500:]}"
+    finals = list(out_abs.glob(f"{vid}_Thumbnail_*_FINAL.png"))
+    if not finals:
+        return False, "card_overlay.py ran 0-exit but produced no *_FINAL.png"
+    # A/B completeness: the feature ships TWO variants. If the spec defines cards we
+    # could NOT burn (a variant's backplate failed to render in the stage-5 batch),
+    # we still advance on whatever rendered — a usable thumbnail beats parking the
+    # whole publish on a non-critical A/B alt — but we must NOT do it silently. Emit
+    # a Telegram warning and surface the gap in the stage message.
+    dropped = sorted(spec_cards - set(backplates))
+    if dropped:
+        notify(f"⚠️ Video {video} stage-8 thumbnail: burned {sorted(backplates)} but "
+               f"spec variant(s) {dropped} had no rendered backplate — shipping "
+               f"{len(finals)} of {len(spec_cards)} thumbnail variants. Re-render the "
+               f"missing variant if A/B coverage is needed.")
+    tail = (proc.stdout or "").strip()[-220:]
+    note = f"burned {len(finals)}/{len(spec_cards)} variants" + (
+        f"; DROPPED {dropped}" if dropped else "")
+    return True, (f"{note}. {tail}").strip()
 
 
 # === Image-review gate (image-reviewer subagent) ==========================
@@ -1155,6 +1266,7 @@ def stage_artifact_path(key: str, video: int) -> str | None:
         "2_review": f"{VAULT_REL}/Scripts/_REVIEW_PREP",
         "6_assemble": f"{VAULT_REL}/Footage_and_Edits/{v}_v2.mp4",
         "7_packaging": f"{VAULT_REL}/Packaging",
+        "8_thumbnail": f"{VAULT_REL}/Thumbnails/{v}_gen",
         "9_description": f"{VAULT_REL}/Video_Descriptions/{v}_Description.md",
         "11_analyze": f"{VAULT_REL}/Channel_Intelligence/Analytics",
         "5_images": f"{VAULT_REL}/Raw_Assets/{v}_HD",
@@ -1426,6 +1538,15 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
         print(line)
         notify(line)
         return 2
+
+    # Thumbnail A/B name-drift guard (best-effort, $0). The stage-8 overlay burn
+    # intersects rendered backplates with the overlay spec's card keys; if the two
+    # agents authored mismatched names, stage 8 would park AFTER this billed spend.
+    # When the overlay spec already exists at spend time, surface any spec card that
+    # has no matching manifest image entry NOW (a warning, not a block — the bulk
+    # value here is the scene shots; we don't refuse the whole batch over a
+    # secondary thumbnail name, but we make the gap loud so it's fixed before stage 8).
+    _warn_thumbnail_name_drift(video, manifest_abs)
 
     # Pass A — pre-spend PROMPTS gate, run as a CLOSED review→fix→re-review loop
     # (image-reviewer flags → scene-image-prompt-generator fixes the manifest →
