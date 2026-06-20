@@ -524,7 +524,31 @@ AGENTS_DIR = Path(os.path.expanduser("~/.claude/agents"))
 
 
 def run_agent_stage(key: str, video: int, stages: dict) -> tuple[bool, str]:
+    """Route an agent stage to its executor under the BINARY quality-control policy
+    (Steve, 2026-06-20: every step has a review + feedback-loop gate).
+
+    - Stage 2 is REVIEW-ONLY (stage 1 produced the script): run the script
+      review→fix→re-review loop and advance only on a clean SHIP.
+    - The producer stages that emit a billable/publishable artifact (7 packaging,
+      9 description, 11 analyze) are PRODUCE-THEN-REVIEW: dispatch the producer,
+      then a dedicated specialist reviewer gates the output through the same
+      binary loop before the stage can mark done.
+    - Everything else is a plain producer dispatch.
+
+    Each gate owns its own agent-availability handling (a missing reviewer →
+    UNAVAILABLE → fail-open with a Telegram warning), so a content stage never
+    wedges on review tooling being down."""
+    if key == "2_review":
+        return run_script_review_gate(video)
+    if key in STAGE_REVIEW:
+        return run_stage_review_gate(key, video)
+    return _dispatch_stage_agent(key, video)
+
+
+def _dispatch_stage_agent(key: str, video: int) -> tuple[bool, str]:
     """Dispatch a claude subagent exactly as iris.py:_run_dispatch does, blocking.
+    This is the bare PRODUCER dispatch (no review) — the review gates call it as
+    their produce step, and run_agent_stage calls it directly for ungated stages.
 
     H2 (no silent stall): the agent definition file is what `claude --agent`
     actually needs. If it is missing, hard-error + Telegram alert + non-zero
@@ -533,12 +557,6 @@ def run_agent_stage(key: str, video: int, stages: dict) -> tuple[bool, str]:
     top-level side-effects under the venv. The run-table here is the orchestrator's
     own authoritative envelope, and the agent-file check is H2 against the real
     source of truth the dispatch consumes.)"""
-    # Stage 2 is a GATE, not a plain dispatch: route it through the BINARY
-    # review→fix→re-review loop so a REVISE script cannot mark the stage done and
-    # advance. run_script_review_gate owns its own agent-availability handling
-    # (missing reviewer → UNAVAILABLE → fail-open, with a Telegram warning).
-    if key == "2_review":
-        return run_script_review_gate(video)
     cfg = RUN_TABLE[key]
     agent = cfg["agent"]
     agent_file = AGENTS_DIR / f"{agent}.md"
@@ -936,6 +954,198 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
         return True, f"script-review UNAVAILABLE — advanced fail-open ({detail})"
     return False, (f"script-reviewer {verdict} on the script after auto-fix — refusing to "
                    f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})")
+
+
+# === Generic producer-stage review gate (every-step QC, Steve 2026-06-20) ====
+# The PRODUCE-THEN-REVIEW analogue of the stage-2 script gate, generalised across
+# every producer stage that emits a publishable artifact but previously had NO
+# review gate. Each stage names a dedicated specialist REVIEWER (binary SHIP /
+# REVISE) and reuses its own PRODUCER as the FIXER (edits in place; $0). The flow
+# per stage: produce → review → (fix → re-review)* → advance ONLY on a clean SHIP.
+# UNAVAILABLE fails OPEN (free content path must not wedge on review tooling being
+# down). Everything reuses the proven image/script-gate machinery: _parse_image_
+# verdict, the IMAGE_REVIEW_MAX_FIX_ATTEMPTS budget, TimeoutExpired+OSError
+# graceful degradation. The reviewer defs live in ~/.claude/agents/.
+STAGE_REVIEW: dict[str, dict] = {
+    "7_packaging": {
+        "reviewer": "packaging-reviewer",
+        "fixer": "packaging-strategist",
+        "verdict_tmpl": f"{VAULT_REL}/Packaging/_REVIEW/Video_NN_Packaging_Review.md",
+        "review_prompt": (
+            "Review the packaging for {v} (BRANDS/3SK_Finance/Packaging/) — the title "
+            "variants, cold-open hooks, thumbnail text overlays, and CTR rationale — "
+            "against the Discoverability_Playbook and the first-generation-wealth moat. "
+            "WRITE your verdict to {verdict_rel} including a one-line 'VERDICT:' line. The "
+            "verdict is BINARY: SHIP (every element is 100% good to go) or REVISE (anything "
+            "less — list every fix under REVISE). There is no 'ship with fixes': if it is "
+            "not all good to go, none of it goes."
+        ),
+        "fix_prompt": (
+            "packaging-reviewer flagged the {v} packaging as not yet shippable. Read its "
+            "review at {verdict_rel} and FIX the packaging in BRANDS/3SK_Finance/Packaging/ "
+            "IN PLACE: apply every fix it lists (title quality, hook strength, thumbnail "
+            "text, CTR rationale, moat alignment). PRESERVE the Discoverability_Playbook "
+            "format and every already-passing element UNCHANGED. Write the corrected "
+            "packaging back to the same path(s)."
+        ),
+    },
+    "9_description": {
+        "reviewer": "description-reviewer",
+        "fixer": "video-description-writer",
+        "verdict_tmpl": f"{VAULT_REL}/Video_Descriptions/_REVIEW/Video_NN_Description_Review.md",
+        "review_prompt": (
+            "Review the YouTube upload pack for {v} (BRANDS/3SK_Finance/Video_Descriptions/"
+            "{v}_Description.md) — description copy, chapter timestamps, FTC affiliate "
+            "disclosure, hashtags, pinned comment — against the Brand Bible voice and FTC "
+            "compliance. WRITE your verdict to {verdict_rel} including a one-line 'VERDICT:' "
+            "line. The verdict is BINARY: SHIP (every element is 100% good to go) or REVISE "
+            "(anything less — list every fix under REVISE). There is no 'ship with fixes': "
+            "if it is not all good to go, none of it goes."
+        ),
+        "fix_prompt": (
+            "description-reviewer flagged the {v} upload pack as not yet shippable. Read its "
+            "review at {verdict_rel} and FIX BRANDS/3SK_Finance/Video_Descriptions/"
+            "{v}_Description.md IN PLACE: apply every fix it lists (disclosure compliance, "
+            "timestamp accuracy, Brand Bible voice, hashtags, pinned comment). PRESERVE the "
+            "upload-pack structure and every already-passing section UNCHANGED. Write the "
+            "corrected pack back to the same path."
+        ),
+    },
+    "11_analyze": {
+        "reviewer": "analyze-reviewer",
+        "fixer": "channel-analyst",
+        "verdict_tmpl": f"{VAULT_REL}/Channel_Intelligence/Analytics/_REVIEW/Video_NN_Analysis_Review.md",
+        "review_prompt": (
+            "Review the performance analysis for {v} (BRANDS/3SK_Finance/Channel_Intelligence/"
+            "Analytics/) — verify EVERY claim is backed by an actual metric in the analytics "
+            "export (no fabricated or hallucinated numbers) and that the routed fixes for "
+            "scriptwriter + packaging are specific and actionable. WRITE your verdict to "
+            "{verdict_rel} including a one-line 'VERDICT:' line. The verdict is BINARY: SHIP "
+            "(every claim is metric-backed and every routed fix is actionable) or REVISE "
+            "(anything less — list every fix under REVISE). There is no 'ship with fixes': "
+            "if it is not all good to go, none of it goes."
+        ),
+        "fix_prompt": (
+            "analyze-reviewer flagged the {v} performance analysis as not yet shippable. Read "
+            "its review at {verdict_rel} and FIX the analysis in BRANDS/3SK_Finance/"
+            "Channel_Intelligence/Analytics/ IN PLACE: correct or remove any claim not backed "
+            "by a real metric, drop fabrication, and sharpen the routed fixes for scriptwriter "
+            "+ packaging into specific actionable items. PRESERVE every metric-backed finding "
+            "UNCHANGED. Write the corrected analysis back to the same path."
+        ),
+    },
+}
+
+
+def _stage_review_verdict_rel(key: str, video: int) -> str:
+    return STAGE_REVIEW[key]["verdict_tmpl"].replace("NN", nn(video))
+
+
+def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
+    """Dispatch a producer stage's dedicated reviewer and read back its BINARY
+    verdict. Returns (verdict, vrel, detail): SHIP (clean → advance), REVISE
+    (block), or UNAVAILABLE (could not run / no parseable VERDICT). Reuses the
+    shared _parse_image_verdict, which also ranks the retired SHIP WITH FIXES as
+    blocking so a drifting reviewer can't sneak it past."""
+    cfg = STAGE_REVIEW[key]
+    reviewer = cfg["reviewer"]
+    verdict_rel = _stage_review_verdict_rel(key, video)
+    agent_file = AGENTS_DIR / f"{reviewer}.md"
+    if not agent_file.exists():
+        return "UNAVAILABLE", verdict_rel, f"agent definition not found at {agent_file}"
+    v = f"Video_{nn(video)}"
+    timeout = RUN_TABLE[key]["timeout"]
+    prompt = cfg["review_prompt"].format(v=v, verdict_rel=verdict_rel)
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", reviewer,
+           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+           "--", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "UNAVAILABLE", verdict_rel, f"timed out after {timeout}s"
+    except OSError as e:
+        return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
+    if proc.returncode != 0:
+        return "UNAVAILABLE", verdict_rel, \
+            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+    verdict_abs = vault_abs(verdict_rel)
+    text = ""
+    if verdict_abs and verdict_abs.exists():
+        text = verdict_abs.read_text(encoding="utf-8", errors="replace")
+    verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
+    if verdict is None:
+        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in file or stdout"
+    return verdict, verdict_rel, f"{key} verdict {verdict}"
+
+
+def run_stage_fixer(key: str, video: int, verdict_rel: str) -> tuple[bool, str]:
+    """Dispatch a producer stage's own author to FIX its artifact per the reviewer
+    block — the generic analogue of run_script_fixer / run_prompt_fixer. Edits in
+    place; bills nothing. Returns (ran_ok, detail); ran_ok=False means the fixer
+    could not run (caller stops looping)."""
+    cfg = STAGE_REVIEW[key]
+    fixer = cfg["fixer"]
+    agent_file = AGENTS_DIR / f"{fixer}.md"
+    if not agent_file.exists():
+        return False, f"agent definition not found at {agent_file}"
+    v = f"Video_{nn(video)}"
+    timeout = RUN_TABLE[key]["timeout"]
+    prompt = cfg["fix_prompt"].format(v=v, verdict_rel=verdict_rel)
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", fixer,
+           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+           "--", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"{fixer} timed out after {timeout}s"
+    except OSError as e:
+        return False, f"{fixer} could not run (command not found): {e}"
+    if proc.returncode != 0:
+        return False, f"{fixer} exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+    return True, (proc.stdout or "").strip()[-200:]
+
+
+def run_stage_review_loop(key: str, video: int) -> tuple[str, str, str]:
+    """A producer stage's review→fix→re-review loop, mirroring run_script_review_
+    loop. Advances only on a clean SHIP; anything less drives a fixer dispatch and
+    a re-review, bounded by IMAGE_REVIEW_MAX_FIX_ATTEMPTS. UNAVAILABLE ends the loop
+    immediately (caller fails open). Returns the FINAL (verdict, vrel, detail)."""
+    verdict, vrel, detail = run_stage_review(key, video)
+    attempts = 0
+    while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
+        attempts += 1
+        ran, fdetail = run_stage_fixer(key, video, vrel)
+        if not ran:
+            return verdict, vrel, f"{detail}; fix attempt {attempts} could not run ({fdetail})"
+        verdict, vrel, detail = run_stage_review(key, video)
+    if attempts:
+        s = "s" if attempts != 1 else ""
+        detail = f"{detail} (after {attempts} auto-fix attempt{s})"
+    return verdict, vrel, detail
+
+
+def run_stage_review_gate(key: str, video: int) -> tuple[bool, str]:
+    """PRODUCE-THEN-REVIEW executor for a producer stage under the BINARY policy.
+    Step 1: dispatch the producer (the bare stage agent). If it fails to run, return
+    that failure unchanged — no point reviewing a non-existent artifact. Step 2: run
+    the review→fix→re-review loop and advance ONLY on a clean SHIP. UNAVAILABLE fails
+    OPEN (free content path must not wedge — warn + advance). REVISE (or any non-SHIP
+    surviving the fix budget) parks: returns False so the stage goes needs-steve."""
+    ok, out = _dispatch_stage_agent(key, video)
+    if not ok:
+        return False, out
+    verdict, vrel, detail = run_stage_review_loop(key, video)
+    if verdict == "SHIP":
+        return True, f"{STAGE_REVIEW[key]['reviewer']} SHIP ({vrel}). {detail}"
+    if verdict == "UNAVAILABLE":
+        notify(f"⚠️ Video {video}: {STAGE_REVIEW[key]['reviewer']} could not run the "
+               f"{key} review ({detail}) — advancing anyway (fail-open). Eyeball the output.")
+        return True, f"{key} review UNAVAILABLE — advanced fail-open ({detail})"
+    return False, (f"{STAGE_REVIEW[key]['reviewer']} {verdict} on the {key} output after "
+                   f"auto-fix — refusing to advance. Fix per {vrel}, then re-run "
+                   f"/pipeline {video}. ({detail})")
 
 
 def stage_artifact_path(key: str, video: int) -> str | None:
