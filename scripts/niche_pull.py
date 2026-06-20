@@ -2,11 +2,15 @@
 """Niche view-count feed (YouTube Data API v3) for the youtube-researcher agent.
 
 The competitor analogue of ``analytics_pull.py``. Where that script reads OUR
-channel's metrics from the Analytics API, this one reads the OUTSIDE finance
-niche from the public Data API: for a rolling window it runs ``search.list``
-(ordered by view count) over a set of finance seed queries, then ``videos.list``
-to attach the REAL ``viewCount`` (+ channel, publish date, duration) to each hit,
-and writes a single markdown file ranked by views.
+channel's metrics from the Analytics API, this one reads the OUTSIDE animated-
+finance peer set from the public Data API: for a rolling window it runs
+``search.list`` (ordered by view count) within each peer channel — the
+Willie-anchored animated-finance allowlist (Willie Finance + 100k+ look-alikes
+in his animated-documentary format) — then ``videos.list`` to attach the REAL
+``viewCount`` (+ channel, publish date, duration) to each hit, and writes a
+single markdown file ranked by views. Finance keyword search is available as an
+opt-in (``--keyword-search``) for topic discovery, but is OFF by default because
+it resurfaces human face-to-camera creators outside the animated peer set.
 
 This exists because youtube-researcher only has WebSearch/WebFetch — it cannot
 call the Data API itself, so its ``viral_teardowns.md`` kept saying "Views: No
@@ -18,7 +22,8 @@ routine runs it first, then hands the file to the agent (see
 routines/youtube-research.prompt), exactly mirroring the analytics-feedback loop.
 
 Quota: ``search.list`` costs 100 units/call, ``videos.list`` 1 unit per ≤50 ids.
-The default 8 queries ≈ 800 + a few = well under the 10k/day default quota.
+Default run (allowlist only, 3 channels) ≈ 300 units; ``--keyword-search`` adds
+~800 — both well under the 10k/day default quota.
 
 Output: Channel_Intelligence/Niche_Views/<YYYY-MM-DD>_niche-views.md (under $SK_VAULT).
 Frontmatter ``status:`` follows the agent status contract so a no-results / quota
@@ -26,7 +31,8 @@ run is a clean skeleton, never a fake success.
 
 Usage:
   python3 scripts/niche_pull.py --dry-run        # show plan, no network
-  python3 scripts/niche_pull.py                  # last 14 days, default queries
+  python3 scripts/niche_pull.py                  # last 14 days, animated-peer allowlist (no keyword search)
+  python3 scripts/niche_pull.py --keyword-search # also run opt-in keyword queries
   python3 scripts/niche_pull.py --days 7         # last 7 days
   python3 scripts/niche_pull.py --per-query 15   # widen per-query result depth
   python3 scripts/niche_pull.py --queries my_queries.txt   # one query per line
@@ -53,19 +59,30 @@ from youtube_client import (  # noqa: E402
 DEFAULT_VAULT = "~/Documents/3SK/outputs/BRANDS/3SK_Finance"
 NICHE_SUBDIR = "Channel_Intelligence/Niche_Views"
 
-# PRIMARY high-signal source: the finance creators 3SK actually tracks (handles
-# grounded in 05_Research_and_Intelligence + Channel_Intelligence — Willie is the
-# #1 format-validator, then Humphrey/Graham/Ramit). Resolved at runtime via
+# PRIMARY high-signal source: the WILLIE-ANCHORED animated-finance peer set.
+# 3SK Finance is an animated-documentary finance channel built directly on the
+# Willie Finance format (flat-2D illustrated, high image density, data-on-art,
+# "Every Level of [X]" / "POV: Your Life at Every Level of Wealth"). The benchmark
+# is therefore Willie himself + the channels that share that exact animated format
+# at scale — NOT human face-to-camera personal brands (Graham/Humphrey/Ramit/
+# Nischa) and NOT live-action faceless-documentary channels (How Money Works /
+# Economics Explained), which are a different visual genre.
+#
+# Curated 2026-06-20 (Steve: "Willie is the main account; find 100k+ look-alikes").
+# The pure animated-finance-documentary lane is genuinely thin — only two true
+# 100k+ look-alikes exist (Finance With Ryan, Hypothetically); Steve chose this
+# tight "core only" set over looser animated-money adjacents. Willie himself is
+# ~24K subs (under 100k) but is the named STYLE ANCHOR, so he stays in.
+#
+# EXACT handles matter: `willie_finance` (with the underscore) — `WillieFinance`
+# resolves to a DIFFERENT, unrelated channel. Resolved at runtime via
 # channels.list(forHandle=...) so we never hardcode brittle UC ids; a handle that
 # fails to resolve is skipped, never fatal. Override with --channels (one handle
-# per line). Each channel contributes its most-viewed uploads in the window —
-# pure finance signal, no keyword bleed. Add Willie's handle here once confirmed.
+# per line). Each contributes its most-viewed uploads in the window.
 CREATOR_HANDLES = [
-    "humphrey",        # Humphrey Yang
-    "grahamstephan",   # Graham Stephan
-    "ramitsethi",      # Ramit Sethi (I Will Teach You To Be Rich)
-    "marktilbury",     # Mark Tilbury
-    "Nischa",          # Nischa
+    "willie_finance",   # Willie Finance — STYLE ANCHOR, animated-documentary (~24K)
+    "ryanfinanceus",    # Finance With Ryan — animated finance, near-identical (~184K)
+    "hypotheticallyhq", # Hypothetically — animated "every level of wealth" (~297K)
 ]
 
 # SECONDARY source: keyword search. INTENTIONALLY finance-anchored (every query
@@ -301,7 +318,7 @@ def skeleton(path: Path, status: str, note: str, window_days: int) -> None:
 
 
 def build_body(rows: list[dict], queries: list[str], window_days: int,
-               quota_note: str) -> str:
+               quota_note: str, keyword_search: bool) -> str:
     lines = [
         "---",
         f"date: {date.today().isoformat()}",
@@ -318,21 +335,28 @@ def build_body(rows: list[dict], queries: list[str], window_days: int,
         f"# 3SK Finance — Niche most-viewed feed (last {window_days} days)",
         "",
         "Real view counts from the YouTube **Data API** (`search.list` ordered by "
-        "views → `videos.list` statistics) over the finance seed queries below. "
-        "This is the deterministic data feed for **youtube-researcher** — use these "
-        "numbers to rank `viral_teardowns.md` and gauge `title_performance.md` "
-        "instead of 'no public data'. Raw data only; no analysis here.",
-        "",
-        f"**Seed queries:** {', '.join('`' + q + '`' for q in queries)}",
+        "views → `videos.list` statistics) over the **Willie-anchored animated-finance "
+        "peer set** (Willie Finance + 100k+ look-alikes that share his animated-"
+        "documentary format). This is the deterministic data feed for "
+        "**youtube-researcher** — use these numbers to rank `viral_teardowns.md` and "
+        "gauge `title_performance.md` instead of 'no public data'. Raw data only; no "
+        "analysis here.",
         "",
     ]
+    if keyword_search:
+        lines += [
+            f"**Keyword search (opt-in):** {', '.join('`' + q + '`' for q in queries)}",
+            "",
+        ]
     if quota_note:
         lines += [f"> ⚠️ {quota_note}", ""]
     lines += [
         f"## Top {len(rows)} by views (most-viewed first)",
         "",
-        "_Source = `creator:@handle` (a tracked finance channel's most-viewed in "
-        "window — primary signal) or `q:<query>` (finance-anchored keyword search)._",
+        "_Source = `creator:@handle` (an animated-finance peer channel's most-viewed "
+        "in window — the primary, replicable-format benchmark) or `q:<query>` "
+        "(opt-in keyword search — note: this can surface human face-to-camera "
+        "creators outside the animated peer set)._",
         "",
         "| # | Views | Title | Channel | Published | Length | Source |",
         "|---|---|---|---|---|---|---|",
@@ -358,6 +382,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--channels", help="Path to a file of creator handles (one per line; # comments ok).")
     p.add_argument("--include-shorts", action="store_true",
                    help="Keep Shorts (<=60s) in the feed (dropped by default; 3SK is long-form).")
+    p.add_argument("--keyword-search", action="store_true",
+                   help="ALSO run the finance keyword searches (default OFF). These surface human "
+                        "face-to-camera creators outside 3SK's format; 3SK is an animated-documentary "
+                        "channel, so the animated-peer allowlist is the benchmark. Use for "
+                        "topic/title discovery only.")
     p.add_argument("--token", help="Override path to youtube_token.json.")
     p.add_argument("--out", help="Override output file path.")
     p.add_argument("--dry-run", action="store_true", help="Show the plan; touch no network.")
@@ -379,19 +408,20 @@ def main() -> None:
            else vlt / NICHE_SUBDIR / f"{date.today().isoformat()}_niche-views.md")
 
     # Rough quota: 1 unit/handle (resolve) + 100/handle-search + 100/query + videos.list.
-    est = len(handles) * 101 + len(queries) * 100
+    est = len(handles) * 101 + (len(queries) * 100 if args.keyword_search else 0)
     print(f"window     : last {args.days} days (publishedAfter {after})")
     print(f"creators   : {len(handles)} ({', '.join('@' + h for h in handles)})")
-    print(f"queries    : {len(queries)}")
+    print(f"queries    : {len(queries) if args.keyword_search else 0}"
+          f"{' (keyword search ON — also includes human creators)' if args.keyword_search else ' (keyword search OFF — animated peer allowlist only)'}")
     print(f"quota est  : ~{est} units (of 10k/day)")
     print(f"shorts     : {'kept' if args.include_shorts else 'dropped (long-form channel)'}")
     print(f"output     : {out}")
 
     if args.dry_run:
-        print("\n--- DRY RUN (no network). Would resolve creator handles, run "
-              "search.list(order=viewCount) per channel + per query, then "
-              "videos.list for statistics, and write the ranked feed. "
-              "Drop --dry-run to run. ---")
+        kw = "per channel + per query" if args.keyword_search else "per channel (keyword search off)"
+        print(f"\n--- DRY RUN (no network). Would resolve creator handles, run "
+              f"search.list(order=viewCount) {kw}, then videos.list for statistics, "
+              "and write the ranked feed. Drop --dry-run to run. ---")
         return
 
     try:
@@ -414,11 +444,12 @@ def main() -> None:
             for vid in ids:
                 source.setdefault(vid, f"creator:@{h}")
             print(f"  creator @{h}: {len(ids)} hit(s)")
-        for q in queries:
-            ids = search_video_ids(data, after, args.per_query, query=q)
-            for vid in ids:
-                source.setdefault(vid, f"q:{q}")
-            print(f"  search {q!r}: {len(ids)} hit(s)")
+        if args.keyword_search:
+            for q in queries:
+                ids = search_video_ids(data, after, args.per_query, query=q)
+                for vid in ids:
+                    source.setdefault(vid, f"q:{q}")
+                print(f"  search {q!r}: {len(ids)} hit(s)")
     except QuotaExceeded:
         quota_note = ("Data API quota was exhausted mid-pull — this feed is PARTIAL "
                       "(only the sources that ran before the cap are included).")
@@ -427,8 +458,9 @@ def main() -> None:
     if not source:
         status = "partial-quota" if quota_note else "blocked-no-results"
         note = (quota_note or
-                "No videos found from the tracked creators or seed queries in this "
-                "window. Widen --days or retune --queries/--channels; re-run next cycle.")
+                "No videos found from the animated-finance peer channels in this "
+                "window. Widen --days, retune --channels, or add --keyword-search; "
+                "re-run next cycle.")
         skeleton(out, status, note, args.days)
         print(f"\nℹ no results → wrote {status} skeleton: {out}")
         return
@@ -467,7 +499,7 @@ def main() -> None:
         print(f"\nℹ no long-form stats rows → wrote partial skeleton: {out}")
         return
 
-    write_report(out, build_body(rows, queries, args.days, quota_note))
+    write_report(out, build_body(rows, queries, args.days, quota_note, args.keyword_search))
     print(f"\n✅ wrote niche feed ({len(rows)} videos, top by views) → {out}")
     print("   Next: dispatch `youtube-researcher` to read this file for ranked intel.")
 
