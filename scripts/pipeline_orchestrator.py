@@ -533,6 +533,12 @@ def run_agent_stage(key: str, video: int, stages: dict) -> tuple[bool, str]:
     top-level side-effects under the venv. The run-table here is the orchestrator's
     own authoritative envelope, and the agent-file check is H2 against the real
     source of truth the dispatch consumes.)"""
+    # Stage 2 is a GATE, not a plain dispatch: route it through the BINARY
+    # review→fix→re-review loop so a REVISE script cannot mark the stage done and
+    # advance. run_script_review_gate owns its own agent-availability handling
+    # (missing reviewer → UNAVAILABLE → fail-open, with a Telegram warning).
+    if key == "2_review":
+        return run_script_review_gate(video)
     cfg = RUN_TABLE[key]
     agent = cfg["agent"]
     agent_file = AGENTS_DIR / f"{agent}.md"
@@ -581,24 +587,27 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     if key != "6_assemble":
         return False, f"no script executor for stage {key}"
     # Pass B — pre-assemble RENDERS review, pinned to the SAME billed manifest the
-    # spend used. A REVISE verdict means an off-model / garbled rendered PNG is
-    # present: refuse to build it into the cut. Returns False → consumes a normal
-    # retry (bounded by MAX_FAILS) and eventually parks for Steve. The render-fix
-    # LOOP closes through the human money-gate, NOT here: regenerating renders is
-    # BILLED, so it must NOT auto-run (no-autonomous-spend invariant). The fix
-    # path is the same closed loop as Pass A — correct the prompts per the verdict
-    # (free) then re-run `/pipeline N spend-ok`, which re-reviews + regenerates,
-    # and this gate re-checks the fresh renders. Fail-OPEN if the reviewer can't
-    # run (assembly is free): warn and assemble anyway.
+    # spend used. BINARY allow-list (Steve, 2026-06-20): assemble ONLY on a clean
+    # SHIP — a 100% sign-off that every rendered PNG is on-model and legible.
+    # ANYTHING that is not a clean SHIP (REVISE, the retired SHIP WITH FIXES, or
+    # any unexpected token) refuses the build: if it is not all good to go, none of
+    # it goes. Returns False → consumes a normal retry (bounded by MAX_FAILS) and
+    # eventually parks for Steve. The render-fix LOOP closes through the human
+    # money-gate, NOT here: regenerating renders is BILLED, so it must NOT auto-run
+    # (no-autonomous-spend invariant). The fix path is the same closed loop as Pass
+    # A — correct the prompts per the verdict (free) then re-run `/pipeline N
+    # spend-ok`, which re-reviews + regenerates, and this gate re-checks the fresh
+    # renders. UNAVAILABLE is the single fail-OPEN exception (assembly is free):
+    # warn and assemble anyway.
     verdict, vrel, detail = run_image_review("renders", video,
                                              canonical_manifest_rel(video))
-    if verdict == "REVISE":
-        return False, (f"image-reviewer REVISE on the rendered images — refusing to "
-                       f"assemble. Fix prompts per {vrel}, then re-run /pipeline "
-                       f"{video} spend-ok to regenerate (BILLED — human-gated) ({detail}).")
     if verdict == "UNAVAILABLE":
         notify(f"⚠️ Video {video}: image-reviewer could not run the pre-assemble "
                f"renders review ({detail}) — assembling anyway (fail-open).")
+    elif verdict != "SHIP":
+        return False, (f"image-reviewer {verdict} on the rendered images — refusing to "
+                       f"assemble. Fix prompts per {vrel}, then re-run /pipeline "
+                       f"{video} spend-ok to regenerate (BILLED — human-gated) ({detail}).")
     cfg = RUN_TABLE[key]
     vid = f"Video_{nn(video)}"
     cmd = [
@@ -618,14 +627,22 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
 
 
 # === Image-review gate (image-reviewer subagent) ==========================
-# Pass A: pre-spend PROMPTS review inside cmd_spend_ok — blocks a billed batch
-#         whose prompts are off-model / garble-risk (HOLD-SPEND).
-# Pass B: pre-assemble RENDERS review inside run_script_stage — blocks a cut
-#         built from off-model / garbled rendered PNGs (REVISE).
+# BINARY gate policy (Steve, 2026-06-20): each pass advances ONLY on a clean SHIP
+# (a 100% sign-off). Anything less is not advanceable — there is no "ship with
+# fixes" middle state.
+# Pass A: pre-spend PROMPTS review inside cmd_spend_ok — spends ONLY on SHIP;
+#         anything else drives the fix loop, then parks (HOLD-SPEND et al.).
+# Pass B: pre-assemble RENDERS review inside run_script_stage — assembles ONLY on
+#         SHIP; anything else refuses the cut (REVISE et al., human-gated re-spend).
 IMAGE_REVIEWER_AGENT = "image-reviewer"
 # The author that FIXES flagged prompts — the image analogue of scriptwriter in
 # the scriptwriter↔script-reviewer loop. It edits the manifest in place; $0.
 PROMPT_FIXER_AGENT = "scene-image-prompt-generator"
+# Stage-2 script gate (BINARY, same policy): script-reviewer critiques, and on
+# anything less than a clean SHIP the scriptwriter FIXES the script in place and
+# it is re-reviewed — a closed loop, $0, mirroring the image PROMPTS gate.
+SCRIPT_REVIEWER_AGENT = "script-reviewer"
+SCRIPT_FIXER_AGENT = "scriptwriter"
 IMAGE_REVIEW_TIMEOUT = 900
 # Closed review→fix→re-review loop budget at the PROMPTS gate. Fixing prompts is
 # free, so we iterate, but bounded: after this many fix dispatches still HOLD-
@@ -687,10 +704,13 @@ def run_image_review(mode: str, video: int,
     mode: "prompts" (Pass A, pre-spend) | "renders" (Pass B, pre-assemble).
     manifest_rel: if given, pin the reviewer to that exact manifest (keeps the
     reviewed file == the spent file even when a state-file override is set).
-    Returns (verdict, verdict_rel, detail). verdict is one of
-    SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE, or the sentinel "UNAVAILABLE"
-    when the reviewer could not run or emitted no parseable VERDICT line — the
-    caller decides fail-open vs fail-closed on UNAVAILABLE per its gate.
+    Returns (verdict, verdict_rel, detail). Under the BINARY policy the reviewer
+    emits SHIP (clean, advances) or a block token (HOLD-SPEND for prompts / REVISE
+    for renders — anything less than 100%); the parser still RECOGNISES the retired
+    SHIP WITH FIXES token for robustness, but every caller treats non-SHIP as
+    blocking. "UNAVAILABLE" is the sentinel when the reviewer could not run or
+    emitted no parseable VERDICT line — the caller decides fail-open vs fail-closed
+    on UNAVAILABLE per its gate.
     The verdict FILE is the source of truth; stdout is only a fallback parse."""
     verdict_rel = _image_review_verdict_rel(video)
     agent_file = AGENTS_DIR / f"{IMAGE_REVIEWER_AGENT}.md"
@@ -698,14 +718,17 @@ def run_image_review(mode: str, video: int,
         return "UNAVAILABLE", verdict_rel, f"agent definition not found at {agent_file}"
     v = f"Video_{nn(video)}"
     label = "A (PROMPTS, pre-spend)" if mode == "prompts" else "B (RENDERS, pre-assemble)"
+    block_tok = "HOLD-SPEND" if mode == "prompts" else "REVISE"
     pin = f" Use manifest {manifest_rel} (the exact billed file)." if manifest_rel else ""
     prompt = (
         f"Run image-reviewer MODE {label} for {v} (3SK Finance). mode:{mode}.{pin} "
         f"Verify the canonical billed image manifest (and rendered PNGs in renders "
         f"mode) against the Master Character Prompt v3, the On-Model Verification "
         f"Protocol, and the Background & Color Standard. WRITE your verdict to "
-        f"{verdict_rel} including a 'VERDICT:' line "
-        f"(SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE)."
+        f"{verdict_rel} including a 'VERDICT:' line. The verdict is BINARY: SHIP "
+        f"(every shot is 100% good to go) or {block_tok} (anything less — list every "
+        f"fix under {block_tok}). There is no 'ship with fixes': if it is not all "
+        f"good to go, none of it goes."
     )
     cmd = [CLAUDE_CLI_PATH, "--print", "--agent", IMAGE_REVIEWER_AGENT,
            "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
@@ -715,6 +738,10 @@ def run_image_review(mode: str, video: int,
                               text=True, timeout=IMAGE_REVIEW_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "UNAVAILABLE", verdict_rel, f"timed out after {IMAGE_REVIEW_TIMEOUT}s"
+    except OSError as e:
+        # CLI binary missing / unspawnable (e.g. a stale CLAUDE_CLI_PATH). Degrade
+        # to UNAVAILABLE (an infra condition) rather than crashing the orchestrator.
+        return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
     if proc.returncode != 0:
         return "UNAVAILABLE", verdict_rel, \
             f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
@@ -755,6 +782,8 @@ def run_prompt_fixer(video: int, verdict_rel: str,
                               text=True, timeout=IMAGE_REVIEW_TIMEOUT)
     except subprocess.TimeoutExpired:
         return False, f"prompt-fixer timed out after {IMAGE_REVIEW_TIMEOUT}s"
+    except OSError as e:
+        return False, f"prompt-fixer could not run (command not found): {e}"
     if proc.returncode != 0:
         return False, f"prompt-fixer exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
     return True, (proc.stdout or "").strip()[-200:]
@@ -762,15 +791,20 @@ def run_prompt_fixer(video: int, verdict_rel: str,
 
 def run_prompt_review_loop(video: int, manifest_rel: str) -> tuple[str, str, str]:
     """The PROMPTS gate as a CLOSED feedback loop (review → fix → re-review),
-    mirroring scriptwriter↔script-reviewer. Only HOLD-SPEND (the spend-blocking
-    verdict) triggers a fix; SHIP / SHIP WITH FIXES are spendable and end the
-    loop. Bounded by IMAGE_REVIEW_MAX_FIX_ATTEMPTS so a manifest the fixer can't
-    clear parks for a human instead of looping forever. UNAVAILABLE ends the loop
-    immediately (the caller fails open). Returns the FINAL (verdict, vrel, detail).
-    Fixing prompts is $0, so this whole loop runs BEFORE the single billed spend."""
+    mirroring scriptwriter↔script-reviewer. BINARY policy (Steve, 2026-06-20):
+    a verdict is either a clean SHIP — the ONLY thing that advances — or it is
+    not, and ANYTHING that is not a clean SHIP (HOLD-SPEND, REVISE, the retired
+    SHIP WITH FIXES, or any unexpected token) drives a fix and a re-review. There
+    is no "advance while imperfect": if the reviewer is not 100% signing off, the
+    batch does not move to the billed spend. Bounded by IMAGE_REVIEW_MAX_FIX_
+    ATTEMPTS so a manifest the fixer can't clear parks for a human instead of
+    looping forever. UNAVAILABLE ends the loop immediately (the caller fails open
+    — a human authorized THIS spend; review tooling being down must not block it).
+    Returns the FINAL (verdict, vrel, detail). Fixing prompts is $0, so this whole
+    loop runs BEFORE the single billed spend."""
     verdict, vrel, detail = run_image_review("prompts", video, manifest_rel)
     attempts = 0
-    while verdict == "HOLD-SPEND" and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
+    while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
         attempts += 1
         ran, fdetail = run_prompt_fixer(video, vrel, manifest_rel)
         if not ran:
@@ -780,6 +814,128 @@ def run_prompt_review_loop(video: int, manifest_rel: str) -> tuple[str, str, str
         s = "s" if attempts != 1 else ""
         detail = f"{detail} (after {attempts} auto-fix attempt{s})"
     return verdict, vrel, detail
+
+
+# === Script-review gate (stage 2) — the BINARY analogue of the PROMPTS gate ===
+def _script_review_verdict_rel(video: int) -> str:
+    return f"{VAULT_REL}/Scripts/_REVIEW_PREP/Video_{nn(video)}_Script_Review.md"
+
+
+def run_script_review(video: int) -> tuple[str, str, str]:
+    """Dispatch script-reviewer and read back its BINARY verdict.
+
+    Returns (verdict, vrel, detail). verdict is SHIP (clean → advance), REVISE
+    (block), or the sentinel UNAVAILABLE (could not run / no parseable VERDICT).
+    The shared _parse_image_verdict also recognises the retired SHIP WITH FIXES
+    token and ranks it as blocking, so a drifting reviewer can't sneak it past."""
+    verdict_rel = _script_review_verdict_rel(video)
+    agent_file = AGENTS_DIR / f"{SCRIPT_REVIEWER_AGENT}.md"
+    if not agent_file.exists():
+        return "UNAVAILABLE", verdict_rel, f"agent definition not found at {agent_file}"
+    v = f"Video_{nn(video)}"
+    timeout = RUN_TABLE["2_review"]["timeout"]
+    prompt = (
+        f"Review the drafted script for {v} (BRANDS/3SK_Finance/Scripts/{v}_Script.md). "
+        f"7-dimension read-only critique → {verdict_rel}. Include a one-line 'VERDICT:' "
+        f"line. The verdict is BINARY: SHIP (every dimension passes, zero fixes) or "
+        f"REVISE (anything less — list every fix under REVISE). There is no 'ship with "
+        f"fixes': if it is not all good to go, none of it goes."
+    )
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", SCRIPT_REVIEWER_AGENT,
+           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+           "--", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "UNAVAILABLE", verdict_rel, f"timed out after {timeout}s"
+    except OSError as e:
+        return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
+    if proc.returncode != 0:
+        return "UNAVAILABLE", verdict_rel, \
+            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+    verdict_abs = vault_abs(verdict_rel)
+    text = ""
+    if verdict_abs and verdict_abs.exists():
+        text = verdict_abs.read_text(encoding="utf-8", errors="replace")
+    verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
+    if verdict is None:
+        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in file or stdout"
+    return verdict, verdict_rel, f"script verdict {verdict}"
+
+
+def run_script_fixer(video: int, verdict_rel: str) -> tuple[bool, str]:
+    """Dispatch scriptwriter to FIX the script per a script-reviewer block — the
+    script analogue of run_prompt_fixer. Edits the script in place; bills nothing.
+    Returns (ran_ok, detail); ran_ok=False means the fixer could not run."""
+    agent_file = AGENTS_DIR / f"{SCRIPT_FIXER_AGENT}.md"
+    if not agent_file.exists():
+        return False, f"agent definition not found at {agent_file}"
+    v = f"Video_{nn(video)}"
+    timeout = RUN_TABLE["1_script"]["timeout"]
+    prompt = (
+        f"script-reviewer flagged the {v} script as not yet shippable. Read its review at "
+        f"{verdict_rel} and FIX the script BRANDS/3SK_Finance/Scripts/{v}_Script.md IN "
+        f"PLACE: apply every line-level fix it lists (voice, structure, retention beats, "
+        f"the email-list CTA rule, number-spine, beat alignment). PRESERVE the locked Brand "
+        f"Bible voice, the Universal Intro/Outro structure, the scene-prompt format, and "
+        f"every already-passing section UNCHANGED. Write the corrected script back to the "
+        f"same path."
+    )
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", SCRIPT_FIXER_AGENT,
+           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+           "--", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"script-fixer timed out after {timeout}s"
+    except OSError as e:
+        return False, f"script-fixer could not run (command not found): {e}"
+    if proc.returncode != 0:
+        return False, f"script-fixer exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+    return True, (proc.stdout or "").strip()[-200:]
+
+
+def run_script_review_loop(video: int) -> tuple[str, str, str]:
+    """Stage 2 as a CLOSED feedback loop (review → fix → re-review), mirroring
+    run_prompt_review_loop. BINARY policy (Steve, 2026-06-20): a clean SHIP is the
+    ONLY thing that lets the script advance; ANYTHING less (REVISE, the retired
+    SHIP WITH FIXES, or any unexpected token) drives a scriptwriter fix and a
+    re-review. Bounded by IMAGE_REVIEW_MAX_FIX_ATTEMPTS so a script the fixer can't
+    clear parks for a human instead of looping forever. UNAVAILABLE ends the loop
+    immediately (the caller fails open — the script path is free; review tooling
+    being down must not wedge it). Returns the FINAL (verdict, vrel, detail)."""
+    verdict, vrel, detail = run_script_review(video)
+    attempts = 0
+    while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
+        attempts += 1
+        ran, fdetail = run_script_fixer(video, vrel)
+        if not ran:
+            return verdict, vrel, f"{detail}; fix attempt {attempts} could not run ({fdetail})"
+        verdict, vrel, detail = run_script_review(video)
+    if attempts:
+        s = "s" if attempts != 1 else ""
+        detail = f"{detail} (after {attempts} auto-fix attempt{s})"
+    return verdict, vrel, detail
+
+
+def run_script_review_gate(video: int) -> tuple[bool, str]:
+    """Stage-2 executor under the BINARY policy: run the review→fix→re-review loop
+    and advance ONLY on a clean SHIP. UNAVAILABLE fails OPEN (the free script path
+    must not wedge on review tooling being down — warn + advance). REVISE (or any
+    non-SHIP surviving the fix budget) parks: returns False so the stage goes
+    needs-steve, exactly like a stage failure. Returns the (ok, out) the dispatcher
+    expects."""
+    verdict, vrel, detail = run_script_review_loop(video)
+    if verdict == "SHIP":
+        return True, f"script-reviewer SHIP ({vrel}). {detail}"
+    if verdict == "UNAVAILABLE":
+        notify(f"⚠️ Video {video}: script-reviewer could not run the stage-2 review "
+               f"({detail}) — advancing anyway (fail-open). Eyeball the script.")
+        return True, f"script-review UNAVAILABLE — advanced fail-open ({detail})"
+    return False, (f"script-reviewer {verdict} on the script after auto-fix — refusing to "
+                   f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})")
 
 
 def stage_artifact_path(key: str, video: int) -> str | None:
@@ -1071,27 +1227,23 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
         print(f"⏭️  Video {video}: --force — skipping pre-spend image-review gate.")
     else:
         verdict, vrel, detail = run_prompt_review_loop(video, manifest_rel)
-        # ALLOW-LIST, not deny-list: spend ONLY on an explicitly spendable verdict
-        # (SHIP / SHIP WITH FIXES). UNAVAILABLE is the single fail-OPEN exception
-        # (a human authorized THIS spend; review tooling being down must not block
-        # it). EVERY other verdict — HOLD-SPEND, REVISE, or anything unexpected the
-        # reviewer emits — fails CLOSED and refuses the batch. This matches the
-        # parser's fail-safe philosophy: a false block is cheap (--force overrides),
-        # a false SHIP bills real money. A deny-list `else: spend` would leak a
-        # REVISE (which the loop does NOT auto-fix) straight to a billed spend.
+        # BINARY allow-list (Steve, 2026-06-20): spend ONLY on a clean SHIP — a
+        # 100% sign-off. UNAVAILABLE is the single fail-OPEN exception (a human
+        # authorized THIS spend; review tooling being down must not block it).
+        # EVERY other verdict — HOLD-SPEND, REVISE, the retired SHIP WITH FIXES,
+        # or anything unexpected the reviewer emits — fails CLOSED and refuses the
+        # batch. "Ship with fixes" is no longer a spendable state: if it is not all
+        # good to go, none of it goes. A false block is cheap (--force overrides);
+        # a false SHIP bills real money / ships an off-model batch.
         if verdict == "UNAVAILABLE":
             line = (f"⚠️ Video {video}: image-reviewer could not run the pre-spend "
                     f"prompts review ({detail}) — proceeding with spend (fail-open). "
                     f"Eyeball the prompts manually.")
             print(line)
             notify(line)
-        elif verdict in ("SHIP", "SHIP WITH FIXES"):
-            line = f"✅ Video {video}: image-reviewer pre-spend verdict {verdict} ({vrel})."
+        elif verdict == "SHIP":
+            line = f"✅ Video {video}: image-reviewer pre-spend verdict SHIP ({vrel})."
             print(line)
-            # SHIP WITH FIXES still spends (fixes are low-cost text/vocab), but
-            # surface it on Telegram so the required fixes don't hide in the file.
-            if verdict == "SHIP WITH FIXES":
-                notify(line + " Low-cost fixes noted — apply post-render.")
         else:
             s["note"] = f"spend held: image-reviewer {verdict} ({vrel})"
             sf.save()
