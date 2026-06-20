@@ -2478,8 +2478,76 @@ async def _handle_adapt_command(update, chat_id: str, subcommand: str, arg: str)
         )
         return
 
+    # --- Outcome tagging: close the learning loop (did the edit help?) --------
+    if subcommand == "due":
+        try:
+            props = await _run(_adaptation.due_for_review)
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Couldn't list due reviews: {exc}")
+            return
+        if not props:
+            await update.message.reply_text(
+                "✅ No applied adaptations are due for an outcome review."
+            )
+            return
+        lines = [f"🔎 {len(props)} applied adaptation(s) due for an outcome call:", ""]
+        for p in props:
+            tgt = _vault_rel(p.target) if p.target else "(no target)"
+            eff = p.meta.get("expected_effect") or p.meta.get("metric") or "(no hypothesis)"
+            lines.append(f"• `{p.pid}` (due {p.meta.get('evaluate_after', '?')}) → {tgt}")
+            lines.append(f"   {p.summary}")
+            lines.append(f"   expected: {eff}")
+        lines.append("")
+        lines.append("Record: `/adapt outcome <id> <improved|no-change|regressed|inconclusive> [note]`")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if subcommand == "score":
+        try:
+            sb = await _run(_adaptation.scoreboard)
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Couldn't build scoreboard: {exc}")
+            return
+        c = sb["counts"]
+        if sb["hit_rate"] is None:
+            hr = "n/a (no decisive outcomes yet)"
+        else:
+            hr = f"{sb['hit_rate']*100:.0f}% ({c['improved']}/{sb['decisive']} decisive)"
+        await update.message.reply_text(
+            "📊 Adaptation outcome scoreboard\n"
+            f"• applied total: {sb['total']}\n"
+            f"• improved: {c['improved']}  ·  no-change: {c['no-change']}  ·  "
+            f"regressed: {c['regressed']}\n"
+            f"• inconclusive: {c['inconclusive']}  ·  untagged: {sb['untagged']}\n"
+            f"• hit-rate: {hr}"
+        )
+        return
+
+    if subcommand == "outcome":
+        parts = arg.split(None, 2) if arg else []
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "Usage: /adapt outcome <id> <improved|no-change|regressed|inconclusive> [note]"
+            )
+            return
+        pid, verdict = parts[0], parts[1]
+        note = parts[2].strip() if len(parts) > 2 else ""
+        try:
+            res = await _run(_adaptation.tag_outcome, pid, verdict, note)
+        except AdaptError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Tag failed for `{pid}`: {exc}")
+            return
+        await update.message.reply_text(
+            f"🏷️ Recorded `{res['pid']}` → *{res['outcome']}*.\n📝 {res['summary']}"
+        )
+        return
+
     await update.message.reply_text(
-        "Usage: /adapt [list | show <id> | approve <id> | reject <id> [reason]]"
+        "Usage: /adapt [list | show <id> | approve <id> | reject <id> [reason] | "
+        "due | score | outcome <id> <verdict> [note]]"
     )
 
 

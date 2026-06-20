@@ -90,6 +90,20 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 OLD_OPEN, OLD_CLOSE = "<<<ADAPT:OLD", "ADAPT:OLD>>>"
 NEW_OPEN, NEW_CLOSE = "<<<ADAPT:NEW", "ADAPT:NEW>>>"
 
+# --- Outcome tagging (closing the learning loop) -----------------------------
+# An applied adaptation is a HYPOTHESIS ("this edit will move metric X"), not a
+# proven win. Outcome tagging records whether it actually helped, so the loop is
+# measurable rather than fire-and-forget. At apply time we stamp an
+# `evaluate_after` date (apply date + horizon); once that date passes, the
+# adaptation is "due" for an outcome call, recorded with tag_outcome(). The
+# horizon is deliberately short — internal QC signals (reviewer block-rate, lint
+# flags) mature in days; slower signals (CTR/retention) can be re-tagged later.
+EVAL_HORIZON_DAYS = 14
+# The closed vocabulary of an outcome verdict. "inconclusive" is honest — many
+# pre-launch adaptations have no clean metric yet; it is NOT a failure, just an
+# unmeasured change. Only improved/no-change/regressed feed the hit-rate.
+OUTCOME_VALUES = ("improved", "no-change", "regressed", "inconclusive")
+
 
 class AdaptError(Exception):
     """Any refusal/validation failure. Carries a one-line, user-facing reason."""
@@ -276,19 +290,43 @@ def _atomic_write(path: Path, content: str) -> None:
             os.unlink(tmp)
 
 
+def _set_frontmatter_field(text: str, key: str, value: str) -> str:
+    """Set `key: value` in the LEADING frontmatter block only — replace the field's
+    line there, or inject it right after the opening `---` fence.
+
+    Scoped to the frontmatter block on purpose: a naive `(?m)^key:` over the whole
+    document would also match a line in the rationale/payload (e.g. a NEW block that
+    legitimately quotes `outcome: ...`), silently corrupting the proposal record and
+    leaving the real frontmatter field unstamped. We operate ONLY on the region
+    before the closing fence, matching _parse_frontmatter's own bounds.
+
+    Uses a replacement FUNCTION, not a string, so a value containing backslashes or
+    `\\1`-style sequences is written literally, never interpreted as a regex backref.
+    """
+    # No (or malformed) frontmatter: prepend a fresh block. Defensive — every real
+    # proposal already carries frontmatter — but never silently drops the field.
+    if not text.startswith("---"):
+        return f"---\n{key}: {value}\n---\n{text}"
+    end = text.find("\n---", 3)
+    if end == -1:
+        return f"---\n{key}: {value}\n---\n{text}"
+    head, tail = text[:end], text[end:]  # head = opening fence + fields; tail = closing fence onward
+    pat = re.compile(rf"(?m)^{re.escape(key)}:.*$")
+    if pat.search(head):
+        head = pat.sub(lambda _m: f"{key}: {value}", head, count=1)
+    else:
+        # inject right after the opening "---\n" fence (^ = start of string, no re.M)
+        head = re.sub(r"^---\n", lambda _m: f"---\n{key}: {value}\n", head, count=1)
+    return head + tail
+
+
 def _move_proposal(prop: Proposal, dest_dir: Path, new_status: str, extra: dict) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     text = prop.path.read_text(encoding="utf-8")
     # Update the status line in frontmatter (or inject one), plus extra stamps.
-    def _set(t: str, key: str, value: str) -> str:
-        pat = re.compile(rf"(?m)^{re.escape(key)}:.*$")
-        if pat.search(t):
-            return pat.sub(f"{key}: {value}", t, count=1)
-        # inject right after the opening --- fence
-        return re.sub(r"^---\n", f"---\n{key}: {value}\n", t, count=1)
-    text = _set(text, "status", new_status)
+    text = _set_frontmatter_field(text, "status", new_status)
     for k, v in extra.items():
-        text = _set(text, k, v)
+        text = _set_frontmatter_field(text, k, v)
     dest = dest_dir / prop.path.name
     dest.write_text(text, encoding="utf-8")
     prop.path.unlink()
@@ -324,16 +362,22 @@ def apply_proposal(pid: str) -> dict:
     shutil.copy2(target, backup)
     updated = current.replace(prop.old, prop.new, 1)
     _atomic_write(target, updated)
+    # Stamp the outcome-evaluation horizon: this applied edit is a HYPOTHESIS to be
+    # checked on/after this date (see tag_outcome / due_for_review). ISO dates sort
+    # lexicographically, so the due-check is a plain string compare.
+    eval_after = (_dt.date.today() + _dt.timedelta(days=EVAL_HORIZON_DAYS)).isoformat()
     moved = _move_proposal(
-        prop, APPLIED_DIR, "applied", {"applied": _now(), "backup": str(backup)}
+        prop, APPLIED_DIR, "applied",
+        {"applied": _now(), "backup": str(backup), "evaluate_after": eval_after},
     )
-    _append_log("APPLIED", prop, f"backup {backup.name}")
+    _append_log("APPLIED", prop, f"backup {backup.name}; evaluate_after {eval_after}")
     return {
         "pid": prop.pid,
         "target": str(target),
         "backup": str(backup),
         "proposal": str(moved),
         "summary": prop.summary,
+        "evaluate_after": eval_after,
     }
 
 
@@ -345,6 +389,101 @@ def reject_proposal(pid: str, reason: str = "") -> dict:
     moved = _move_proposal(prop, REJECTED_DIR, "rejected", extra)
     _append_log("REJECTED", prop, reason)
     return {"pid": prop.pid, "proposal": str(moved), "summary": prop.summary}
+
+
+# --- Outcome tagging: did the applied adaptation actually help? ---------------
+def _applied_path(pid: str) -> Path:
+    """Resolve an APPLIED proposal's file by id, with the same path-safety guard
+    as _queue_path (no traversal, must live in the applied dir)."""
+    _validate_id(pid)
+    p = (APPLIED_DIR / f"{pid}.md").resolve()
+    if p.parent != APPLIED_DIR.resolve():
+        raise AdaptError(f"proposal id {pid!r} escapes the applied dir")
+    if not p.is_file():
+        raise AdaptError(f"no applied proposal with id {pid!r} (see --scoreboard)")
+    return p
+
+
+def _load_applied(path: Path) -> Proposal | None:
+    """Load an applied-proposal file, or None if it's malformed (skip, don't crash
+    a listing). Applied files have the same structure as queued ones plus extra
+    frontmatter stamps."""
+    try:
+        return _load_proposal_file(path)
+    except AdaptError:
+        return None
+
+
+def due_for_review() -> list[Proposal]:
+    """Applied adaptations whose evaluate_after date has passed and that carry NO
+    outcome yet — i.e. matured hypotheses awaiting a verdict. Adaptations applied
+    before outcome tagging existed have no evaluate_after and are skipped (they
+    predate the mechanism; nothing to score)."""
+    if not APPLIED_DIR.is_dir():
+        return []
+    today = _dt.date.today().isoformat()
+    out = []
+    for f in sorted(APPLIED_DIR.glob("*.md")):
+        prop = _load_applied(f)
+        if prop is None or prop.meta.get("outcome"):
+            continue
+        ea = prop.meta.get("evaluate_after", "")
+        if ea and ea <= today:
+            out.append(prop)
+    return out
+
+
+def tag_outcome(pid: str, verdict: str, note: str = "") -> dict:
+    """Record the outcome of an applied adaptation. verdict ∈ OUTCOME_VALUES.
+    Stamps `outcome` / `outcome_measured` / `outcome_note` into the applied file
+    in place (does not move it) and appends to the audit log. Re-tagging is
+    allowed — a later, better-evidenced call overwrites an earlier one (logged
+    each time), so a slow CTR signal can supersede an early reviewer-block read."""
+    v = (verdict or "").strip().lower()
+    if v not in OUTCOME_VALUES:
+        raise AdaptError(
+            f"outcome must be one of {', '.join(OUTCOME_VALUES)} — got {verdict!r}"
+        )
+    path = _applied_path(pid)
+    prop = _load_proposal_file(path)
+    text = path.read_text(encoding="utf-8")
+    text = _set_frontmatter_field(text, "outcome", v)
+    text = _set_frontmatter_field(text, "outcome_measured", _now())
+    if note:
+        text = _set_frontmatter_field(text, "outcome_note", note.replace("\n", " "))
+    _atomic_write(path, text)
+    _append_log("OUTCOME", prop, f"{v}" + (f": {note}" if note else ""))
+    return {"pid": prop.pid, "outcome": v, "proposal": str(path), "summary": prop.summary}
+
+
+def scoreboard() -> dict:
+    """Tally outcomes across all applied adaptations. Returns counts per verdict,
+    the number still untagged, the total, and the hit-rate (improved / decisive),
+    where decisive = improved+no-change+regressed (inconclusive + untagged are
+    excluded — they carry no signal about whether the loop is net-positive)."""
+    counts = {v: 0 for v in OUTCOME_VALUES}
+    untagged = 0
+    total = 0
+    if APPLIED_DIR.is_dir():
+        for f in sorted(APPLIED_DIR.glob("*.md")):
+            prop = _load_applied(f)
+            if prop is None:
+                continue
+            total += 1
+            oc = (prop.meta.get("outcome") or "").strip().lower()
+            if oc in counts:
+                counts[oc] += 1
+            else:
+                untagged += 1
+    decisive = counts["improved"] + counts["no-change"] + counts["regressed"]
+    hit_rate = (counts["improved"] / decisive) if decisive else None
+    return {
+        "total": total,
+        "counts": counts,
+        "untagged": untagged,
+        "decisive": decisive,
+        "hit_rate": hit_rate,
+    }
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -362,6 +501,41 @@ def _cli_list() -> int:
     return 0
 
 
+def _cli_review_due() -> int:
+    props = due_for_review()
+    if not props:
+        print("No applied adaptations are due for an outcome review.")
+        return 0
+    print(f"{len(props)} applied adaptation(s) due for an outcome call:\n")
+    for p in props:
+        tgt = p.target.replace(str(Path.home()), "~")
+        eff = p.meta.get("expected_effect") or p.meta.get("metric") or "(no hypothesis recorded)"
+        print(f"  [{p.pid}] applied, due {p.meta.get('evaluate_after', '?')} → {tgt}")
+        print(f"      {p.summary}")
+        print(f"      expected: {eff}")
+    print("\nTag:  python3 adaptation.py --tag-outcome <id> --outcome "
+          f"<{'|'.join(OUTCOME_VALUES)}> [--note \"...\"]")
+    return 0
+
+
+def _cli_scoreboard() -> int:
+    sb = scoreboard()
+    c = sb["counts"]
+    print("Adaptation outcome scoreboard")
+    print(f"  applied total : {sb['total']}")
+    print(f"  improved      : {c['improved']}")
+    print(f"  no-change     : {c['no-change']}")
+    print(f"  regressed     : {c['regressed']}")
+    print(f"  inconclusive  : {c['inconclusive']}")
+    print(f"  untagged      : {sb['untagged']}")
+    if sb["hit_rate"] is None:
+        print("  hit-rate      : n/a (no decisive outcomes yet)")
+    else:
+        print(f"  hit-rate      : {sb['hit_rate']*100:.0f}% "
+              f"({c['improved']}/{sb['decisive']} decisive)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ADAPTS loop apply core")
     g = ap.add_mutually_exclusive_group(required=True)
@@ -369,8 +543,17 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--show", metavar="ID")
     g.add_argument("--apply", metavar="ID")
     g.add_argument("--reject", metavar="ID")
+    g.add_argument("--review-due", action="store_true",
+                   help="list applied adaptations whose evaluate_after has passed and are untagged")
+    g.add_argument("--tag-outcome", metavar="ID",
+                   help="record the outcome of an applied adaptation (needs --outcome)")
+    g.add_argument("--scoreboard", action="store_true",
+                   help="tally applied-adaptation outcomes + hit-rate")
     g.add_argument("--selftest", action="store_true")
     ap.add_argument("--reason", default="")
+    ap.add_argument("--outcome", default="",
+                    help=f"outcome verdict for --tag-outcome: {', '.join(OUTCOME_VALUES)}")
+    ap.add_argument("--note", default="", help="optional note for --tag-outcome")
     args = ap.parse_args(argv)
 
     try:
@@ -383,11 +566,24 @@ def main(argv: list[str] | None = None) -> int:
             res = apply_proposal(args.apply)
             print(f"APPLIED {res['pid']} → {res['target']}")
             print(f"  backup: {res['backup']}")
+            print(f"  evaluate_after: {res['evaluate_after']}")
             return 0
         if args.reject:
             res = reject_proposal(args.reject, args.reason)
             print(f"REJECTED {res['pid']}")
             return 0
+        if args.review_due:
+            return _cli_review_due()
+        if args.tag_outcome:
+            if not args.outcome:
+                print("error: --tag-outcome requires --outcome "
+                      f"<{'|'.join(OUTCOME_VALUES)}>", file=sys.stderr)
+                return 2
+            res = tag_outcome(args.tag_outcome, args.outcome, args.note)
+            print(f"OUTCOME {res['pid']} → {res['outcome']}")
+            return 0
+        if args.scoreboard:
+            return _cli_scoreboard()
         if args.selftest:
             return _selftest()
     except AdaptError as e:
@@ -488,6 +684,89 @@ def _selftest() -> int:
                         "You are the scriptwriter.\nUse hook style C.")
             apply_proposal("p9")
             self.assertIn("hook style C.", self.agent.read_text())
+
+        # --- outcome tagging --------------------------------------------------
+        def _backdate(self, pid, date_iso):
+            """Force an applied proposal's evaluate_after into the past so the
+            due-for-review check fires deterministically in the test."""
+            p = APPLIED_DIR / f"{pid}.md"
+            t = _set_frontmatter_field(p.read_text(encoding="utf-8"),
+                                       "evaluate_after", date_iso)
+            p.write_text(t, encoding="utf-8")
+
+        def test_apply_stamps_evaluate_after(self):
+            self._write("o1", str(self.agent), "Use hook style A.", "Use hook style B.")
+            res = apply_proposal("o1")
+            meta = _load_proposal_file(APPLIED_DIR / "o1.md").meta
+            self.assertEqual(meta.get("evaluate_after"), res["evaluate_after"])
+            # it's a future date, horizon days out
+            expected = (_dt.date.today() + _dt.timedelta(days=EVAL_HORIZON_DAYS)).isoformat()
+            self.assertEqual(meta["evaluate_after"], expected)
+
+        def test_tag_outcome_writes_fields_and_log(self):
+            self._write("o2", str(self.agent), "Use hook style A.", "Use hook style B.")
+            apply_proposal("o2")
+            tag_outcome("o2", "Improved", "block-rate dropped")  # case-insensitive
+            meta = _load_proposal_file(APPLIED_DIR / "o2.md").meta
+            self.assertEqual(meta["outcome"], "improved")
+            self.assertEqual(meta["outcome_note"], "block-rate dropped")
+            self.assertIn("OUTCOME", LOG_FILE.read_text())
+
+        def test_tag_outcome_ignores_body_field_line(self):
+            # Regression: a payload/body line starting with a frontmatter key must
+            # NOT be rewritten when that key is stamped — only the real frontmatter
+            # field changes, and the body is preserved verbatim.
+            self._write("o6", str(self.agent), "Use hook style A.",
+                        "Use hook style B.\noutcome: must always be measured")
+            apply_proposal("o6")
+            tag_outcome("o6", "improved")
+            applied = (APPLIED_DIR / "o6.md").read_text(encoding="utf-8")
+            meta = _load_proposal_file(APPLIED_DIR / "o6.md").meta
+            self.assertEqual(meta["outcome"], "improved")               # frontmatter stamped
+            self.assertIn("outcome: must always be measured", applied)  # body untouched
+
+        def test_tag_outcome_invalid_verdict(self):
+            self._write("o3", str(self.agent), "Use hook style A.", "Use hook style B.")
+            apply_proposal("o3")
+            with self.assertRaises(AdaptError):
+                tag_outcome("o3", "great-success")
+
+        def test_tag_outcome_unknown_id(self):
+            with self.assertRaises(AdaptError):
+                tag_outcome("nope", "improved")
+
+        def test_tag_outcome_traversal_id(self):
+            with self.assertRaises(AdaptError):
+                tag_outcome("../../etc/passwd", "improved")
+
+        def test_due_for_review_lifecycle(self):
+            self._write("o4", str(self.agent), "Use hook style A.", "Use hook style B.")
+            apply_proposal("o4")
+            # freshly applied → not yet due (evaluate_after is in the future)
+            self.assertEqual([p.pid for p in due_for_review()], [])
+            self._backdate("o4", "2000-01-01")
+            self.assertEqual([p.pid for p in due_for_review()], ["o4"])
+            # once tagged, it drops out of the due list
+            tag_outcome("o4", "no-change")
+            self.assertEqual([p.pid for p in due_for_review()], [])
+
+        def test_scoreboard_counts_and_hitrate(self):
+            for pid, new in (("s1", "B."), ("s2", "C."), ("s3", "D.")):
+                self.agent.write_text("You are the scriptwriter.\nUse hook style A.\nEnd.\n",
+                                      encoding="utf-8")
+                self._write(pid, str(self.agent), "Use hook style A.", f"Use hook style {new}")
+                apply_proposal(pid)
+            tag_outcome("s1", "improved")
+            tag_outcome("s2", "regressed")
+            tag_outcome("s3", "inconclusive")
+            sb = scoreboard()
+            self.assertEqual(sb["total"], 3)
+            self.assertEqual(sb["counts"]["improved"], 1)
+            self.assertEqual(sb["counts"]["regressed"], 1)
+            self.assertEqual(sb["counts"]["inconclusive"], 1)
+            self.assertEqual(sb["untagged"], 0)
+            self.assertEqual(sb["decisive"], 2)  # inconclusive excluded
+            self.assertAlmostEqual(sb["hit_rate"], 0.5)
 
     suite = unittest.TestLoader().loadTestsFromTestCase(T)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
