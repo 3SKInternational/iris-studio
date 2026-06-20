@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CANON REVIEW — monthly "reviewer of the reviewers" — installed 2026-06-20.
+
+  Closes the second half of the ADAPTS loop. The nightly adaptation-proposer is
+  REACTIVE and per-output (it retunes the agent that produced a weak output). This
+  runs the `canon-review` Claude routine, which dispatches the PROACTIVE, doc-level
+  `canon-reviewer` agent: it audits the CANON itself — the content-standard docs
+  (Discoverability_Playbook, Master_Character_Prompt, On_Model_Verification_Protocol)
+  and the reviewer rubrics (script-reviewer, image-reviewer) — for staleness/drift
+  against (a) fresh youtube-researcher intel about what the platform rewards NOW and
+  (b) the accumulated adaptation OUTCOME scoreboard (which past edits actually moved
+  the needle). For each standing canon line the evidence shows has gone stale, it
+  DRAFTS a surgical cited edit into the SAME /adapt queue Steve already approves, in
+  the SAME format — so the deterministic apply core (scripts/adaptation.py), the
+  /adapt approval flow, and the outcome-tagging loop all apply unchanged. The agent
+  NEVER applies; Steve one-taps `/adapt approve <id>`.
+
+  Runs via run_claude_job.sh (NOT run_job.sh): it's a `claude --print` routine, so
+  the SAME wrapper every other claude-code job uses handles logging, the
+  ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and the retry queue.
+
+  Schedule: MONTHLY on the 1st at 5:30 AM ET. Canon doesn't go stale nightly and
+  the audit needs accumulated outcome data + a month of fresh intel to judge drift,
+  so a monthly cadence (matching contradiction-detector / credential-check) is the
+  right altitude. canon-reviewer is evidence-gated + idempotent: a month with no
+  stale canon line drafts ZERO proposals and reports a clean no-op — it never spams.
+  5:30 on the 1st is a free slot after pre-brief (5:00 daily) and clear of the other
+  1st-of-month jobs (credential-check 4:15, contradiction-detector 4:45). Bump to a
+  fortnightly cadence later if the loop accumulates enough outcome signal to warrant.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-canon-review 2>/dev/null
+    cp scripts/com.iris.claude-code-canon-review.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-canon-review.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-canon-review   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-canon-review</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh canon-review /Volumes/AI_Workspace/iris_studio/routines/canon-review.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/canon-review.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/canon-review.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Day</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>5</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+</dict>
+</plist>
