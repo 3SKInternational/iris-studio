@@ -72,6 +72,19 @@ spend_alive() {
 
 alert() { "$NOTIFY" "$1" >>"$LOG" 2>&1 || log "notify FAILED: $1"; }
 
+# On a clean finish, build + open a contact sheet of the rendered batch so the
+# billed run can be eyeballed at a glance (standing instruction, 2026-06-19).
+# Best-effort and $0: never let a sheet failure change the watchdog's exit path.
+make_sheet() {
+  local sheet="$SCRIPT_DIR/contact_sheet.py"
+  [ -f "$sheet" ] || { log "contact_sheet.py not found at $sheet — skipping sheet"; return 0; }
+  log "building contact sheet for video ${VIDEO}"
+  # Bound the whole build (no `timeout` binary on macOS — perl's alarm stands in)
+  # so a stalled PNG decode on a slow/network path can't hang the watchdog.
+  perl -e 'alarm shift; exec @ARGV' 120 python3 "$sheet" "$VIDEO" --open >>"$LOG" 2>&1 \
+    || log "contact_sheet.py exited non-zero or timed out (non-fatal)"
+}
+
 log "watch start (poll=${POLL}s grace=${GRACE}s max=${MAX_WAIT}s)"
 
 # --- Startup grace: wait for the spend to appear (or already be done) ---------
@@ -93,7 +106,8 @@ elapsed=0
 while true; do
   st="$(stage5_status)"
   if [ "$st" = "done" ]; then
-    log "stage5 reached done — spend completed (orchestrator already notified)"; exit 0
+    log "stage5 reached done — spend completed (orchestrator already notified)"
+    make_sheet; exit 0
   fi
   if ! spend_alive; then
     # Re-read state: the process may have written stage5=done and exited in the
@@ -101,7 +115,8 @@ while true; do
     # finish. Only a non-done status after the process is truly gone is abnormal.
     st="$(stage5_status)"
     if [ "$st" = "done" ]; then
-      log "spend process exited with stage5=done — clean finish"; exit 0
+      log "spend process exited with stage5=done — clean finish"
+      make_sheet; exit 0
     fi
     log "spend process GONE with stage5='${st}' — abnormal end"
     alert "⚠️ Video ${VIDEO}: image spend STOPPED without completing (stage 5 = '${st}'). Killed/crashed mid-run — \$0 or a partial batch, nothing assembled. Re-authorize when ready: /pipeline ${VIDEO} spend-ok"
