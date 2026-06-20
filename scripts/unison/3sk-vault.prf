@@ -1,0 +1,52 @@
+# 3sk-vault.prf — Unison bidirectional sync profile for the 3SK vault.
+# Deploys to the AIR at ~/.unison/3sk-vault.prf (the Air is the initiator —
+# it is the intermittently-awake laptop, so it syncs itself on wake + interval).
+#
+# DO NOT enable bidirectional from a divergent state. The bootstrap script
+# (unison-bootstrap.sh) makes both sides byte-identical FIRST, then seeds the
+# Unison archive from that identical state. See the 2026-05-27 Syncthing
+# data-loss decision log before changing anything here.
+#
+# root1 = local Air vault.  root2 = Mini vault over ssh (Mini is canonical).
+# ⚠️ AIR_VAULT_ROOT is UNVERIFIED — CLAUDE.md says ~/3SK/outputs but both rsync
+#    scripts use ~/Documents/3SK/outputs. unison-bootstrap.sh verifies the real
+#    path via a sentinel file and refuses to run if it is wrong. Update the
+#    root below to whatever the bootstrap confirms BEFORE first use.
+root = /Users/mainfolder/Documents/3SK/outputs
+root = ssh://steve@100.118.108.65//Users/steve/Documents/3SK/outputs
+
+# --- Conflict behavior (the reason we chose Unison over Syncthing) -----------
+# batch=true: never prompt. With NO `prefer` set, a true conflict (same file
+# changed on both sides since last sync) is NOT propagated — Unison skips it and
+# leaves both copies untouched, then exits 1. The wrapper notifies on exit 1 so
+# you resolve it by hand. Everything non-conflicting still syncs.
+# DO NOT add `prefer = newer` — that silently clobbers the older edit, which is
+# exactly the behavior we picked Unison to avoid.
+batch = true
+auto = true
+times = true
+perms = 0
+
+# --- Backup net (recovery if a delete/overwrite ever slips through) ----------
+# maxbackups is INERT without a `backup` pattern. Keep up to 5 versions of every
+# changed/deleted path in a CENTRAL dir OUTSIDE the synced tree (so backups never
+# ping-pong as new files). This is the rollback net if Critical-1 ever fires.
+backup = Name *
+backuplocation = central
+backupdir = /Users/mainfolder/.unison/backups
+maxbackups = 5
+
+# --- ssh transport (Tailscale + dedicated Air->Mini key, non-interactive) ----
+sshargs = -i /Users/mainfolder/.ssh/id_ed25519_iris_mini_sync -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+
+# --- ignore patterns ---------------------------------------------------------
+# Per-machine UI state and clutter must NOT sync, or they ping-pong as conflicts.
+ignore = Name .DS_Store
+ignore = Name ._*
+ignore = Name .git
+ignore = Path .obsidian/workspace.json
+ignore = Path .obsidian/workspace-mobile.json
+ignore = Name .trash
+ignore = Name *.tmp
+ignore = Name .syncthing.*.tmp
+ignore = Name .unison.*

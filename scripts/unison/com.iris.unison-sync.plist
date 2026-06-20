@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.iris.unison-sync — INSTALLS ON THE AIR (not the Mini).
+  Bidirectional 3SK-vault sync, Air-initiated. Fires on login/wake (RunAtLoad)
+  and every 15 minutes while the Air is awake. No-ops cleanly when the Mini is
+  unreachable. Deploy to ~/Library/LaunchAgents/ on the Air, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.unison-sync.plist
+  Do NOT install until unison-bootstrap.sh has verified an identical state.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.unison-sync</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/mainfolder/iris_studio/scripts/unison/unison-sync-wrapper.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/mainfolder/iris_studio/logs/unison-sync.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mainfolder/iris_studio/logs/unison-sync.stdout.log</string>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>
