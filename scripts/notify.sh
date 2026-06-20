@@ -14,6 +14,12 @@
 #   ./notify.sh "message text"
 #   echo "message text" | ./notify.sh
 #   ./notify.sh "🔴 nightly job failed: <detail>"
+#   ./notify.sh --photo /path/to/image.png "optional caption"   # send an image
+#
+# In --photo mode the image is uploaded inline (Telegram sendPhoto) with the
+# remaining args as an optional caption — used e.g. to push a finished contact
+# sheet so a billed render batch can be eyeballed on the phone, not just on the
+# Mac. The default (no --photo) text path is unchanged.
 #
 # Reads TELEGRAM_BOT_TOKEN + IRIS_TELEGRAM_USER_IDS (first id = chat target) from
 # the gitignored .env next to iris.py. No secrets live in this file.
@@ -40,6 +46,38 @@ CHAT_ID=$(grep -E '^IRIS_TELEGRAM_USER_IDS=' "$ENV_FILE" | head -1 | cut -d= -f2
 if [ -z "${TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
     echo "notify.sh ERROR: TELEGRAM_BOT_TOKEN or IRIS_TELEGRAM_USER_IDS missing in .env" >&2
     exit 1
+fi
+
+# --- Photo mode: notify.sh --photo /path/to.png "optional caption" -----------
+if [ "${1:-}" = "--photo" ]; then
+    PHOTO="${2:-}"
+    if [ -z "$PHOTO" ]; then
+        echo "notify.sh ERROR: --photo needs a file path" >&2
+        exit 1
+    fi
+    if [ ! -f "$PHOTO" ]; then
+        echo "notify.sh ERROR: --photo file not found: $PHOTO" >&2
+        exit 1
+    fi
+    shift 2
+    CAPTION="$*"   # may be empty — Telegram allows a caption-less photo
+    # Multipart upload (sendPhoto). Larger --max-time than text since we're
+    # uploading a few MB. `|| RESP=""` keeps a curl-level failure on the error path.
+    # --form-string for text fields so a caption starting with '@' or '<' is sent
+    # literally, not interpreted by curl as a file reference; -F only for the upload.
+    RESP=$(curl -s --max-time 60 \
+        -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+        --form-string "chat_id=${CHAT_ID}" \
+        -F "photo=@${PHOTO}" \
+        --form-string "caption=${CAPTION}") || RESP=""
+
+    if printf '%s' "$RESP" | grep -q '"ok":true'; then
+        echo "notify.sh: photo delivered to chat ${CHAT_ID}"
+        exit 0
+    else
+        echo "notify.sh ERROR: Telegram API rejected the photo send: $RESP" >&2
+        exit 2
+    fi
 fi
 
 # Message from args, or stdin if no args given.

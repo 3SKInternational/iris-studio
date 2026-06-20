@@ -78,11 +78,20 @@ alert() { "$NOTIFY" "$1" >>"$LOG" 2>&1 || log "notify FAILED: $1"; }
 make_sheet() {
   local sheet="$SCRIPT_DIR/contact_sheet.py"
   [ -f "$sheet" ] || { log "contact_sheet.py not found at $sheet — skipping sheet"; return 0; }
+  local out="/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Raw_Assets/Image_Factory/_REVIEW/Video_${NN}_contact_sheet.png"
+  rm -f "$out" 2>/dev/null || true   # never send a stale sheet if this build fails
   log "building contact sheet for video ${VIDEO}"
   # Bound the whole build (no `timeout` binary on macOS — perl's alarm stands in)
   # so a stalled PNG decode on a slow/network path can't hang the watchdog.
-  perl -e 'alarm shift; exec @ARGV' 120 python3 "$sheet" "$VIDEO" --open >>"$LOG" 2>&1 \
+  perl -e 'alarm shift; exec @ARGV' 120 python3 "$sheet" "$VIDEO" --open --output "$out" >>"$LOG" 2>&1 \
     || log "contact_sheet.py exited non-zero or timed out (non-fatal)"
+  # Also push it inline to Telegram so the batch can be eyeballed off the Mac.
+  if [ -f "$out" ]; then
+    "$NOTIFY" --photo "$out" "🖼 Video ${VIDEO}: render batch complete — contact sheet." \
+      >>"$LOG" 2>&1 || log "telegram photo send failed (non-fatal)"
+  else
+    log "no contact sheet at $out — skipping telegram photo"
+  fi
 }
 
 log "watch start (poll=${POLL}s grace=${GRACE}s max=${MAX_WAIT}s)"
