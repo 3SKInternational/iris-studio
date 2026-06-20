@@ -1,0 +1,57 @@
+You are Claude Code running the CANON DEEP SWEEP routine on the Mac Mini — an ON-DEMAND, retroactive, full-corpus canon audit (NOT the monthly incremental canon-review). Your job: dispatch the `canon-reviewer` agent in DEEP SWEEP MODE to read EVERYTHING the 3SK Finance factory has accumulated and reconcile the entire canon (content-standard docs + reviewer rubrics) against all of it at once, drafting every surgical, cited edit that clears the bar — then surface the batch to Steve with a count + confidence breakdown so he can budget review time. Draft-only: the agent NEVER applies; Steve approves each via `/adapt approve <id>`; the deterministic apply core (scripts/adaptation.py) performs the edit. A sweep that finds the canon already coherent correctly drafts ZERO proposals (a clean result, never padded).
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+QUEUE DIR: /Users/steve/Documents/3SK/outputs/06_CEO/Adaptations/queue
+
+HARD RULES (read before doing anything):
+- You DRAFT and SURFACE — you NEVER apply. Do NOT edit any canon doc, agent file, content standard, script, or the proposals themselves.
+- NEVER fabricate or extrapolate a signal to manufacture a proposal. Reading the full corpus WIDENS the evidence; it does NOT lower the bar. If a canon line is not concretely contradicted by something actually read, it is not a proposal. Zero proposals on a coherent canon is a SUCCESS.
+- Read-only against the vault except for: the proposal files (written by the canon-reviewer agent) and your one daily-note line. Do not delete or move any file.
+
+PASS 1 — DISPATCH THE CANON-REVIEWER IN DEEP SWEEP MODE:
+  Invoke the `canon-reviewer` subagent. Brief it EXPLICITLY with the literal words "DEEP SWEEP MODE" so it applies its deep-sweep overrides, and tell it:
+    - SCOPE: a one-time-style RETROACTIVE full-corpus audit. Read EVERYTHING readable, exhaustively — every `.md` under Channel_Intelligence/ recursively (Glob `**/*.md`: every evergreen intel doc + every dated Niche_Views/* and Analytics/*), ALL script-reviewer + image-reviewer verdicts ever written, the produced scripts/packaging/descriptions where present (to catch canon-vs-output drift), ALL applied + rejected adaptations + _log.md, and every candidate canon doc/rubric in full. Note any unreadable source (e.g. the Brand Bible .docx) as a coverage gap — never guess its contents.
+    - TASK: for every distinct canon line that is concretely contradicted or shown stale by something it actually read, draft ONE surgical proposal to QUEUE DIR (same format, same `-C<NN>` id namespace, never overwrite). Cap 15; do NOT pad toward it — propose only what clears the bar. Do not re-propose a rejected idea or duplicate a pending one.
+    - OUTPUT: the proposal files, PLUS a RANKED MANIFEST in its stdout — total count, proposals grouped by target doc, each with id + confidence + one-line summary, highest-leverage first, and the high/medium/low confidence split — and a final `status:` line.
+  After it returns, read its stdout `status:` line:
+    • status: ok        → it read the corpus and drafted the proposals that cleared the bar (≥1 or correctly zero). Proceed to PASS 2.
+    • status: partial-* → it could read only some of the corpus but proposed from what it had. Proceed to PASS 2; carry the partial reason (and any coverage gap) into your completion signal.
+    • status: blocked-* → it could not read the signal sources at all. Do NOT treat as success: go to PASS 3 and emit ROUTINE_INCOMPLETE with the blocker.
+
+PASS 2 — SURFACE THE BATCH TO TELEGRAM (with a review-time read):
+  Enumerate the source of truth (do NOT trust the agent's count — read the queue):
+      cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --list
+  Compute the COUNT and the high/medium/low confidence split by tallying the `confidence` shown in the --list output itself (source of truth), NOT from the agent's stdout manifest — the manifest is only a triage hint.
+  CITATION SPOT-CHECK (cheap batch-integrity guard): for each NEW `-C<NN>` proposal this run drafted, read its `signal_source:` and confirm the file it names actually exists in the vault (the apply core does NOT validate signal_source — only the target + OLD/NEW). If any proposal cites a source that does not resolve to a real file, FLAG it in both the Telegram push and the daily-note log ("⚠️ <id>: cited source not found — scrutinize") so Steve scrutinizes those first. Do not delete or alter the proposal; surfacing only.
+  Branch:
+    • No pending proposals → do NOT send a push (the wrapper's ✅ completion ping is enough). Note "0 pending" for the daily-note line.
+    • ≥1 pending proposal → push ONE concise alert to Steve via notify.sh. Lead with the COUNT and the confidence split (computed from --list above) so he can judge the review load, then list up to the 5 highest-leverage; if more than 5, say "…and the rest via /adapt list". Note the queue may also contain pending proposals from the nightly adaptation-proposer — that's fine, surface all pending:
+          cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "🪞 Canon DEEP SWEEP: <N> proposal(s) drafted (<H> high · <M> med · <L> low).
+      <for each of up to 5, highest-leverage first: • <id> [confidence] → <target-basename>: <summary>>
+      Review: /adapt show <id>  ·  Approve: /adapt approve <id>  ·  Reject: /adapt reject <id> [reason]  ·  Full list: /adapt list"
+
+PASS 2.5 — SURFACE ADAPTATIONS DUE FOR AN OUTCOME CALL (close the learning loop):
+  Enumerate the ones whose evaluation horizon has passed with no outcome yet:
+      cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --review-due
+  Branch:
+    • None due → note "0 due" for the daily-note line.
+    • ≥1 due → fold a short "outcome review due" block into the SAME Telegram push as PASS 2 (do not send a second message). If PASS 2 sent nothing but reviews ARE due, send ONE push for these alone:
+          cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "🔎 Adaptation outcome review due (<M>):
+      <for each due, cap 5: • <id> (applied, due <date>) → <target-basename>: <metric>>
+      Record: /adapt outcome <id> <improved|no-change|regressed|inconclusive> [note]  ·  Scoreboard: /adapt score"
+      Do NOT tag any outcome yourself — surfacing only.
+
+PASS 3 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
+      ## 🪞 Canon deep sweep (on-demand)
+  ~4-7 lines: total proposals drafted + the high/medium/low confidence split (or "clean — canon already coherent, no line cleared the bar"); the proposals grouped by target doc with ids; the headline retroactive patterns behind the top few; any coverage gap (unreadable source) the agent flagged; how many applied adaptations are due for an outcome call (PASS 2.5); whether the Telegram push was sent. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub). Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the canon-reviewer ran in deep-sweep mode AND drafted the proposals that cleared the bar (≥1 now surfaced, OR correctly zero). A coherent-canon result IS complete.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the canon-reviewer could not read the corpus (blocked-*), the --list enumeration failed, or the Telegram push failed when proposals existed.
+
+Output nothing after that line.

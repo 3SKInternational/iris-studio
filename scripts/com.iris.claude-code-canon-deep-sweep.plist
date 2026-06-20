@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CANON DEEP SWEEP — ON-DEMAND, retroactive full-corpus canon audit — installed 2026-06-20.
+
+  This is the heavy, one-time-style sibling of the MONTHLY canon-review job
+  (com.iris.claude-code-canon-review.plist). Where canon-review is an incremental
+  monthly pass over a month of fresh intel, this DEEP SWEEP dispatches the same
+  `canon-reviewer` agent in DEEP SWEEP MODE: it reads EVERYTHING the 3SK Finance
+  factory has accumulated — every Channel_Intelligence/ doc (recursively, incl. all
+  dated Niche_Views/* + Analytics/*), every script/image/stage reviewer verdict ever
+  written, the produced scripts/packaging/descriptions, all applied + rejected
+  adaptations + _log.md, and every candidate canon doc/rubric in full — and reconciles
+  the entire canon against the whole corpus at once. For each standing canon line the
+  evidence shows stale or contradicted it DRAFTS a surgical cited edit (cap 15) into the
+  SAME /adapt queue Steve already approves, same `-C<NN>` id namespace, same deterministic
+  apply core (scripts/adaptation.py). Draft-only: the agent NEVER applies; Steve one-taps
+  `/adapt approve <id>`. A coherent canon correctly drafts ZERO proposals.
+
+  *** ON-DEMAND ONLY — there is intentionally NO StartCalendarInterval and RunAtLoad is
+  false, so this NEVER fires on a schedule. It runs ONLY when explicitly kickstarted.
+  The deep sweep is expensive (full-corpus read) and the monthly canon-review already
+  covers the steady state; fire this manually after a big accumulation of new intel /
+  outputs, or when you want a from-scratch reconciliation. ***
+
+  Runs via run_claude_job.sh (NOT run_job.sh): a `claude --print` routine, so the SAME
+  wrapper every other claude-code job uses handles logging, the
+  ROUTINE_COMPLETE/INCOMPLETE sentinel -> Telegram alert, and the retry queue.
+
+  Manage / install:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-canon-deep-sweep 2>/dev/null
+    cp scripts/com.iris.claude-code-canon-deep-sweep.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-canon-deep-sweep.plist
+
+  Fire a deep sweep on demand (the reusable handle):
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-canon-deep-sweep
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-canon-deep-sweep</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh canon-deep-sweep /Volumes/AI_Workspace/iris_studio/routines/canon-deep-sweep.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/canon-deep-sweep.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/canon-deep-sweep.stdout.log</string>
+</dict>
+</plist>
