@@ -46,6 +46,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
@@ -151,7 +152,59 @@ def parse_desc_pack(path: Path) -> dict:
         "description": description,
         "tags": tags,
         "pinned_comment": _section(body, "Pinned comment"),
+        "do_not_publish_before": fm.get("do_not_publish_before"),
     }
+
+
+# --- release-date gate -----------------------------------------------------
+# Why: a public publish must never happen before its INTENDED release day. V2
+# went public a day early because the only guardrail was --allow-public, a flag
+# an automated agent can satisfy on its own. This gate keys off a per-video
+# `do_not_publish_before:` date (description-pack frontmatter, receipt fallback)
+# and HARD-FAILS — there is deliberately no override flag. To publish early you
+# edit the date, an intentional human act.
+
+ET = ZoneInfo("America/New_York")
+
+
+def parse_release_gate(value: str, *, source: str) -> datetime:
+    """Parse a do_not_publish_before value into a tz-aware datetime.
+
+    'YYYY-MM-DD'  -> 00:00 America/New_York that day (the channel's tz).
+    Full ISO8601  -> aware value respected; a naive value is read as ET.
+    """
+    v = str(value).strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            # strptime (not just the regex) validates the calendar date, so a
+            # plausible typo like 2026-13-01 / 2026-02-30 is caught here too.
+            return datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=ET)
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        die(f"`do_not_publish_before` in {source} is not a valid date/ISO8601: "
+            f"{value!r} (use YYYY-MM-DD or a full ISO8601 timestamp).")
+    return dt.replace(tzinfo=ET) if dt.tzinfo is None else dt
+
+
+def enforce_release_gate(*, going_public: bool, effective_moment: datetime,
+                         gate_raw, gate_source: str, already_public: bool,
+                         vid: str, desc_pack_name: str) -> None:
+    """Block a public/scheduled publish that has no declared release date, or
+    whose effective publish moment is before that date. No-op for non-public
+    targets and for refreshing an already-public video."""
+    if not going_public or already_public:
+        return
+    if not gate_raw:
+        die(f"release-date gate: refusing to publish {vid} public — no "
+            f"`do_not_publish_before` declared. Add `do_not_publish_before: "
+            f"YYYY-MM-DD` to {desc_pack_name} frontmatter (the intended release "
+            "day), then publish. No override flag by design.")
+    gate_dt = parse_release_gate(gate_raw, source=gate_source)
+    if effective_moment < gate_dt:
+        die(f"release-date gate: {vid} is not publishable until {gate_raw} "
+            f"(do_not_publish_before, from {gate_source}). Effective publish "
+            f"moment is {effective_moment.astimezone(ET).isoformat()}. Wait until "
+            "then, or change the date in the description pack. No override flag.")
 
 
 # --- input resolution ------------------------------------------------------
@@ -531,6 +584,16 @@ def main() -> None:
         die("refusing to upload public/scheduled without --allow-public "
             "(the roadmap review-gate guardrail).")
 
+    enforce_release_gate(
+        going_public=going_public,
+        effective_moment=(pa_dt if publish_at else datetime.now(timezone.utc)),
+        gate_raw=meta.get("do_not_publish_before"),
+        gate_source=desc_pack.name,
+        already_public=False,  # insert path: the video is not on the channel yet.
+        vid=vid,
+        desc_pack_name=desc_pack.name,
+    )
+
     has_placeholders = bool(PLACEHOLDER_RE.search(meta["description"]))
     if has_placeholders:
         if going_public and not args.allow_placeholders:
@@ -613,6 +676,7 @@ def main() -> None:
         "captions_set": False,
         "thumbnail_set": False,
         "pinned_comment": meta.get("pinned_comment"),
+        "do_not_publish_before": meta.get("do_not_publish_before"),
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "source_file": str(video_file),
     }

@@ -57,6 +57,7 @@ from upload_video import (  # noqa: E402
     PLACEHOLDER_RE,
     _resolve_path,
     die,
+    enforce_release_gate,
     normalize_id,
     parse_desc_pack,
     resolve_thumbnail,
@@ -154,6 +155,22 @@ def main() -> None:
     if going_public and not args.allow_public:
         die("refusing to publish public/scheduled without --allow-public (the review-gate guardrail).")
 
+    gate_raw = meta.get("do_not_publish_before") or (receipt or {}).get("do_not_publish_before")
+    gate_source = desc_pack.name if meta.get("do_not_publish_before") else "receipt"
+    effective_moment = pa_dt if publish_at else datetime.now(timezone.utc)
+    # Release-date gate (pre-network, also covers --dry-run). Trust the receipt's
+    # last-known privacy to exempt a metadata refresh of an already-public video;
+    # the authoritative live re-check happens after the fetch below.
+    enforce_release_gate(
+        going_public=going_public,
+        effective_moment=effective_moment,
+        gate_raw=gate_raw,
+        gate_source=gate_source,
+        already_public=(receipt or {}).get("privacy") == "public",
+        vid=vid,
+        desc_pack_name=desc_pack.name,
+    )
+
     if PLACEHOLDER_RE.search(meta["description"]):
         if going_public and not args.allow_placeholders:
             die("description still has unresolved [AFFILIATE LINK]/[WORKSHEET LINK] placeholders "
@@ -204,6 +221,19 @@ def main() -> None:
     live_snippet = live.get("snippet") or {}
     live_status = live.get("status") or {}
     prev_privacy = live_status.get("privacyStatus")
+
+    # Authoritative release-date gate: re-check against the LIVE privacy (the
+    # receipt can be stale). A genuine refresh of an already-public video is
+    # exempt; a private→public transition is held to the declared release date.
+    enforce_release_gate(
+        going_public=going_public,
+        effective_moment=effective_moment,
+        gate_raw=gate_raw,
+        gate_source=gate_source,
+        already_public=(prev_privacy == "public"),
+        vid=vid,
+        desc_pack_name=desc_pack.name,
+    )
 
     # 2) Build the update body from a WHITELIST of WRITABLE fields only.
     # videos.update REPLACES the snippet/status parts wholesale, and echoing
@@ -281,6 +311,7 @@ def main() -> None:
         "category_id": snippet.get("categoryId"),
         "tags": tags,
         "pinned_comment": meta.get("pinned_comment") or out.get("pinned_comment"),
+        "do_not_publish_before": gate_raw or out.get("do_not_publish_before"),
         "thumbnail_set": bool(thumb) or out.get("thumbnail_set", False),
         "captions_set": captions_set or out.get("captions_set", False),
         "last_published_at": datetime.now(timezone.utc).isoformat(),
