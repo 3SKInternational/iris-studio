@@ -167,6 +167,43 @@ def parse_cut_anchors(text: str) -> dict[int, list[str]]:
     return out
 
 
+def lint_cut_anchors(shots: list[dict], edit_anchors: dict[int, list[str]]) -> list[str]:
+    """Build-time diagnostics for the optional phrase-anchored cut directive.
+
+    A multi-shot scene with NO `✂️ Cut-anchors:` directive silently falls back to
+    even-sentence-split picture timing — the exact misalignment that defect
+    existed to prevent (Video_02, 2026-06-18). Because shot lists are hand-authored
+    and nothing emits the directive automatically, a new video's missing anchors
+    were invisible until someone eyeballed the assembled cut. This surfaces them at
+    build time so they are loud, not silent.
+
+    Pure warning, never fatal: the even-split fallback is a valid, intentional
+    default, so a missing/miscounted directive must not block a build. Returns a
+    list of human-readable warning strings (no `⚠` prefix — the caller adds it,
+    matching the other build warnings).
+    """
+    shots_per_scene: dict[int, int] = {}
+    for s in shots:
+        shots_per_scene[s["scene"]] = shots_per_scene.get(s["scene"], 0) + 1
+    warns: list[str] = []
+    for scene in sorted(shots_per_scene):
+        k = shots_per_scene[scene]
+        if k < 2:
+            continue  # single-shot scene: no internal cut, no anchors needed
+        phrases = edit_anchors.get(scene)
+        if not phrases:
+            warns.append(
+                f"scene {scene} has {k} shots but no Cut-anchors directive — picture "
+                f"cuts use even-sentence-split timing, not the editorial beats. Add: "
+                f'> ✂️ Cut-anchors: {scene} | "phrase" | … ({k - 1} verbatim spoken phrases)')
+        elif len(phrases) != k - 1:
+            warns.append(
+                f"scene {scene} Cut-anchors has {len(phrases)} phrase(s) but {k} shots "
+                f"need {k - 1} — the directive will be rejected and the scene falls back "
+                f"to even-split timing (fix the phrase count)")
+    return warns
+
+
 # --- VO kit parsing (captions) --------------------------------------------
 
 _KIT_BLOCK_RE = re.compile(r"^##\s+Scene\s+(\d+)\s*(?:->|→)\s*`([^`]+\.mp3)`[^\n]*\n", re.MULTILINE)
@@ -715,6 +752,8 @@ def main() -> None:
 
     shots, cadence = parse_shot_list(shot_list)
     edit_anchors = parse_cut_anchors(shot_list.read_text(encoding="utf-8"))
+    for w in lint_cut_anchors(shots, edit_anchors):
+        print(f"  ⚠ {w}")
     kit = parse_kit(vo_kit)
 
     # Warn if the kit and shot list disagree on which scenes exist — a mismatch
