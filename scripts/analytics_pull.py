@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Build 4 — performance-feedback data feed (YouTube Analytics API v2).
 
-Pulls OUR channel's per-video metrics (views, CTR, average view duration, avg %
-viewed, subscribers gained) + channel traffic sources + the top videos' audience
-retention curve over a window, and writes them as a **metrics block** markdown
-file under ``Channel_Intelligence/Analytics/``. That file is the exact input the
+Pulls OUR channel's per-video metrics (views, average view duration, avg %
+viewed, subscribers gained, likes/comments/shares) + channel traffic sources +
+the top videos' audience retention curve over a window, and writes them as a
+**metrics block** markdown file under ``Channel_Intelligence/Analytics/``.
+
+Note on CTR/impressions: thumbnail **impressions** and **impression CTR** are NOT
+exposed by the YouTube Analytics API — the API rejects those identifiers with a
+400 "Unknown identifier" (verified 2026-06-20). They exist only in YouTube Studio.
+If ``channel-analyst`` needs CTR, it must come from a Studio CSV/manual paste, not
+this feed. This script therefore does not attempt to query them.
+
+That file is the exact input the
 ``channel-analyst`` agent already consumes — Build 4 swaps the agent's manual
 YouTube-Studio-CSV paste for this automated pull. The agent's analysis logic is
 unchanged; only the input is now automated.
@@ -45,9 +53,10 @@ from youtube_client import (  # noqa: E402
 DEFAULT_VAULT = "~/Documents/3SK/outputs/BRANDS/3SK_Finance"
 ANALYTICS_SUBDIR = "Channel_Intelligence/Analytics"
 
-# Core per-video metrics that exist for every channel report. CTR + impressions
-# are requested SEPARATELY (some channels/date-ranges reject them) and degrade to
-# "n/a" rather than failing the whole pull.
+# Core per-video metrics that exist for every channel report.
+# (Thumbnail impressions + impression CTR are intentionally absent: the YouTube
+# Analytics API rejects those identifiers — see the module docstring. They are a
+# Studio-only metric and must be pasted in manually if the analyst needs them.)
 CORE_METRICS = [
     "views",
     "estimatedMinutesWatched",
@@ -58,7 +67,6 @@ CORE_METRICS = [
     "comments",
     "shares",
 ]
-CTR_METRICS = ["impressions", "impressionsClickThroughRate"]
 
 RETENTION_TOP_N = 5   # pull the audience-retention curve for the top-N by views.
 MAX_VIDEOS = 50       # cap the per-video table (one analytics row each).
@@ -203,13 +211,6 @@ def fmt_avd(seconds) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def fmt_ctr(v) -> str:
-    try:
-        return f"{float(v):.2f}%"
-    except (TypeError, ValueError):
-        return "n/a"
-
-
 def write_report(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -233,8 +234,7 @@ def skeleton(path: Path, status: str, note: str, start: str, end: str) -> None:
 
 
 def build_report_body(channel: dict, start: str, end: str, rows: list[dict],
-                      traffic: list[tuple[str, int]], retention: dict[str, str],
-                      ctr_available: bool) -> str:
+                      traffic: list[tuple[str, int]], retention: dict[str, str]) -> str:
     lines = [
         "---",
         f"date: {date.today().isoformat()}",
@@ -255,34 +255,19 @@ def build_report_body(channel: dict, start: str, end: str, rows: list[dict],
         "",
         "## Per-video metrics",
         "",
+        "_Thumbnail CTR + impressions are not in this feed — the YouTube Analytics "
+        "API does not expose them (Studio-only). If you need CTR, paste a YouTube "
+        "Studio export; everything else below is live from the API._",
+        "",
+        "| Video | Views | AVD | Avg % | Subs+ | Likes | Comments |",
+        "|---|---|---|---|---|---|---|",
     ]
-    if ctr_available:
-        lines += [
-            "| Video | Views | Impressions | CTR | AVD | Avg % | Subs+ | Likes | Comments |",
-            "|---|---|---|---|---|---|---|---|---|",
-        ]
-        for r in rows:
-            lines.append(
-                f"| {_cell(r['title'], 48)} | {r.get('views', 0)} | "
-                f"{r.get('impressions', 'n/a')} | {fmt_ctr(r.get('impressionsClickThroughRate'))} | "
-                f"{fmt_avd(r.get('averageViewDuration'))} | "
-                f"{_pct(r.get('averageViewPercentage'))} | {r.get('subscribersGained', 0)} | "
-                f"{r.get('likes', 0)} | {r.get('comments', 0)} |"
-            )
-    else:
-        lines += [
-            "_CTR/impressions unavailable for this window (the Analytics API rejected "
-            "them — often too little data yet); core metrics only._",
-            "",
-            "| Video | Views | AVD | Avg % | Subs+ | Likes | Comments |",
-            "|---|---|---|---|---|---|---|",
-        ]
-        for r in rows:
-            lines.append(
-                f"| {_cell(r['title'], 48)} | {r.get('views', 0)} | "
-                f"{fmt_avd(r.get('averageViewDuration'))} | {_pct(r.get('averageViewPercentage'))} | "
-                f"{r.get('subscribersGained', 0)} | {r.get('likes', 0)} | {r.get('comments', 0)} |"
-            )
+    for r in rows:
+        lines.append(
+            f"| {_cell(r['title'], 48)} | {r.get('views', 0)} | "
+            f"{fmt_avd(r.get('averageViewDuration'))} | {_pct(r.get('averageViewPercentage'))} | "
+            f"{r.get('subscribersGained', 0)} | {r.get('likes', 0)} | {r.get('comments', 0)} |"
+        )
     lines += ["", "## Channel traffic sources (by views)", ""]
     if traffic:
         lines.append("| Source | Views |")
@@ -365,16 +350,12 @@ def main() -> None:
 
     title_by_id = {v["id"]: v["title"] for v in videos}
     core = query_per_video(analytics, channel["id"], start, end, CORE_METRICS)
-    ctr = query_per_video(analytics, channel["id"], start, end, CTR_METRICS)
-    ctr_available = bool(ctr)
 
-    # Merge core + CTR per video; keep core ordering (already -views sorted).
+    # Build rows from the core pull; keep its ordering (already -views sorted).
     rows: list[dict] = []
     for vid_id, rec in core.items():
         merged = {"id": vid_id, "title": title_by_id.get(vid_id, vid_id)}
         merged.update(rec)
-        if vid_id in ctr:
-            merged.update(ctr[vid_id])
         rows.append(merged)
 
     if not rows:
@@ -392,7 +373,7 @@ def main() -> None:
         retention[r["title"]] = biggest_dip(curve)
 
     write_report(out, build_report_body(channel, start, end, rows, traffic,
-                                        retention, ctr_available))
+                                        retention))
     print(f"\n✅ wrote analytics feed ({len(rows)} videos) → {out}")
     print("   Next: dispatch `channel-analyst` with this file's path for the diagnosis.")
 
