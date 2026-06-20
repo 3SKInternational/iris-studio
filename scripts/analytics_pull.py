@@ -7,10 +7,14 @@ the top videos' audience retention curve over a window, and writes them as a
 **metrics block** markdown file under ``Channel_Intelligence/Analytics/``.
 
 Note on CTR/impressions: thumbnail **impressions** and **impression CTR** are NOT
-exposed by the YouTube Analytics API — the API rejects those identifiers with a
-400 "Unknown identifier" (verified 2026-06-20). They exist only in YouTube Studio.
-If ``channel-analyst`` needs CTR, it must come from a Studio CSV/manual paste, not
-this feed. This script therefore does not attempt to query them.
+served by the real-time YouTube Analytics API v2 — it recognizes the identifiers
+but rejects them in ``reports().query()`` (verified 2026-06-20). They are
+**bulk-only**: Google exposes them through the YouTube *Reporting* API. This script
+enriches the per-video table with those two columns via ``reporting_reach.py``
+when the data is available (the reach reporting job must exist and have generated
+at least one report). Until then those cells show ``n/a`` — never fabricated, and
+the rest of the feed runs normally. See ``reporting_reach.py`` for the one-time
+enable + job-creation steps.
 
 That file is the exact input the
 ``channel-analyst`` agent already consumes — Build 4 swaps the agent's manual
@@ -36,7 +40,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -49,14 +53,15 @@ from youtube_client import (  # noqa: E402
     load_credentials,
     resolve_channel,
 )
+from reporting_reach import fetch_reach  # noqa: E402  (bulk thumbnail impressions + CTR)
 
 DEFAULT_VAULT = "~/Documents/3SK/outputs/BRANDS/3SK_Finance"
 ANALYTICS_SUBDIR = "Channel_Intelligence/Analytics"
 
 # Core per-video metrics that exist for every channel report.
-# (Thumbnail impressions + impression CTR are intentionally absent: the YouTube
-# Analytics API rejects those identifiers — see the module docstring. They are a
-# Studio-only metric and must be pasted in manually if the analyst needs them.)
+# (Thumbnail impressions + impression CTR are NOT here: the real-time Analytics
+# API rejects those identifiers. They are bulk-only and merged in separately from
+# the Reporting API via reporting_reach.fetch_reach — see the module docstring.)
 CORE_METRICS = [
     "views",
     "estimatedMinutesWatched",
@@ -255,16 +260,18 @@ def build_report_body(channel: dict, start: str, end: str, rows: list[dict],
         "",
         "## Per-video metrics",
         "",
-        "_Thumbnail CTR + impressions are not in this feed — the YouTube Analytics "
-        "API does not expose them (Studio-only). If you need CTR, paste a YouTube "
-        "Studio export; everything else below is live from the API._",
+        "_Impressions + CTR come from the YouTube **Reporting** API (bulk), merged in "
+        "via `reporting_reach.py`. They show `n/a` until the reach reporting job has "
+        "generated its first report (~24-48h after creation) — never fabricated. "
+        "Everything else is live from the Analytics API._",
         "",
-        "| Video | Views | AVD | Avg % | Subs+ | Likes | Comments |",
-        "|---|---|---|---|---|---|---|",
+        "| Video | Impr. | CTR | Views | AVD | Avg % | Subs+ | Likes | Comments |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
-            f"| {_cell(r['title'], 48)} | {r.get('views', 0)} | "
+            f"| {_cell(r['title'], 48)} | {_impr(r.get('impressions'))} | "
+            f"{_ctr(r.get('ctr'))} | {r.get('views', 0)} | "
             f"{fmt_avd(r.get('averageViewDuration'))} | {_pct(r.get('averageViewPercentage'))} | "
             f"{r.get('subscribersGained', 0)} | {r.get('likes', 0)} | {r.get('comments', 0)} |"
         )
@@ -289,6 +296,22 @@ def build_report_body(channel: dict, start: str, end: str, rows: list[dict],
 def _pct(v) -> str:
     try:
         return f"{float(v):.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _impr(v) -> str:
+    """Format impressions count, or n/a when reach data is not yet available."""
+    try:
+        return f"{int(v):,}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _ctr(v) -> str:
+    """Format impression CTR (a 0..1 ratio) as a percentage, or n/a."""
+    try:
+        return f"{float(v) * 100:.1f}%"
     except (TypeError, ValueError):
         return "n/a"
 
@@ -365,6 +388,26 @@ def main() -> None:
                  start, end)
         print(f"\nℹ no analytics rows for window → wrote partial skeleton: {out}")
         return
+
+    # Merge bulk thumbnail impressions + CTR from the Reporting API (best-effort:
+    # empty until the reach job has generated a report — cells show n/a, no crash).
+    # fetch_reach has a no-raise contract; the extra guard is belt-and-suspenders
+    # so an otherwise-good run is never sunk by the enrichment step.
+    try:
+        reach = fetch_reach(creds, date.fromisoformat(start), date.fromisoformat(end))
+    except Exception as exc:  # noqa: BLE001
+        print(f"reach      : enrichment skipped ({type(exc).__name__})", file=sys.stderr)
+        reach = {}
+    if reach:
+        for r in rows:
+            m = reach.get(r["id"])
+            if m:
+                r["impressions"] = m.get("impressions")
+                if "ctr" in m:
+                    r["ctr"] = m["ctr"]
+        print(f"reach      : merged impressions+CTR for {sum(1 for r in rows if 'impressions' in r)}/{len(rows)} video(s)")
+    else:
+        print("reach      : no impressions/CTR data yet (Reporting API job pending) — cells show n/a")
 
     traffic = query_traffic_sources(analytics, channel["id"], start, end)
     retention: dict[str, str] = {}

@@ -126,6 +126,20 @@ def build_analytics_service(creds):
     return build("youtubeAnalytics", "v2", credentials=creds, cache_discovery=False)
 
 
+def build_reporting_service(creds):
+    """YouTube Reporting API v1 service (bulk pre-generated CSV reports).
+
+    This is the ONLY API surface that serves thumbnail impressions + impression
+    CTR per video (``video_thumbnail_impressions`` / ``video_thumbnail_impressions_ctr``,
+    added by Google 2026-01-15). The real-time Analytics API v2 (build_analytics_service)
+    recognizes the equivalent identifiers but rejects them in ``reports().query()`` —
+    they are bulk-only. Reach those metrics via reporting jobs (see reporting_reach.py).
+    """
+    from googleapiclient.discovery import build
+
+    return build("youtubereporting", "v1", credentials=creds, cache_discovery=False)
+
+
 def resolve_channel(data_service) -> dict:
     """Return {id, title, uploads_playlist} for the authorized channel.
 
