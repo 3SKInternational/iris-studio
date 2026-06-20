@@ -55,3 +55,9 @@ requests==2.34.2
 requests-oauthlib==2.0.0
 uritemplate==4.2.0
 urllib3==2.7.0
+
+# --- Thumbnail downscaling for the YouTube uploader (added 2026-06-20) ---
+# upload_video.py / publish_video.py auto-shrink an over-2MiB or unsupported
+# thumbnail to a web-optimized JPEG before upload (YouTube rejects >2 MiB, which
+# silently dropped the V3 custom thumbnail). Pillow does the convert+resize.
+Pillow==12.2.0

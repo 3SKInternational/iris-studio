@@ -42,7 +42,9 @@ import random
 import re
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +65,15 @@ DEFAULT_VAULT = "~/Documents/3SK/outputs/BRANDS/3SK_Finance"
 MAX_TITLE = 100
 MAX_DESCRIPTION = 5000
 MAX_TAGS_CHARS = 450  # API cap is ~500 incl. quoting overhead; stay under.
+
+# Custom-thumbnail limits. YouTube rejects a thumbnail over 2 MiB outright (the
+# bug that shipped V3 with no thumbnail: a ~2.1 MB PNG → HttpError → quiet skip).
+# Over the cap (or an unsupported format) we transparently ship a web-optimized
+# JPEG copy instead of the master. 2048px wide is comfortably above YouTube's
+# recommended 1280×720 while keeping the file small.
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024  # 2,097,152
+THUMBNAIL_MAX_WIDTH = 2048
+SUPPORTED_THUMBNAIL_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
 
 # Resumable-upload chunk + retry policy. 8 retries with capped exp-backoff covers
 # transient 5xx / socket drops without hanging forever on a hard failure.
@@ -364,25 +375,132 @@ def set_captions(youtube, video_id: str, srt: Path) -> bool:
         return False
 
 
+def _notify(msg: str) -> None:
+    """Best-effort LOUD alert to Steve's Telegram via scripts/notify.sh.
+
+    Never raises and never blocks the upload — notify.sh is the canonical alert
+    channel, but a missing/failed notifier must not sink a good upload.
+    """
+    notify = REPO / "scripts" / "notify.sh"
+    if not notify.is_file():
+        return
+    try:
+        subprocess.run([str(notify), msg], timeout=20, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _thumbnail_mime(suffix: str) -> str:
+    s = suffix.lower()
+    if s == ".png":
+        return "image/png"
+    if s == ".gif":
+        return "image/gif"
+    if s == ".bmp":
+        return "image/bmp"
+    return "image/jpeg"
+
+
+def prepare_thumbnail_for_upload(thumb: Path) -> tuple[Path, str, bool]:
+    """Return (path_to_upload, mimetype, is_temp) for a YouTube-uploadable thumb.
+
+    If ``thumb`` is already a supported format under YouTube's 2 MiB cap it is
+    uploaded verbatim → (thumb, mime, False). Otherwise (over the cap, or an
+    unsupported format) a web-optimized JPEG copy is written to a temp file:
+    converted to RGB, downscaled to ≤2048px wide (aspect preserved), and saved
+    with quality stepped down until it fits under the cap. The master is never
+    touched. ``is_temp`` tells the caller to delete the returned path afterward.
+
+    Raises (PIL / OSError) only on a genuine image-processing failure; the caller
+    catches broadly so a thumbnail problem never crashes a good upload.
+    """
+    suffix = thumb.suffix.lower()
+    size = thumb.stat().st_size
+    if suffix in SUPPORTED_THUMBNAIL_SUFFIXES and size <= MAX_THUMBNAIL_BYTES:
+        return thumb, _thumbnail_mime(suffix), False
+
+    reason = (f"{size / 1e6:.2f} MB over the 2 MB cap" if size > MAX_THUMBNAIL_BYTES
+              else f"unsupported format '{suffix or thumb.name}'")
+
+    from PIL import Image  # lazy: keep Pillow off the cold path.
+
+    with Image.open(thumb) as src:
+        img = src.convert("RGB")  # flatten alpha/palette → JPEG-safe.
+
+    fd, tmp_name = tempfile.mkstemp(suffix=".jpg", prefix=f"{thumb.stem}_web_")
+    os.close(fd)
+    tmp = Path(tmp_name)
+
+    # Own the temp file from here: if encoding raises (corrupt frame, disk full,
+    # encoder error) we must delete it before propagating, since the caller only
+    # learns is_temp=True via our return value — an exception skips that.
+    try:
+        width = min(img.width, THUMBNAIL_MAX_WIDTH)
+        quality = 92
+        while True:
+            if width != img.width:
+                height = max(1, round(img.height * (width / img.width)))
+                frame = img.resize((width, height), Image.LANCZOS)
+            else:
+                frame = img
+            frame.save(tmp, format="JPEG", quality=quality, optimize=True, progressive=True)
+            out_size = tmp.stat().st_size
+            if out_size <= MAX_THUMBNAIL_BYTES:
+                print(f"  ℹ thumbnail downscaled ({reason}) → {width}px / q{quality} / "
+                      f"{out_size / 1e6:.2f} MB (master untouched)")
+                return tmp, "image/jpeg", True
+            # Shrink quality first, then dimensions; guaranteed to terminate
+            # because width strictly decreases once quality bottoms out.
+            if quality > 70:
+                quality -= 7
+            elif width > 1024:
+                width = int(width * 0.85)
+                quality = 85
+            else:
+                print(f"  ⚠ thumbnail still {out_size / 1e6:.2f} MB after max "
+                      f"compression — uploading the smallest copy anyway.",
+                      file=sys.stderr)
+                return tmp, "image/jpeg", True
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def set_thumbnail(youtube, video_id: str, thumb: Path) -> bool:
     """Non-fatal thumbnail set; returns True iff it succeeded.
 
-    Like set_captions, this must never crash a successful upload/publish — a
-    transient network error here is NOT HttpError, so catch broadly and warn.
+    Auto-shrinks an over-cap / unsupported source to a web-optimized JPEG copy
+    first (see prepare_thumbnail_for_upload) so an oversized PNG can no longer
+    silently lose the thumbnail. A failure is LOUD — a missing custom thumbnail
+    tanks CTR — so it both warns on stderr and pages Steve's Telegram, but still
+    never crashes a successful upload/publish (a transient network error here is
+    NOT HttpError, so catch broadly).
     """
     from googleapiclient.http import MediaFileUpload
 
-    mime = "image/png" if thumb.suffix.lower() == ".png" else "image/jpeg"
+    upload_path = thumb
+    is_temp = False
     try:
+        upload_path, mime, is_temp = prepare_thumbnail_for_upload(thumb)
         youtube.thumbnails().set(
-            videoId=video_id, media_body=MediaFileUpload(str(thumb), mimetype=mime)
+            videoId=video_id, media_body=MediaFileUpload(str(upload_path), mimetype=mime)
         ).execute()
-        print(f"  ✅ thumbnail set from {thumb.name}")
+        print(f"  ✅ thumbnail set from {upload_path.name}")
         return True
     except Exception as exc:  # best-effort side channel — never crash the run.
-        print(f"  ⚠ thumbnail set failed ({type(exc).__name__}: {exc}); video is up, "
-              "add it manually.", file=sys.stderr)
+        msg = (f"🔴 thumbnail FAILED for {video_id} ({type(exc).__name__}: {exc}) — "
+               f"video is LIVE with NO custom thumbnail (tanks CTR). Set it manually "
+               f"in Studio. Source: {thumb}")
+        print(f"  ⚠ {msg}", file=sys.stderr)
+        _notify(msg)
         return False
+    finally:
+        if is_temp:
+            try:
+                upload_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # --- caption sweep (verify-and-backfill across all uploaded videos) ---------
