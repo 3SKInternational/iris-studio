@@ -19,10 +19,13 @@
   the SAME wrapper that every other claude-code job uses handles logging, the
   ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and the retry queue.
 
-  Schedule: Thursday 4:30 AM ET — after the week's analytics (Mon 5:30) and
-  youtube-researcher intel (Wed 3:00) have landed, so the proposer reasons over
-  fresh signals; a free overnight slot between vault-gardener (4:10) and
-  pipeline-heartbeat (4:50).
+  Schedule: NIGHTLY 4:35 AM ET (Steve's directive 2026-06-20: "adaptation-proposer
+  should run nightly"). The proposer is idempotent + signal-gated: on any night
+  with no signal clearing the bar it drafts ZERO proposals and reports a clean
+  no-op, so a daily cadence just shortens the latency between a reviewer verdict /
+  analytics finding landing and a cited fix being drafted for Steve's /adapt — it
+  never spams. 4:35 is a free overnight slot between vault-gardener (4:10) and
+  pipeline-heartbeat (4:50), and dodges the Sunday-only hygiene job at 4:30.
 
   Manage:
     launchctl bootout gui/$(id -u)/com.iris.claude-code-adaptation-scan 2>/dev/null
@@ -51,9 +54,7 @@
 		<key>Hour</key>
 		<integer>4</integer>
 		<key>Minute</key>
-		<integer>30</integer>
-		<key>Weekday</key>
-		<integer>4</integer>
+		<integer>35</integer>
 	</dict>
 </dict>
 </plist>
