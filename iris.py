@@ -572,33 +572,12 @@ AUTONOMOUS_DISPATCHES: list[dict] = [
             "Return the headline 🧍 needs-Steve list on stdout (4-6 ranked lines)."
         ),
     },
-    {
-        "name": "youtube-researcher-weekly",
-        "agent_name": "youtube-researcher",
-        # weekly Wednesdays 02:00 ET — fresh YT channel intelligence mid-week,
-        # before the typical Thu-Sun script production push. Feeds
-        # BRANDS/3SK_Finance/Channel_Intelligence/ which the channel content
-        # agents (scriptwriter, thumbnail-coordinator, video-description-writer,
-        # scene-image-prompt-generator) read at every dispatch as their
-        # freshness layer. Runs at 02:00 (ahead of the 03:00 nightly) so the
-        # nightly's content work reads fresh intel, and so three heavy LLM jobs
-        # don't collide at 03:00 (de-staggered 6/18, Session 66).
-        "trigger_kwargs": {"day_of_week": "wed", "hour": 2, "minute": 0},
-        "prompt": (
-            "Weekly autonomous YouTube channel intelligence sweep. Read existing "
-            "BRANDS/3SK_Finance/Channel_Intelligence/*.md to know what's already "
-            "captured (don't repeat — extend, refine, or replace stale claims). "
-            "Then run 2-4 targeted web searches per intelligence area and refresh "
-            "the 5 canonical files (hook_patterns / title_performance / "
-            "thumbnail_trends / algorithm_signals / viral_teardowns) + the "
-            "_index.md TOC with current last-updated dates. Cite every claim; "
-            "date-stamp anything that decays; keep each file ≤ 80 lines so the "
-            "content agents can skim fast (they have limited context). Return a "
-            "4-line stdout summary: top hook signal, top thumbnail signal, one "
-            "algorithm signal worth Steve's awareness, most useful viral teardown "
-            "for the upcoming production cycle."
-        ),
-    },
+    # NOTE: youtube-researcher is NOT dispatched here. It moved to a launchd
+    # routine (com.iris.claude-code-youtube-research → routines/youtube-research.prompt)
+    # on 2026-06-20, bumped to 2x/week (Mon + Thu 02:00 ET) and fronted by a
+    # niche_pull.py Data-API view-count feed so its intel is backed by REAL ranked
+    # view counts. Mirrors the analytics-feedback loop. Do not re-add it here or it
+    # will double-fire.
     {
         "name": "market-researcher-monthly",
         "agent_name": "market-researcher",

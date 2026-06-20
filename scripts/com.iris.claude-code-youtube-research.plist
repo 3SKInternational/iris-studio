@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  YouTube research FRESHNESS LOOP — installed 2026-06-20.
+
+  CLOSED LOOP, not just a data pull: this runs the `youtube-research` Claude
+  routine, which (1) runs niche_pull.py to fetch the OUTSIDE finance niche's real
+  most-viewed videos from the YouTube Data API, then (2) dispatches the
+  youtube-researcher agent to refresh the 5 Channel_Intelligence freshness files
+  the content agents (scriptwriter / thumbnail-coordinator / video-description-
+  writer / scene-image-prompt-generator) read at every dispatch. The agent's web
+  sweep runs every cycle; the niche feed gives it REAL ranked view counts so
+  viral_teardowns.md stops saying "no public data retrieved".
+
+  Runs via run_claude_job.sh (NOT run_job.sh): it's a `claude --print` routine, so
+  the SAME wrapper every other claude-code job uses handles logging, the
+  ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and the retry queue.
+
+  Schedule: Mon + Thu 2:00 AM ET — fresh niche intel before each half-week's
+  production push. Replaces the old weekly (Wed) youtube-researcher-weekly
+  APScheduler entry in iris.py (removed 2026-06-20 to avoid double-firing); the
+  2:00 slot keeps it ahead of the 3:00 nightly so the nightly's content work
+  reads fresh intel, and de-staggered from the 5:30 analytics-pull.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-youtube-research 2>/dev/null
+    cp scripts/com.iris.claude-code-youtube-research.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-youtube-research.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-youtube-research   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-youtube-research</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh youtube-research /Volumes/AI_Workspace/iris_studio/routines/youtube-research.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/youtube-research.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/youtube-research.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+			<key>Weekday</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+			<key>Weekday</key>
+			<integer>4</integer>
+		</dict>
+	</array>
+</dict>
+</plist>
