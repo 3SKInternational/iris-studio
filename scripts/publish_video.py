@@ -321,9 +321,24 @@ def main() -> None:
         out["captions_updated_at"] = datetime.now(timezone.utc).isoformat()
     write_receipt(receipt_path, out)
     print(f"\n✅ receipt → {receipt_path}")
-    if meta.get("pinned_comment"):
-        print("  ℹ pinned-comment text is in the receipt — pin it manually in Studio "
-              "(the Data API can't pin comments).")
+
+    # Auto-post the pinned comment. The poster is go-live-aware + idempotent: if we
+    # just went public it posts now; if this was a SCHEDULED publish (still private
+    # until publishAt) it's a clean no-op and the hourly comment-sweep posts it at
+    # go-live. Best-effort — a comment hiccup never sinks a good publish. The Data
+    # API still can't PIN, so it pings Telegram to pin manually once.
+    if out.get("pinned_comment") and not out.get("comment_id"):
+        try:
+            from post_comment import post_pinned_comment  # local: avoid import cost on dry-run
+            res = post_pinned_comment(youtube, vlt, vid)
+            msg = {"posted": "✅ pinned comment posted (now PIN it in Studio)",
+                   "not_public": "⏳ scheduled — comment will auto-post at go-live",
+                   "already_posted": "✓ pinned comment already posted"}.get(
+                       res["status"], f"ℹ pinned comment: {res['status']} ({res['detail']})")
+            print(f"  {msg}")
+        except Exception as exc:  # noqa: BLE001 — never let a comment failure sink publish
+            print(f"  ⚠ pinned-comment auto-post skipped ({type(exc).__name__}: {exc}); "
+                  "the hourly comment-sweep will retry.")
 
 
 if __name__ == "__main__":
