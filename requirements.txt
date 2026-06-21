@@ -61,3 +61,13 @@ urllib3==2.7.0
 # thumbnail to a web-optimized JPEG before upload (YouTube rejects >2 MiB, which
 # silently dropped the V3 custom thumbnail). Pillow does the convert+resize.
 Pillow==12.2.0
+
+# --- Niche caption-hook feed for youtube-researcher (added 2026-06-20) ---
+# transcript_pull.py fetches PUBLIC captions for the niche's top videos so the
+# research agent quotes real cold-open hooks instead of inferring them from titles.
+# Two backends, tried in order: youtube-transcript-api (fast timedtext), then
+# yt-dlp (resilient json3 fallback). defusedxml is youtube-transcript-api's
+# transitive XML parser.
+youtube-transcript-api==1.2.4
+yt-dlp==2026.6.9
+defusedxml==0.7.1

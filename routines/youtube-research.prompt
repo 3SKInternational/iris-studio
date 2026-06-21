@@ -22,16 +22,32 @@ PASS 1 — PULL THE NICHE FEED (deterministic, no analysis):
     failure, set FEED to "(pull failed — no ranked feed this cycle)", and continue to
     PASS 2. The wrapper's retry queue handles transient pull failures separately.
 
+PASS 1b — PULL THE CAPTION-HOOK FEED (deterministic, no analysis):
+  After the niche feed, fetch the verbatim cold-open hooks for that feed's top
+  videos so the agent quotes what creators ACTUALLY said instead of inferring a
+  hook from the title:
+      cd /Volumes/AI_Workspace/iris_studio && .venv/bin/python scripts/transcript_pull.py
+  It reads the niche feed written in PASS 1 and writes to a DETERMINISTIC path:
+  NICHE DIR/<today>_transcripts.md (it also echoes `output :` and `✅ wrote ...`).
+  Use that deterministic path as TRANSCRIPTS.
+  - This is best-effort. If it exits non-zero, or PASS 1 produced no feed, do NOT
+    stop the routine — set TRANSCRIPTS to "(no caption feed this cycle)" and
+    continue. Captions can be disabled/region-locked/rate-limited; the agent's
+    title + web research still has value without them.
+
 PASS 2 — READ THE FEED STATUS (so you brief the agent honestly):
   If PASS 1 succeeded, read FEED and parse its YAML frontmatter `status:` field:
     • status: ok               → real ranked view-count data is on disk. Brief the agent to READ it.
     • status: partial-*        → some real data; tell the agent it is partial.
     • status: blocked-no-results → no niche hits this window; tell the agent there is no ranked feed, proceed on web research alone.
     • missing/unreadable        → treat as pull failure (FEED = none); proceed on web research alone.
+  Also, if PASS 1b succeeded, read TRANSCRIPTS' `status:` (ok / partial-*-missing /
+  blocked-*) so you can tell the agent how much verbatim hook data is on disk.
 
 PASS 3 — DISPATCH THE RESEARCHER (always — the agent's web sweep runs every cycle):
   Invoke the `youtube-researcher` subagent. Brief it explicitly with:
     - FEED: the absolute NICHE DIR/<today>_niche-views.md path and its status (or that the pull produced no usable feed this cycle). When the feed status is ok/partial, tell it to READ that file FIRST and use those REAL view counts to rank `viral_teardowns.md` and gauge `title_performance.md` — those entries should no longer say "no public data retrieved" when the feed has numbers. The feed is a starting signal, not a replacement for its web research; it still runs its normal 2–4 searches per intel area.
+    - TRANSCRIPTS: the absolute NICHE DIR/<today>_transcripts.md path and its status (or that no caption feed exists this cycle). When present, tell it to READ that file too and quote the VERBATIM cold-open hooks in `hook_patterns.md` and `viral_teardowns.md` instead of inferring a hook from the title. A video shown as `(no transcript)` has no caption data — it must NOT invent a hook for it.
     - TASK: its normal weekly sweep — refresh the 5 canonical files (hook_patterns / title_performance / thumbnail_trends / algorithm_signals / viral_teardowns) + _index.md with current last-updated dates, ≤ 80 lines each, every claim cited.
     - OUTPUT: overwrite the 5 living docs under INTEL DIR + update _index.md. Return its 4-line stdout summary (top hook signal, top thumbnail signal, one algorithm signal worth Steve's awareness, most useful viral teardown).
   After it returns, read one of its files' (`viral_teardowns.md`) `status:` frontmatter. If it reports a blocked-* status, carry that into your completion signal as ROUTINE_INCOMPLETE.
