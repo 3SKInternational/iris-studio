@@ -1040,11 +1040,12 @@ def run_prompt_review_loop(video: int, manifest_rel: str) -> tuple[str, str, str
     is no "advance while imperfect": if the reviewer is not 100% signing off, the
     batch does not move to the billed spend. Bounded by IMAGE_REVIEW_MAX_FIX_
     ATTEMPTS so a manifest the fixer can't clear parks for a human instead of
-    looping forever. UNAVAILABLE ends the loop immediately (the caller fails open
-    — a human authorized THIS spend; review tooling being down must not block it).
-    Returns the FINAL (verdict, vrel, detail). Fixing prompts is $0, so this whole
-    loop runs BEFORE the single billed spend. UNAVAILABLE ends the loop immediately
-    and the caller now fails CLOSED (refuses the spend; retry or --force)."""
+    looping forever. UNAVAILABLE ends the loop immediately — the reviewer could not
+    run, which is NOT an approval. Returns the FINAL (verdict, vrel, detail). Fixing
+    prompts is $0, so this whole loop runs BEFORE the single billed spend. On
+    UNAVAILABLE the caller (cmd_spend_ok) fails CLOSED: it refuses the billed spend
+    and the human re-runs spend-ok once the reviewer recovers, or overrides with
+    --force. (A false block is cheap; a false SHIP bills real money.)"""
     verdict, vrel, detail = run_image_review("prompts", video, manifest_rel)
     attempts = 0
     while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:

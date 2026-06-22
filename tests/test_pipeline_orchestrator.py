@@ -148,7 +148,7 @@ class TestPromoteGateExits(unittest.TestCase):
         stages = _stages()
         stages["3_vo_expand"]["status"] = "needs-steve"
         stages["3_vo_expand"]["park_reason"] = "gate"
-        promoted = po.promote_gate_exits(stages, 1)
+        promoted, _ = po.promote_gate_exits(stages, 1)
         self.assertEqual(promoted, [])
         self.assertEqual(stages["3_vo_expand"]["status"], "needs-steve")
 
@@ -158,7 +158,7 @@ class TestPromoteGateExits(unittest.TestCase):
         stages = _stages()
         stages["4_vo_record"]["status"] = "needs-steve"
         stages["4_vo_record"]["park_reason"] = "failed"
-        promoted = po.promote_gate_exits(stages, 1)
+        promoted, _ = po.promote_gate_exits(stages, 1)
         self.assertEqual(promoted, [])
         self.assertEqual(stages["4_vo_record"]["status"], "needs-steve")
 
@@ -166,7 +166,7 @@ class TestPromoteGateExits(unittest.TestCase):
         stages = _stages()
         stages["5_images"]["status"] = "needs-steve"
         stages["5_images"]["park_reason"] = "gate"
-        promoted = po.promote_gate_exits(stages, 1)
+        promoted, _ = po.promote_gate_exits(stages, 1)
         self.assertNotIn("5_images", promoted)
         self.assertEqual(stages["5_images"]["status"], "needs-steve")
 
@@ -189,7 +189,7 @@ class TestPromoteGateExits(unittest.TestCase):
                 stages["3_vo_expand"]["completed_at"] = "2020-01-01T00:00:00Z"
                 stages["4_vo_record"]["status"] = "needs-steve"
                 stages["4_vo_record"]["park_reason"] = "gate"
-                promoted = po.promote_gate_exits(stages, 1)
+                promoted, _ = po.promote_gate_exits(stages, 1)
                 self.assertIn("4_vo_record", promoted)
                 self.assertEqual(stages["4_vo_record"]["status"], "done")
             finally:
@@ -731,7 +731,11 @@ class TestSpendOkImageGate(unittest.TestCase):
         finally:
             restore()
 
-    def test_ship_with_fixes_spends(self):
+    def test_ship_with_fixes_refuses_spend(self):
+        # BINARY gate (Steve, 2026-06-20): "SHIP WITH FIXES" is RETIRED as a
+        # spendable verdict — it once billed an off-model V3 image batch. Only a
+        # clean SHIP advances; SHIP WITH FIXES now falls to the else-branch and
+        # fails CLOSED. This pins that retirement shut.
         restore = self._patch_common()
         try:
             called = {"gen": False}
@@ -744,12 +748,17 @@ class TestSpendOkImageGate(unittest.TestCase):
                 "SHIP WITH FIXES", "rel", "low-cost vocab fixes")
             sf = _FakeSF(self._ready_stages())
             rc = po.cmd_spend_ok(sf)
-            self.assertEqual(rc, 0)
-            self.assertTrue(called["gen"], "SHIP WITH FIXES is spendable")
+            self.assertEqual(rc, 2)
+            self.assertFalse(called["gen"], "SHIP WITH FIXES must NOT spend (binary gate)")
         finally:
             restore()
 
-    def test_unavailable_fails_open_and_spends(self):
+    def test_unavailable_fails_closed_and_refuses_spend(self):
+        # Fail-CLOSED hardening (2026-06-22): a reviewer that could not RUN
+        # (timeout/outage/unparseable → UNAVAILABLE) is NOT an approval. Spending
+        # past it would bill real money on an unreviewed batch exactly when the
+        # safety check is blind. Must refuse and return 2; the human's spend-ok is
+        # honored by RETRYING on recovery or an explicit --force override.
         restore = self._patch_common()
         try:
             called = {"gen": False}
@@ -762,8 +771,8 @@ class TestSpendOkImageGate(unittest.TestCase):
                 "UNAVAILABLE", "rel", "reviewer down")
             sf = _FakeSF(self._ready_stages())
             rc = po.cmd_spend_ok(sf)
-            self.assertEqual(rc, 0)
-            self.assertTrue(called["gen"], "fail-open must proceed to the billed spend")
+            self.assertEqual(rc, 2)
+            self.assertFalse(called["gen"], "UNAVAILABLE must fail CLOSED — no billed spend")
         finally:
             restore()
 
@@ -899,13 +908,17 @@ class TestPromptReviewLoop(unittest.TestCase):
         finally:
             restore()
 
-    def test_ship_with_fixes_does_not_trigger_loop(self):
-        # SHIP WITH FIXES is spendable — it must NOT trigger a fix dispatch.
+    def test_ship_with_fixes_drives_fix_loop(self):
+        # BINARY gate (Steve, 2026-06-20): "SHIP WITH FIXES" is RETIRED — it is no
+        # longer a clean SHIP, so the loop now treats it as blocking and drives the
+        # fixer. A stub that keeps returning it must exhaust the fix budget (like a
+        # persistent HOLD-SPEND) and surface the blocking verdict for the human gate.
         restore, calls = self._patch(["SHIP WITH FIXES"])
         try:
             verdict, _vrel, _detail = po.run_prompt_review_loop(3, "m.json")
             self.assertEqual(verdict, "SHIP WITH FIXES")
-            self.assertEqual(calls["fix"], 0)
+            self.assertEqual(calls["fix"], po.IMAGE_REVIEW_MAX_FIX_ATTEMPTS)
+            self.assertEqual(calls["review"], po.IMAGE_REVIEW_MAX_FIX_ATTEMPTS + 1)
         finally:
             restore()
 
