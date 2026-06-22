@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CLAUDE CLI HEALTH CANARY — installed 2026-06-22.
+
+  Proactive early-warning probe for the failure modes that silently break EVERY
+  headless `claude --print` launchd job at once:
+    1. AUTH (primary)  — stale Claude CLI OAuth token / out of credits (401).
+                         Human-only fix: `claude login`. Tested via the real
+                         claude binary, so it is high-confidence.
+    2. VAULT (proxy)   — a scheduled job can't read the vault because Full Disk
+                         Access was broadly revoked for background jobs (a
+                         `brew upgrade claude-code` can do this by moving to a new
+                         version-pinned path). Best-effort guard, NOT a
+                         claude-binary-specific TCC assertion, and NOT a
+                         volume-unmount detector — the probe file is on the internal
+                         Data volume (see the scope note in auth_canary.sh).
+
+  Runs scripts/auth_canary.sh (a STANDALONE detector — NOT a run_claude_job.sh
+  routine; it owns its own state/alert logic). Fires ONE purpose-built Telegram
+  alert on a healthy→broken transition, a throttled re-ping while still broken,
+  and a single ✅ on recovery. Silent when healthy. Named with the `claude-code-`
+  prefix so it shows up alongside the other jobs in `launchctl list | grep
+  claude-code`, even though it is not a claude routine itself.
+
+  Schedule: every 3h (StartInterval 10800) + RunAtLoad so it self-tests the
+  moment it is (re)loaded. One tiny `claude --print` per run — negligible quota.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-auth-canary 2>/dev/null
+    cp scripts/com.iris.claude-code-auth-canary.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-auth-canary.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-auth-canary   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-auth-canary</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/auth_canary.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/auth-canary.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/auth-canary.stdout.log</string>
+	<key>StartInterval</key>
+	<integer>10800</integer>
+</dict>
+</plist>
