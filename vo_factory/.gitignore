@@ -3,5 +3,9 @@
 *.wav
 # Secrets live in the repo-root .env, never here -- but guard anyway.
 .env
+# Per-cycle VO budget runtime state (credits + v2 slots used this cycle).
+vo_budget_state.json
+# Lock guarding the budget-state commit against concurrent runs.
+.vo_budget.lock
 __pycache__/
 *.pyc

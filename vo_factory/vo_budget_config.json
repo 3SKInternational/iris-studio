@@ -1,0 +1,51 @@
+{
+  "_doc": "Budget + model-allocation config for iris_studio vo_factory. Read by model_allocator.py. Edit values here; no code changes needed.",
+  "tier": "creator",
+  "monthly_credits": 100000,
+  "buffer_pct": 0.10,
+  "billing_cycle_day": 1,
+
+  "models": {
+    "v2": {
+      "id": "eleven_multilingual_v2",
+      "credits_per_char": 1.0,
+      "label": "premium / expressive"
+    },
+    "flash": {
+      "id": "eleven_flash_v2_5",
+      "credits_per_char": 0.5,
+      "label": "fast / low-cost"
+    }
+  },
+
+  "allocation": {
+    "v2_score_threshold": 0.60,
+    "max_v2_per_cycle": 3,
+    "fallback_model": "flash",
+    "_note": "A script gets v2 only if its classifier score >= threshold AND a v2 slot remains AND the v2 cost still fits inside the buffered budget. Otherwise it falls back to flash."
+  },
+
+  "classifier": {
+    "bias": -0.5,
+    "weights": {
+      "emotion_lexicon": 0.45,
+      "dialogue_quotes": 0.35,
+      "exclaim_density": 0.30,
+      "question_density": 0.15,
+      "ellipsis_emdash": 0.20,
+      "narrative_cues": 0.40,
+      "second_person_address": 0.10,
+      "info_lexicon": -0.45,
+      "instruction_cues": -0.40,
+      "digit_density": -0.30,
+      "list_markers": -0.25
+    },
+    "emotion_lexicon": ["love","fear","afraid","dream","lost","hope","heart","cry","cried","tears","alone","lonely","fight","fought","betray","grief","joy","rage","ache","longing","whisper","scream","broke","broken","forever","promise","regret","miss","missed","soul","brave","courage","sorry","goodbye"],
+    "narrative_cues": ["once upon","remember when","i remember","the day","years ago","back then","story","let me tell you","picture this","imagine","there was","that night","that morning","little did","everything changed"],
+    "info_lexicon": ["according to","data","percent","study","report","statistics","overview","summary","definition","feature","specification","update","version","release","benchmark","comparison","pros and cons","review"],
+    "instruction_cues": ["step 1","step one","first,","next,","then,","finally,","how to","tutorial","click","tap","install","setup","configure","enable","select","open the","go to","in this video","subscribe","like and"]
+  },
+
+  "default_voice_id": "nPczCjzI2devNBz1zQrb",
+  "_voice_note": "Set one voice id to keep brand consistency across both models. The model only changes quality/cost, not which voice speaks."
+}

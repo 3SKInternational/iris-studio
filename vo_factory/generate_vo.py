@@ -27,6 +27,8 @@ Never put the key in the vault -- it is git-tracked + synced.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -36,6 +38,15 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# VO model allocator (premium v2 vs cheap flash, per-video, budget-aware).
+# Lives beside this file in vo_factory/. Best-effort import: if it's missing the
+# run falls back to DEFAULT_MODEL rather than breaking.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import model_allocator as ma
+except Exception:  # noqa: BLE001 -- allocator is an optimization, not a hard dep
+    ma = None
 
 API_BASE = "https://api.elevenlabs.io/v1"
 
@@ -180,6 +191,47 @@ def check_key(key: str) -> None:
     print(f"  resets     : {sub.get('next_character_count_reset_unix')}")
 
 
+def subscription_count(key: str) -> int | None:
+    """Current billing-cycle usage (credits) from ElevenLabs, or None.
+
+    Used for subscription-delta reconciliation: capture before + after the batch
+    and book (after - before) as the REAL credits charged. Version-proof -- no
+    dependence on a response header name ElevenLabs may rename."""
+    try:
+        sub = json.loads(_request(f"{API_BASE}/user/subscription", key=key))
+        v = sub.get("character_count")
+        return int(v) if isinstance(v, (int, float)) else None
+    except Exception:  # noqa: BLE001 -- reconciliation is best-effort
+        return None
+
+
+@contextlib.contextmanager
+def budget_lock(lock_path: Path):
+    """Serialize the allocator commit (read-modify-write of vo_budget_state.json)
+    across concurrent VO runs so a parallel run can't lose a counter increment.
+    Best-effort: if locking is unavailable the run proceeds unlocked rather than
+    failing. Held only around the fast commit, not the TTS batch, so it never
+    serializes rendering."""
+    fh = None
+    try:
+        fh = open(lock_path, "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except Exception:  # noqa: BLE001 -- proceed unlocked, but keep fh so finally closes it
+            pass
+    except Exception:  # noqa: BLE001 -- couldn't even open the lock file; run unlocked
+        fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001 -- harmless if we never acquired it
+                pass
+            fh.close()
+
+
 # Warn (don't block) when the run nears or exceeds the remaining balance. Steve's
 # 2026-06-15 directive: warn me through Telegram for any/all alerts. The render
 # loop already tolerates per-clip 402s, so this only adds a heads-up, never aborts.
@@ -282,7 +334,24 @@ def main() -> None:
         die(f"{kit_path.name} has scene headers but no narration text under any of them.")
 
     voice_id = args.voice_id or load_dotenv_value(script_dir, "ELEVENLABS_VOICE_ID") or DEFAULT_VOICE_ID
-    model = args.model or DEFAULT_MODEL
+    # Model: explicit --model wins; else the allocator auto-picks premium v2 vs
+    # cheap flash for THIS video (one decision per kit, over all narration),
+    # constrained by the monthly budget + the 3-v2/cycle cap.
+    dec = cfg = state = None
+    if args.model:
+        model = args.model
+    elif ma is not None:
+        try:
+            cfg = ma.load_config()
+            state = ma.load_state(cfg)
+            script_text = "\n\n".join(b["text"] for b in blocks)
+            dec = ma.choose_model(script_text, state, cfg)
+            model = dec.model_id
+        except Exception as e:  # noqa: BLE001 -- fall back, never break a run
+            model = DEFAULT_MODEL
+            print(f"  allocator: unavailable ({e}); using default {model}", file=sys.stderr)
+    else:
+        model = DEFAULT_MODEL
     stability = args.stability if args.stability is not None else DEFAULT_STABILITY
     similarity = args.similarity if args.similarity is not None else DEFAULT_SIMILARITY
     style = args.style if args.style is not None else DEFAULT_STYLE
@@ -302,6 +371,9 @@ def main() -> None:
     print(f"kit      : {kit_path.name}   scenes: {len(blocks)}")
     print(f"voice    : {voice_id}   model: {model}   stab/sim/style: {stability}/{similarity}/{style}")
     print(f"output   : {out_dir}")
+    if dec is not None:
+        print(f"allocator: {dec.model_key} ({dec.model_id})  score={dec.score:.2f}  "
+              f"est~{dec.credits_est} cr  -- {dec.reason}")
     print("-" * 64)
 
     total_chars = 0
@@ -336,6 +408,7 @@ def main() -> None:
     # Pre-flight: warn (don't block) if this batch nears/exceeds the balance.
     make_chars = sum(len(b["text"]) for b in to_make)
     preflight_credits(key, make_chars)
+    before = subscription_count(key)   # subscription-delta baseline
 
     out_dir.mkdir(parents=True, exist_ok=True)
     made = failed = 0
@@ -368,6 +441,44 @@ def main() -> None:
 
     print("-" * 64)
     print(f"done: {made} generated, {failed} failed, {len(blocks) - len(to_make)} skipped.")
+
+    # Book REAL spend against the monthly budget (subscription-delta = exact
+    # credits charged this run). Only on a full run that produced audio: --limit
+    # is a smoke test and must not consume a cycle v2 slot.
+    if dec is not None and made > 0 and args.limit is None:
+        after = subscription_count(key)
+        actual = (max(after - before, 0)
+                  if (before is not None and after is not None) else None)
+        # actual is None -> commit falls back to the estimate.
+        # TODO: reconcile real usage if the subscription endpoint was unavailable.
+        # NOTE: subscription character_count is account-wide, so a concurrent run
+        # spending between the before/after reads would skew this video's delta.
+        # Acceptable for a single-operator account; the commit itself is locked.
+        video_id = kit_path.parent.name
+        with budget_lock(script_dir / ".vo_budget.lock"):
+            # Re-read state INSIDE the lock so a parallel run's increment isn't
+            # lost, and so the idempotency check sees the freshest log.
+            state = ma.load_state(cfg)
+            # Idempotent v2 cap: a --force re-render or a partial-failure top-up of
+            # a video already committed THIS cycle re-books its real credits but must
+            # NOT burn a second v2 slot. (A true parallel double-v2 race on distinct
+            # videos can still momentarily exceed the cap; it self-heals as the next
+            # decision sees the over-count and falls back to flash.)
+            # Match by note AND model: a video that already burned a v2 slot this
+            # cycle must not burn a second one on a re-render, but a flash->v2 flip
+            # (script edit / config change between runs) correctly books a new slot.
+            prev_v2 = any(e.get("note") == video_id and e.get("model") == "v2"
+                          for e in state.get("log", []))
+            ma.commit(state, dec, cfg, note=video_id, actual_credits=actual)
+            if prev_v2 and dec.model_key == "v2":
+                state["v2_count"] -= 1
+            ma.save_state(state)
+        booked = actual if actual is not None else dec.credits_est
+        src = "real" if actual is not None else "estimate"
+        print(f"allocator: booked {booked} cr ({src}) for {video_id}; "
+              f"cycle {state['credits_used']:,}/{int(ma.usable_budget(cfg)):,} usable, "
+              f"v2 {state['v2_count']}/{cfg['allocation']['max_v2_per_cycle']}")
+
     if failed:
         raise SystemExit(1)
 
