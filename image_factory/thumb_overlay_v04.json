@@ -1,0 +1,11 @@
+{
+  "canvas": [2048, 1152],
+  "base_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Raw_Assets/Video_04_HD",
+  "out_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_04_gen",
+  "defaults": {"weight": "bold", "align": "center", "anchor": "mm"},
+  "cards": {
+    "Video_04_Thumbnail_A": [
+      {"text": "$847\nTO WEALTH", "x": 0.50, "y": 0.18, "size": 112, "color": "white", "style": "stroked", "stroke": 9}
+    ]
+  }
+}

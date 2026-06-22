@@ -3,3 +3,7 @@
 *.mp4
 *.mov
 *.srt
+# Auto-generated orchestrated edit manifests (build_video.py rewrites them each
+# assemble run from the script + image manifest + VO kit). Regenerable output.
+manifests/*_orchestrated_*.json
+manifests/*.bak-*

@@ -1,0 +1,18 @@
+{
+  "canvas": [2048, 1152],
+  "base_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_02_gen",
+  "out_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_02_gen",
+  "defaults": {"weight": "bold", "align": "center", "anchor": "mm"},
+  "cards": {
+    "Video_02_Thumbnail_A": [
+      {"text": "BELOW $0", "x": 0.25, "y": 0.13, "size": 84, "color": "white", "style": "pill", "pill_color": "red"},
+      {"text": "$10M", "x": 0.75, "y": 0.13, "size": 96, "color": "amber", "style": "pill", "pill_color": "charcoal"},
+      {"text": "WHICH ONE\nARE YOU?", "x": 0.50, "y": 0.55, "size": 104, "color": "white", "style": "stroked", "stroke": 9}
+    ],
+    "Video_02_Thumbnail_B": [
+      {"text": "BELOW $0", "x": 0.25, "y": 0.13, "size": 84, "color": "white", "style": "pill", "pill_color": "red"},
+      {"text": "$10M", "x": 0.78, "y": 0.12, "size": 96, "color": "amber", "style": "pill", "pill_color": "charcoal"},
+      {"text": "WHICH ONE\nARE YOU?", "x": 0.50, "y": 0.55, "size": 104, "color": "white", "style": "stroked", "stroke": 9}
+    ]
+  }
+}

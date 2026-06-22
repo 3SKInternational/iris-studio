@@ -1,0 +1,15 @@
+{
+  "canvas": [2048, 1152],
+  "base_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_01_gen",
+  "out_dir": "~/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_01_gen",
+  "defaults": {"weight": "bold", "align": "center", "anchor": "mm"},
+  "cards": {
+    "Video_01_Thumbnail_A": [
+      {"text": "10%", "x": 0.36, "y": 0.135, "size": 165, "color": "white", "style": "stroked", "stroke": 11},
+      {"text": "VS", "x": 0.50, "y": 0.135, "size": 95, "color": "amber", "style": "stroked", "stroke": 9},
+      {"text": "50%", "x": 0.64, "y": 0.135, "size": 165, "color": "white", "style": "stroked", "stroke": 11},
+      {"text": "$87,000", "x": 0.25, "y": 0.90, "size": 78, "color": "white", "style": "pill", "pill_color": "blue"},
+      {"text": "$1,840,000", "x": 0.75, "y": 0.90, "size": 78, "color": "white", "style": "pill", "pill_color": "red"}
+    ]
+  }
+}
