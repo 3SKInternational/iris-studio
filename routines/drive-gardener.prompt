@@ -1,4 +1,4 @@
-Sunday Drive gardener at 03:30 AM ET, weekly — runs AFTER the 03:00 rclone backup (which completes in ~10 min) and well BEFORE the 04:30 hygiene job. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
+Sunday Drive gardener at 03:30 AM ET, weekly — runs ~15 min BEFORE the daily 03:45 rclone backup (so today's sync hasn't fired yet when you check health — the freshest COMPLETED run is yesterday's) and well BEFORE the 04:30 hygiene job. You keep the **curated, human-facing** Google Drive folder tidy and verify the offsite backup is healthy. This is the Drive sibling to the markdown vault gardener.
 
 Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` (latest entry) for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
 
@@ -31,10 +31,10 @@ Run `/opt/homebrew/bin/rclone lsf "gdrive:3SK International" --files-only` (top-
 - **If a file's destination is genuinely ambiguous, LEAVE IT and flag it in the report — do not guess.**
 
 ### Pass 2 — Verify backup health (READ-ONLY on the mirror)
-The scheduled backup (`com.iris.drive-sync`) fires Sun 03:00 — ~30 min before you run — so a healthy week leaves a fresh, COMPLETED entry from earlier this morning.
-1. `tail -20 /Users/steve/iris_studio/logs/drive-sync.stdout.log`. Find the **LAST** `=== drive-sync start … ===` line and judge ONLY that most-recent run (do NOT accept "some earlier block has a done"). Health requires ALL three:
-   - its timestamp is within the last ~26 hours — i.e. today's 03:00 run actually fired. An older latest-start means the scheduled job didn't run at all → **FLAG**.
-   - it is followed by a matching `=== drive-sync done … ===` line. A trailing `start` with NO `done` after it = a stalled/aborted run → **FLAG**.
+The scheduled backup (`com.iris.drive-sync`) fires **DAILY at 03:45** — ~15 min AFTER you run at 03:30 — so the freshest COMPLETED run is normally **yesterday's** 03:45 (today's hasn't fired yet when you read this). A healthy day leaves a fresh, COMPLETED entry from within the last ~26 hours.
+1. `tail -30 /Users/steve/iris_studio/logs/job-drive-sync.log` — **this is the AUTHORITATIVE log** (the job runs through `run_job.sh`, which redirects all output here; the older `drive-sync.stdout.log` is CONTENT-FROZEN since the pre-wrapper era — launchd still bumps its mtime each run via `StandardOutPath`, but no real sync output lands there, so reading it gives a FALSE "dead backup" — do NOT use it). Find the **LAST** `=== drive-sync start … ===` line and judge ONLY that most-recent run (do NOT accept "some earlier block has a done"). Health requires ALL three:
+   - its timestamp is within the last ~26 hours — i.e. yesterday's (or today's, if you somehow run after 03:45) scheduled run actually fired. An older latest-start means the scheduled job didn't run at all → **FLAG**.
+   - it is followed by a matching `=== drive-sync done … ===` line (and the wrapper's `run_job: 'drive-sync' completed ok …` confirmation line). A trailing `start` with NO `done` after it = a stalled/aborted run → **FLAG**.
    - there is NO `ERROR` / `Aborting` line after that last `start`.
    (Failure signature for reference: the 5/31 + 6/7 scheduled runs each logged `start` then `ERROR … Aborting` with no `done`. That exact shape = broken backup, even though a later manual run looks clean.)
 2. `launchctl list | grep drive-sync` — the middle column is the LAST exit status. Treat `0` as necessary-but-NOT-sufficient: it reflects only the most recent invocation and can stay `0` across some failure modes. The Step-1 log check is the authoritative signal, not this.
