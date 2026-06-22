@@ -144,6 +144,19 @@ if [ ! -d "$VAULT" ]; then
     fail 1 "vault dir missing: $VAULT"
 fi
 
+# /Volumes mount guard. The iris_studio repo (this script, its prompts, the retry
+# queue) lives on the EXTERNAL AI_Workspace volume. If that volume detaches, its
+# mountpoint can linger as an empty dir on the boot disk — so a bare `[ -d ]` is
+# not enough. Confirm a known sentinel file inside the repo is actually present;
+# if not, the workspace is gone. Don't proceed (we'd run against a phantom tree /
+# write to the wrong disk) — fail() enqueues the 30-min retry so the job re-runs
+# once the volume is back. (Parameter-expansion derive — no cd, safe if detached.)
+WORKSPACE_ROOT="${SCRIPT_DIR%/*}"
+if [ ! -f "$WORKSPACE_ROOT/iris.py" ]; then
+    echo "run_claude_job: AI_Workspace volume unavailable (sentinel $WORKSPACE_ROOT/iris.py missing)" | tee -a "$LOG"
+    fail 1 "AI_Workspace volume unavailable — $WORKSPACE_ROOT not mounted (sentinel iris.py missing)"
+fi
+
 PROMPT="$(cat "$PROMPT_FILE")"
 cd "$VAULT"
 

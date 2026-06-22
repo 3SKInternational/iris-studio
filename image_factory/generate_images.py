@@ -261,6 +261,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, help="Generate at most N images (smoke test).")
     p.add_argument("--force", action="store_true", help="Re-render images whose PNG already exists.")
     p.add_argument("--dry-run", action="store_true", help="Plan + cost estimate; no API calls, no writes.")
+    # Runaway-spend guardrail. A real flagship batch is ~40-80 shots (~$8-9). A
+    # malformed/duplicated manifest — or pointing the runner at the wrong file —
+    # could silently bill hundreds. These caps abort BEFORE any API call when the
+    # batch is implausibly large; raise them for a deliberate big run.
+    p.add_argument("--max-images", type=int, default=150,
+                   help="Refuse to bill more than N images in one run (spend guard; default 150).")
+    p.add_argument("--max-cost", type=float, default=30.0,
+                   help="Refuse to run if the estimated batch cost exceeds $N (spend guard; default 30).")
     return p.parse_args()
 
 
@@ -332,6 +340,44 @@ def main() -> None:
     print(f"output   : {out_dir}")
     print(f"refs     : {len(ref_paths)} reference image(s)")
     print(f"images   : {len(images)}{'  (DRY RUN)' if args.dry_run else ''}\n")
+
+    # --- Spend guardrail (pre-flight) ---------------------------------------
+    # Count ONLY the images that would actually bill this run (skip those whose
+    # PNG already exists unless --force), and sum their estimated cost. If either
+    # the count or the estimate is implausibly large, abort before spending a cent.
+    # Conservative by design: a real flagship (~76 shots, ~$9) clears comfortably;
+    # a duplicated/wrong manifest (hundreds of shots / tens of dollars) is blocked.
+    would_render, pre_est = 0, 0.0
+    for _img in images:
+        if not isinstance(_img, dict):
+            continue
+        _name = str(_img.get("name") or "")
+        _prompt = _img.get("prompt")
+        if not _name or not isinstance(_prompt, str) or not _prompt:
+            continue
+        if "/" in _name or "\\" in _name or _name.startswith("."):
+            continue
+        if (out_dir / f"{_name}.png").exists() and not args.force:
+            continue  # would be skipped → bills nothing
+        _q = _img.get("quality", b_quality)
+        _s = _img.get("size", b_size)
+        _full = f"{preamble}\n\n{_prompt}" if preamble else _prompt
+        _refs = ref_paths if (_img.get("use_references", True) and ref_paths) else []
+        would_render += 1
+        pre_est += estimate_cost(model, _q, _s, _full, len(_refs))
+    if not args.dry_run:
+        if would_render > args.max_images:
+            die(f"spend guard: {would_render} images would bill this run, over the "
+                f"--max-images={args.max_images} cap. If this batch is intentional, "
+                f"re-run with --max-images {would_render}. (A real flagship is ~40-80 "
+                f"shots — a count this high usually means a duplicated or wrong manifest.)")
+        if pre_est > args.max_cost:
+            die(f"spend guard: estimated ${pre_est:.2f} for {would_render} image(s) "
+                f"exceeds the --max-cost=${args.max_cost:.2f} cap. If intentional, "
+                f"re-run with --max-cost {pre_est:.2f}.")
+        if would_render:
+            print(f"spend guard: OK — {would_render} image(s) to render, "
+                  f"~${pre_est:.2f} estimated (caps: {args.max_images} imgs / ${args.max_cost:.0f}).\n")
 
     client = None
     if not args.dry_run and provider == "openai":

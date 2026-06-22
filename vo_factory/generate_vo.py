@@ -30,6 +30,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
@@ -54,6 +55,10 @@ API_BASE = "https://api.elevenlabs.io/v1"
 # by the kit header, env, or CLI -- a voice swap stays a config change.
 DEFAULT_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian
 DEFAULT_MODEL = "eleven_multilingual_v2"
+# When the budget allocator is unavailable we must NOT silently default to the
+# premium (expensive) v2 model -- a blind run falls back to cheap flash. An
+# explicit --model still wins, so deliberate v2 use is unaffected.
+FALLBACK_MODEL = "eleven_flash_v2_5"
 DEFAULT_STABILITY = 0.5
 DEFAULT_SIMILARITY = 0.75
 DEFAULT_STYLE = 0.0
@@ -348,10 +353,10 @@ def main() -> None:
             dec = ma.choose_model(script_text, state, cfg)
             model = dec.model_id
         except Exception as e:  # noqa: BLE001 -- fall back, never break a run
-            model = DEFAULT_MODEL
-            print(f"  allocator: unavailable ({e}); using default {model}", file=sys.stderr)
+            model = FALLBACK_MODEL
+            print(f"  allocator: unavailable ({e}); falling back to cheap {model}", file=sys.stderr)
     else:
-        model = DEFAULT_MODEL
+        model = FALLBACK_MODEL
     stability = args.stability if args.stability is not None else DEFAULT_STABILITY
     similarity = args.similarity if args.similarity is not None else DEFAULT_SIMILARITY
     style = args.style if args.style is not None else DEFAULT_STYLE
@@ -442,42 +447,67 @@ def main() -> None:
     print("-" * 64)
     print(f"done: {made} generated, {failed} failed, {len(blocks) - len(to_make)} skipped.")
 
-    # Book REAL spend against the monthly budget (subscription-delta = exact
-    # credits charged this run). Only on a full run that produced audio: --limit
-    # is a smoke test and must not consume a cycle v2 slot.
-    if dec is not None and made > 0 and args.limit is None:
-        after = subscription_count(key)
-        actual = (max(after - before, 0)
-                  if (before is not None and after is not None) else None)
-        # actual is None -> commit falls back to the estimate.
-        # TODO: reconcile real usage if the subscription endpoint was unavailable.
-        # NOTE: subscription character_count is account-wide, so a concurrent run
-        # spending between the before/after reads would skew this video's delta.
-        # Acceptable for a single-operator account; the commit itself is locked.
-        video_id = kit_path.parent.name
-        with budget_lock(script_dir / ".vo_budget.lock"):
-            # Re-read state INSIDE the lock so a parallel run's increment isn't
-            # lost, and so the idempotency check sees the freshest log.
-            state = ma.load_state(cfg)
-            # Idempotent v2 cap: a --force re-render or a partial-failure top-up of
-            # a video already committed THIS cycle re-books its real credits but must
-            # NOT burn a second v2 slot. (A true parallel double-v2 race on distinct
-            # videos can still momentarily exceed the cap; it self-heals as the next
-            # decision sees the over-count and falls back to flash.)
-            # Match by note AND model: a video that already burned a v2 slot this
-            # cycle must not burn a second one on a re-render, but a flash->v2 flip
-            # (script edit / config change between runs) correctly books a new slot.
-            prev_v2 = any(e.get("note") == video_id and e.get("model") == "v2"
-                          for e in state.get("log", []))
-            ma.commit(state, dec, cfg, note=video_id, actual_credits=actual)
-            if prev_v2 and dec.model_key == "v2":
-                state["v2_count"] -= 1
-            ma.save_state(state)
-        booked = actual if actual is not None else dec.credits_est
-        src = "real" if actual is not None else "estimate"
-        print(f"allocator: booked {booked} cr ({src}) for {video_id}; "
-              f"cycle {state['credits_used']:,}/{int(ma.usable_budget(cfg)):,} usable, "
-              f"v2 {state['v2_count']}/{cfg['allocation']['max_v2_per_cycle']}")
+    # Book spend against the monthly budget. Only on a full run that produced
+    # audio: --limit is a smoke test and must not consume a cycle v2 slot. We
+    # book whenever the allocator module is importable -- even on a fallback run
+    # with no Decision -- so the ledger is never blind to real spend.
+    # Bookkeeping must NEVER fail an otherwise-successful generation: the mp3s
+    # are already on disk, so a budget-write error is logged and swallowed.
+    if ma is not None and made > 0 and args.limit is None:
+        try:
+            after = subscription_count(key)
+            actual = (max(after - before, 0)
+                      if (before is not None and after is not None) else None)
+            # A 0 (or negative) delta after a real billable batch means the
+            # account-wide usage endpoint LAGGED or was skewed by a concurrent
+            # run -- it does NOT mean the run was free. Treat it as unreliable and
+            # fall back to the estimate (marked unreconciled in the log) so the
+            # cap can't be defeated by a lagging endpoint reading zero.
+            if actual is not None and actual <= 0 and make_chars > 0:
+                actual = None
+            video_id = kit_path.parent.name
+            bcfg = cfg if cfg is not None else ma.load_config()
+            with budget_lock(script_dir / ".vo_budget.lock"):
+                # Re-read state INSIDE the lock so a parallel run's increment isn't
+                # lost; commit is replace-by-note, so a re-render/top-up of this
+                # video supersedes its prior cycle entry (no double-book, no extra
+                # v2 slot) rather than stacking on top of it.
+                state = ma.load_state(bcfg)
+                # --force re-renders EVERY scene, so this booking represents the
+                # whole kit -> REPLACE the prior same-note entry (no double-book).
+                # A non-force run rendered ONLY the missing scenes (a partial top-up),
+                # so its booking must ADD to the prior credits (which paid for the
+                # scenes that already existed) -- replacing would under-count spend.
+                replace = bool(args.force)
+                if dec is not None:
+                    # When there's no real delta (`actual is None`), fall back to
+                    # an estimate for THIS run's scenes only -- `dec.credits_est`
+                    # covers the WHOLE kit, so booking it on an additive top-up
+                    # (replace=False) would over-count by the already-rendered
+                    # remainder. make_chars is exactly the scenes rendered now
+                    # (full kit on --force, only the missing ones otherwise), so
+                    # it's the correct per-run estimate either way.
+                    est_override = None
+                    if actual is None:
+                        rate = bcfg["models"][dec.model_key]["credits_per_char"]
+                        est_override = int(math.ceil(make_chars * rate))
+                    ma.commit(state, dec, bcfg, note=video_id, actual_credits=actual,
+                              replace=replace, est_override=est_override)
+                else:
+                    # Allocator was unavailable for the DECISION (fell back to a
+                    # fixed model); still book an estimate from real chars.
+                    ma.commit_fallback(state, bcfg, model, make_chars,
+                                       note=video_id, actual_credits=actual,
+                                       replace=replace)
+                ma.save_state(state)
+            booked = actual if actual is not None else (state["log"][-1]["credits"] if state.get("log") else 0)
+            src = "real" if actual is not None else "estimate"
+            print(f"allocator: booked {booked} cr ({src}) for {video_id}; "
+                  f"cycle {state['credits_used']:,}/{int(ma.usable_budget(bcfg)):,} usable, "
+                  f"v2 {state['v2_count']}/{bcfg['allocation']['max_v2_per_cycle']}")
+        except Exception as e:  # noqa: BLE001 -- budget write must not fail a good render
+            print(f"  budget: booking skipped ({e}); mp3s are intact, ledger "
+                  f"NOT updated -- reconcile manually", file=sys.stderr)
 
     if failed:
         raise SystemExit(1)

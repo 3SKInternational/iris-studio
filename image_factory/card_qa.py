@@ -222,6 +222,17 @@ def main() -> None:
         else:
             build_contact_sheet(items, comp_dir / "card_qa_contact_sheet.png")
 
+    # Exit-code contract: the packet + contact sheet are ALWAYS written (for
+    # diagnosis), but if any expected composite is MISSING we exit non-zero so a
+    # caller using `set -e` (run_card_batch.sh) fails CLOSED — aborting before the
+    # false "✅ composited" notify instead of green-lighting an incomplete batch.
+    # 2 = packet built but N composites missing; 0 = all present. (die() uses 1.)
+    if packet["missing"]:
+        sys.stderr.write(
+            f"[card_qa] FAIL: {len(packet['missing'])} composite(s) missing — "
+            "QA gate cannot pass. " + ", ".join(packet["missing"]) + "\n")
+        sys.exit(2)
+
 
 if __name__ == "__main__":
     main()

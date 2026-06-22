@@ -99,6 +99,10 @@ INFRA_FAILURE_MARKERS = (
     "resource temporarily unavailable",  # EAGAIN — host fork/thread exhaustion
     "too many open files",               # EMFILE — host fd-limit (launchd RLIMIT_NOFILE)
     "command not found",                 # the claude CLI itself missing from PATH
+    "reviewer-unavailable",              # a BINARY review gate could not RUN (timeout/
+                                         # outage/auth-wobble). Treat as infra so the stage
+                                         # is left 'ready' and retried — NEVER fail-open
+                                         # advance unreviewed work (the V04 regression).
 )
 
 # === The run table — the security + invocation envelope ===
@@ -388,9 +392,37 @@ def deps_max_completed(key: str, stages: dict) -> float | None:
     return max(ts) if ts else None
 
 
-def _artifact_nonempty_and_fresh(spec: dict, video: int, threshold: float | None) -> tuple[bool, str]:
+def deps_freshness_threshold(key: str, stages: dict) -> tuple[float | None, bool]:
+    """Freshness threshold for an auto-promotion freshness check, plus a fail-closed
+    flag. Returns (threshold, deps_incomplete):
+
+      - No deps at all          → (None, False): freshness is vacuously satisfied.
+      - All deps have a stamp    → (max_completed_at, False): normal freshness gate.
+      - ANY dep lacks completed_at (null) → (max_of_known_or_None, True): the upstream
+        stage is NOT actually done, so a downstream artifact must NEVER auto-promote off
+        it — the True flag tells the caller to fail CLOSED. This closes the hole where a
+        threshold of None (deps present but unstamped) silently skipped the staleness
+        check and green-lit a stale/orphan artifact (the stale-VO promotion bug)."""
+    deps = stages.get(key, {}).get("deps", [])
+    if not deps:
+        return None, False
+    ts, incomplete = [], False
+    for d in deps:
+        t = parse_iso(stages.get(d, {}).get("completed_at"))
+        if t is None:
+            incomplete = True
+        else:
+            ts.append(t)
+    return (max(ts) if ts else None), incomplete
+
+
+def _artifact_nonempty_and_fresh(spec: dict, video: int, threshold: float | None,
+                                 deps_incomplete: bool = False) -> tuple[bool, str]:
     """Decision 1a: (1) exists & non-empty AND (2) mtime strictly newer than
-    the deps' max completed_at. Returns (ok, reason-if-not)."""
+    the deps' max completed_at. Returns (ok, reason-if-not).
+
+    deps_incomplete=True means at least one upstream dep has no completed_at — the
+    stage isn't legitimately done, so we fail CLOSED regardless of mtime."""
     rel = spec["path_tmpl"].replace("NN", nn(video))
     p = vault_abs(rel)
     if p is None or not p.exists():
@@ -408,6 +440,8 @@ def _artifact_nonempty_and_fresh(spec: dict, video: int, threshold: float | None
         if total <= 0:
             return False, f"only zero-byte files in {rel}"
         mtime = max(f.stat().st_mtime for f in files)
+    if deps_incomplete:
+        return False, f"upstream dep not yet completed (null completed_at) — won't auto-promote: {rel}"
     if threshold is not None and not (mtime > threshold):
         return False, f"artifact older than its deps (stale): {rel}"
     return True, ""
@@ -432,8 +466,9 @@ def promote_gate_exits(stages: dict, video: int) -> tuple[list[str], bool]:
             continue
         if key == "5_images":  # billed gate: spend-ok only
             continue
+        threshold, deps_incomplete = deps_freshness_threshold(key, stages)
         if key == "3_vo_expand":  # reviewed auto-promote: vo-reviewer gates the kit
-            outcome = _maybe_promote_vo_expand(s, video, deps_max_completed(key, stages))
+            outcome = _maybe_promote_vo_expand(s, video, threshold, deps_incomplete)
             if outcome == "promoted":
                 promoted.append(key)
             elif outcome == "changed":
@@ -442,7 +477,7 @@ def promote_gate_exits(stages: dict, video: int) -> tuple[list[str], bool]:
         spec = GATE_ARTIFACTS.get(key)
         if not spec:  # no fixed artifact convention → manual hand-edit only
             continue
-        ok, reason = _artifact_nonempty_and_fresh(spec, video, deps_max_completed(key, stages))
+        ok, reason = _artifact_nonempty_and_fresh(spec, video, threshold, deps_incomplete)
         if ok:
             s["status"] = "done"
             s["completed_at"] = now_iso()
@@ -560,9 +595,11 @@ def run_agent_stage(key: str, video: int, stages: dict) -> tuple[bool, str]:
       binary loop before the stage can mark done.
     - Everything else is a plain producer dispatch.
 
-    Each gate owns its own agent-availability handling (a missing reviewer →
-    UNAVAILABLE → fail-open with a Telegram warning), so a content stage never
-    wedges on review tooling being down."""
+    Each gate owns its own agent-availability handling: a reviewer that cannot
+    RUN (UNAVAILABLE — timeout/outage/unparseable) is treated as an INFRA failure
+    (stage left 'ready', retried next sweep, parked after MAX_INFRA), NOT a pass.
+    A content stage therefore advances only on a real SHIP and never ships
+    unreviewed work, while a transient reviewer outage self-heals on retry."""
     if key == "2_review":
         return run_script_review_gate(video)
     if key in STAGE_REVIEW:
@@ -829,25 +866,74 @@ def canonical_manifest_rel(video: int, stages: dict | None = None) -> str:
 _VERDICT_RANK = {"HOLD-SPEND": 4, "REVISE": 3, "SHIP WITH FIXES": 2, "SHIP": 1}
 _VERDICT_TOKEN_RE = re.compile(
     r"\b(HOLD-SPEND|SHIP WITH FIXES|REVISE|SHIP)\b", re.IGNORECASE)
+# A CANONICAL verdict line: optional markdown decoration (#, *, _, >, whitespace)
+# then the word "verdict" then an optional separator (:, -, *, _, whitespace).
+# This recognises "VERDICT:", "## Verdict", "**Verdict** —", "> Verdict:" etc.,
+# but NOT prose like "my verdict is that this looks shippable" (no separator-led
+# token follows on the line / next line in the structured sense we key on).
+_VERDICT_LABEL_RE = re.compile(r"^\s*[*_#>\s]*verdict\b[*_:\s-]*", re.IGNORECASE)
 
 
 def _image_review_verdict_rel(video: int) -> str:
     return f"{VAULT_REL}/Raw_Assets/Image_Factory/_REVIEW/Video_{nn(video)}_Image_Review.md"
 
 
-def _parse_image_verdict(text: str) -> str | None:
-    """Most-severe verdict token across all VERDICT-bearing lines, or None.
+def _tokens_in(line: str):
+    """Yield the (token, rank) pairs in a line, normalised + ranked."""
+    for m in _VERDICT_TOKEN_RE.finditer(line or ""):
+        tok = m.group(1).upper()
+        yield tok, _VERDICT_RANK[tok]
 
-    Only lines that mention 'verdict' are scanned, so prose/shot-finding text
-    that happens to contain a token elsewhere can't flip the result; among those
-    lines the highest-severity token wins (fail-safe toward blocking)."""
+
+def _parse_image_verdict(text: str) -> str | None:
+    """Most-severe verdict token, preferring CANONICAL 'VERDICT:' lines, or None.
+
+    Two passes, fail-safe toward the most-blocking token throughout:
+
+    1. CANONICAL pass — scan for lines the reviewer is told to emit ("VERDICT:"
+       style, incl. markdown-decorated headers like "## Verdict"). The token may
+       sit on the SAME line ("VERDICT: REVISE") or, when the label is a header,
+       on the NEXT non-blank line ("## Verdict\\nSHIP"). If ANY canonical label is
+       present we trust ONLY those lines and return their most-severe token — this
+       kills prose false-positives (a sentence elsewhere that happens to say
+       "ship") AND the header false-negative (token on the line after the label).
+
+    2. LEGACY fallback — only if NO canonical label exists anywhere, fall back to
+       the old "any line mentioning the word verdict" scan, so older/odd verdict
+       files still parse rather than silently degrading to UNAVAILABLE.
+
+    Returns None only when no token is found at all; the caller treats None as
+    UNAVAILABLE (blocking under the binary gates), never as SHIP."""
+    lines = (text or "").splitlines()
+    canon_best, canon_rank = None, 0
+    saw_label = False
+    for i, line in enumerate(lines):
+        if not _VERDICT_LABEL_RE.match(line):
+            continue
+        saw_label = True
+        # Same-line token (e.g. "VERDICT: REVISE").
+        found_same_line = False
+        for tok, r in _tokens_in(line):
+            found_same_line = True
+            if r > canon_rank:
+                canon_best, canon_rank = tok, r
+        # Header form: token on the next non-blank line (e.g. "## Verdict\nSHIP").
+        if not found_same_line:
+            for j in range(i + 1, len(lines)):
+                if not lines[j].strip():
+                    continue
+                for tok, r in _tokens_in(lines[j]):
+                    if r > canon_rank:
+                        canon_best, canon_rank = tok, r
+                break
+    if saw_label:
+        return canon_best
+    # Legacy fallback: no canonical label anywhere.
     best, best_rank = None, 0
-    for line in (text or "").splitlines():
+    for line in lines:
         if "verdict" not in line.lower():
             continue
-        for m in _VERDICT_TOKEN_RE.finditer(line):
-            tok = m.group(1).upper()
-            r = _VERDICT_RANK[tok]
+        for tok, r in _tokens_in(line):
             if r > best_rank:
                 best, best_rank = tok, r
     return best
@@ -957,7 +1043,8 @@ def run_prompt_review_loop(video: int, manifest_rel: str) -> tuple[str, str, str
     looping forever. UNAVAILABLE ends the loop immediately (the caller fails open
     — a human authorized THIS spend; review tooling being down must not block it).
     Returns the FINAL (verdict, vrel, detail). Fixing prompts is $0, so this whole
-    loop runs BEFORE the single billed spend."""
+    loop runs BEFORE the single billed spend. UNAVAILABLE ends the loop immediately
+    and the caller now fails CLOSED (refuses the spend; retry or --force)."""
     verdict, vrel, detail = run_image_review("prompts", video, manifest_rel)
     attempts = 0
     while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
@@ -1060,8 +1147,8 @@ def run_script_review_loop(video: int) -> tuple[str, str, str]:
     SHIP WITH FIXES, or any unexpected token) drives a scriptwriter fix and a
     re-review. Bounded by IMAGE_REVIEW_MAX_FIX_ATTEMPTS so a script the fixer can't
     clear parks for a human instead of looping forever. UNAVAILABLE ends the loop
-    immediately (the caller fails open — the script path is free; review tooling
-    being down must not wedge it). Returns the FINAL (verdict, vrel, detail)."""
+    immediately (the caller treats it as an INFRA failure → retry, never advance
+    unreviewed). Returns the FINAL (verdict, vrel, detail)."""
     verdict, vrel, detail = run_script_review(video)
     attempts = 0
     while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
@@ -1078,18 +1165,20 @@ def run_script_review_loop(video: int) -> tuple[str, str, str]:
 
 def run_script_review_gate(video: int) -> tuple[bool, str]:
     """Stage-2 executor under the BINARY policy: run the review→fix→re-review loop
-    and advance ONLY on a clean SHIP. UNAVAILABLE fails OPEN (the free script path
-    must not wedge on review tooling being down — warn + advance). REVISE (or any
-    non-SHIP surviving the fix budget) parks: returns False so the stage goes
-    needs-steve, exactly like a stage failure. Returns the (ok, out) the dispatcher
-    expects."""
+    and advance ONLY on a clean SHIP. UNAVAILABLE (the reviewer could not RUN —
+    timeout/outage/unparseable) is NOT a pass: it returns an INFRA failure so the
+    stage is left 'ready' and retried next sweep (self-heals when a transient
+    reviewer/auth outage clears; parks needs-steve after MAX_INFRA if it stays
+    down). This is the fix for the V04 fail-open regression — unreviewed work
+    never advances; Steve can --force if he must. REVISE (or any non-SHIP
+    surviving the fix budget) parks: returns False so the stage goes needs-steve.
+    Returns the (ok, out) the dispatcher expects."""
     verdict, vrel, detail = run_script_review_loop(video)
     if verdict == "SHIP":
         return True, f"script-reviewer SHIP ({vrel}). {detail}"
     if verdict == "UNAVAILABLE":
-        notify(f"⚠️ Video {video}: script-reviewer could not run the stage-2 review "
-               f"({detail}) — advancing anyway (fail-open). Eyeball the script.")
-        return True, f"script-review UNAVAILABLE — advanced fail-open ({detail})"
+        return False, (f"reviewer-unavailable: stage-2 script review could not run "
+                       f"({detail}) — left ready to retry, NOT advanced (binary gate).")
     return False, (f"script-reviewer {verdict} on the script after auto-fix — refusing to "
                    f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})")
 
@@ -1150,7 +1239,8 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
     return verdict, verdict_rel, f"VO kit verdict {verdict}"
 
 
-def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None) -> str:
+def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None,
+                             deps_incomplete: bool = False) -> str:
     """Reviewed auto-promote for the manual 3_vo_expand gate. Promote to done ONLY
     when the billed VO kit exists, is fresh vs deps, AND vo-reviewer returns a clean
     SHIP on it; a REVISE keeps it parked with the fix-list path. The kit mtime is
@@ -1161,6 +1251,10 @@ def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None) -> st
     UNAVAILABLE does NOT fail open here (unlike the free script path): a money-
     adjacent gate must not green-light an unreviewed kit because the reviewer was
     down — it parks for the human, and the render is manual anyway.
+
+    deps_incomplete=True means an upstream dep has no completed_at — the kit can't be
+    legitimately fresh vs an unfinished dep, so we park (fail CLOSED) without even
+    dispatching the (billed-adjacent) reviewer.
 
     Returns one of:
       'promoted' — stage flipped to done (caller counts it; triggers a save)
@@ -1175,6 +1269,11 @@ def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None) -> st
         s["note"] = note
         return "changed" if changed else "parked"
     kit_mtime = kit_abs.stat().st_mtime
+    if deps_incomplete:
+        note = "still needs Steve/Cowork: upstream dep not yet completed (null completed_at) — won't auto-promote VO"
+        changed = s.get("note") != note
+        s["note"] = note
+        return "changed" if changed else "parked"
     if threshold is not None and not (kit_mtime > threshold):
         note = "still needs Steve/Cowork: VO kit older than its deps (stale) — re-expand"
         changed = s.get("note") != note
@@ -1401,7 +1500,8 @@ def run_stage_review_loop(key: str, video: int) -> tuple[str, str, str]:
     """A producer stage's review→fix→re-review loop, mirroring run_script_review_
     loop. Advances only on a clean SHIP; anything less drives a fixer dispatch and
     a re-review, bounded by IMAGE_REVIEW_MAX_FIX_ATTEMPTS. UNAVAILABLE ends the loop
-    immediately (caller fails open). Returns the FINAL (verdict, vrel, detail)."""
+    immediately (caller treats it as an INFRA failure → retry, never advance
+    unreviewed). Returns the FINAL (verdict, vrel, detail)."""
     verdict, vrel, detail = run_stage_review(key, video)
     attempts = 0
     while verdict not in ("SHIP", "UNAVAILABLE") and attempts < IMAGE_REVIEW_MAX_FIX_ATTEMPTS:
@@ -1420,9 +1520,12 @@ def run_stage_review_gate(key: str, video: int) -> tuple[bool, str]:
     """PRODUCE-THEN-REVIEW executor for a producer stage under the BINARY policy.
     Step 1: dispatch the producer (the bare stage agent). If it fails to run, return
     that failure unchanged — no point reviewing a non-existent artifact. Step 2: run
-    the review→fix→re-review loop and advance ONLY on a clean SHIP. UNAVAILABLE fails
-    OPEN (free content path must not wedge — warn + advance). REVISE (or any non-SHIP
-    surviving the fix budget) parks: returns False so the stage goes needs-steve."""
+    the review→fix→re-review loop and advance ONLY on a clean SHIP. UNAVAILABLE (the
+    reviewer could not RUN) is NOT a pass: it returns an INFRA failure so the stage is
+    left 'ready' and retried next sweep (self-heals on a transient reviewer/auth
+    outage; parks after MAX_INFRA). The whole produce-then-review gate re-runs on
+    retry — acceptable: these stages bill nothing. REVISE (or any non-SHIP surviving
+    the fix budget) parks: returns False so the stage goes needs-steve."""
     ok, out = _dispatch_stage_agent(key, video)
     if not ok:
         return False, out
@@ -1430,9 +1533,8 @@ def run_stage_review_gate(key: str, video: int) -> tuple[bool, str]:
     if verdict == "SHIP":
         return True, f"{STAGE_REVIEW[key]['reviewer']} SHIP ({vrel}). {detail}"
     if verdict == "UNAVAILABLE":
-        notify(f"⚠️ Video {video}: {STAGE_REVIEW[key]['reviewer']} could not run the "
-               f"{key} review ({detail}) — advancing anyway (fail-open). Eyeball the output.")
-        return True, f"{key} review UNAVAILABLE — advanced fail-open ({detail})"
+        return False, (f"reviewer-unavailable: {key} review ({STAGE_REVIEW[key]['reviewer']}) "
+                       f"could not run ({detail}) — left ready to retry, NOT advanced.")
     return False, (f"{STAGE_REVIEW[key]['reviewer']} {verdict} on the {key} output after "
                    f"auto-fix — refusing to advance. Fix per {vrel}, then re-run "
                    f"/pipeline {video}. ({detail})")
@@ -1464,7 +1566,45 @@ def _mark_running(s: dict) -> None:
     s["note"] = None
 
 
-def _on_success(s: dict, key: str, video: int, out: str) -> None:
+def _producer_artifact_ok(key: str, video: int) -> tuple[bool, str]:
+    """A producer/script stage can exit 0 yet leave NO artifact (a half-run, a
+    silent write to the wrong path, an empty file). Before we trust exit-0 and mark
+    the stage done, confirm the DECLARED artifact actually exists and is non-empty.
+    Returns (ok, reason-if-not). When the stage has no known artifact convention
+    (path is None / unresolvable) we can't verify, so we don't block (ok=True)."""
+    rel = stage_artifact_path(key, video)
+    if not rel:
+        return True, ""
+    p = vault_abs(rel)
+    if p is None:
+        return True, ""
+    if not p.exists():
+        return False, f"declared artifact missing after exit 0: {rel}"
+    if p.is_file():
+        if p.stat().st_size <= 0:
+            return False, f"declared artifact is empty after exit 0: {rel}"
+        return True, ""
+    # Directory artifact: require at least one non-zero-byte file somewhere under it.
+    total = 0
+    for f in p.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    if total <= 0:
+        return False, f"declared artifact dir empty after exit 0: {rel}"
+    return True, ""
+
+
+def _on_success(s: dict, key: str, video: int, out: str) -> tuple[bool, str]:
+    """Mark a stage done after a clean exit — but ONLY if its declared artifact
+    actually landed. Returns (done, reason): done=False means the producer exited 0
+    without leaving its artifact; the caller must treat that as a task failure (it
+    does NOT mutate fail_count here — the caller routes it through _on_failure once)."""
+    ok_art, reason = _producer_artifact_ok(key, video)
+    if not ok_art:
+        return False, reason
     s["status"] = "done"
     s["completed_at"] = now_iso()
     s["artifact_path"] = stage_artifact_path(key, video)
@@ -1474,6 +1614,7 @@ def _on_success(s: dict, key: str, video: int, out: str) -> None:
     s["pid"] = None
     s["pid_start_token"] = None
     s["note"] = (out or "")[-300:] or "done"
+    return True, ""
 
 
 def _is_infra_failure(err: str) -> bool:
@@ -1493,6 +1634,10 @@ def _on_failure(s: dict, err: str) -> None:
         # But a host outage that NEVER clears must not loop invisibly forever:
         # bound it with MAX_INFRA so it parks (visibly, park_reason "infra") and
         # surfaces in the digest / needs-you count instead (reviewer HIGH).
+        # Reset the OPPOSITE counter: each counter measures a CONSECUTIVE streak of
+        # its own failure type, so an intervening infra blip mustn't leave a stale
+        # task-failure tally that prematurely parks a later genuine retry (and v.v.).
+        s["fail_count"] = 0
         s["infra_count"] = int(s.get("infra_count") or 0) + 1
         s["note"] = ("infra failure (host/toolchain, not a task failure) #"
                      + str(s["infra_count"]) + " — " + (err or "")[-300:])
@@ -1502,6 +1647,7 @@ def _on_failure(s: dict, err: str) -> None:
         else:
             s["status"] = "ready"
         return
+    s["infra_count"] = 0
     s["fail_count"] = int(s.get("fail_count") or 0) + 1
     s["note"] = (err or "")[-500:]
     if s["fail_count"] >= MAX_FAILS:
@@ -1565,23 +1711,28 @@ def advance_once(sf: StateFile) -> AdvanceResult:
         ok, out = False, f"stage {nxt} is billed and not advancable via --advance"
 
     if ok:
-        _on_success(s, nxt, video, out)
-        sf.data["last_progress_at"] = now_iso()   # forward progress → resets staleness clock
-        sf.save()
-        gate = first_ready_gate(stages) if select_next(stages) is None else None
-        nxt2 = select_next(stages)
-        tail = ""
-        if nxt2:
-            tail = f" → next: stage {nxt2} ({STAGE_LABEL[nxt2]})."
-        elif gate == "5_images":
-            tail = (f" → next is BILLED: stage {gate} ({STAGE_LABEL[gate]}). "
-                    f"Reply /pipeline {video} spend-ok to authorize.")
-        elif gate:
-            tail = f" → next action is yours: stage {gate} ({STAGE_LABEL[gate]})."
-        line = f"🎬 Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) done.{tail}"
-        print(line)
-        notify(line)
-        return AdvanceResult(0, "ran_done", nxt, line)
+        done_ok, art_reason = _on_success(s, nxt, video, out)
+        if done_ok:
+            sf.data["last_progress_at"] = now_iso()   # forward progress → resets staleness clock
+            sf.save()
+            gate = first_ready_gate(stages) if select_next(stages) is None else None
+            nxt2 = select_next(stages)
+            tail = ""
+            if nxt2:
+                tail = f" → next: stage {nxt2} ({STAGE_LABEL[nxt2]})."
+            elif gate == "5_images":
+                tail = (f" → next is BILLED: stage {gate} ({STAGE_LABEL[gate]}). "
+                        f"Reply /pipeline {video} spend-ok to authorize.")
+            elif gate:
+                tail = f" → next action is yours: stage {gate} ({STAGE_LABEL[gate]})."
+            line = f"🎬 Video {video}: stage {nxt} ({STAGE_LABEL[nxt]}) done.{tail}"
+            print(line)
+            notify(line)
+            return AdvanceResult(0, "ran_done", nxt, line)
+        # Exit 0 but the artifact didn't land — demote to a task failure and fall
+        # through to the failure handler (which calls _on_failure exactly once).
+        ok = False
+        out = f"stage exited 0 but {art_reason}"
 
     # Failure. _on_failure decides infra (host couldn't run it — no task-failure
     # retry burned, bounded by MAX_INFRA) vs genuine task failure.
@@ -1829,20 +1980,24 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
             notify(line)
             return 2
         verdict, vrel, detail = run_prompt_review_loop(video, manifest_rel)
-        # BINARY allow-list (Steve, 2026-06-20): spend ONLY on a clean SHIP — a
-        # 100% sign-off. UNAVAILABLE is the single fail-OPEN exception (a human
-        # authorized THIS spend; review tooling being down must not block it).
-        # EVERY other verdict — HOLD-SPEND, REVISE, the retired SHIP WITH FIXES,
-        # or anything unexpected the reviewer emits — fails CLOSED and refuses the
-        # batch. "Ship with fixes" is no longer a spendable state: if it is not all
-        # good to go, none of it goes. A false block is cheap (--force overrides);
-        # a false SHIP bills real money / ships an off-model batch.
+        # BINARY allow-list (Steve, 2026-06-20; fail-closed hardened 2026-06-22):
+        # spend ONLY on a clean SHIP — a 100% sign-off. EVERYTHING else fails
+        # CLOSED and refuses the batch, INCLUDING UNAVAILABLE (the reviewer could
+        # not RUN — timeout/outage/unparseable). A review that did not run is not
+        # an approval: spending past it would bill real money on an unreviewed
+        # (possibly off-model) batch exactly when the safety check is blind. The
+        # human's spend-ok is honored by RETRYING once the reviewer recovers, or by
+        # an explicit --force override (which takes the deterministic-guard-only
+        # branch above). A false block is cheap; a false SHIP bills money.
         if verdict == "UNAVAILABLE":
-            line = (f"⚠️ Video {video}: image-reviewer could not run the pre-spend "
-                    f"prompts review ({detail}) — proceeding with spend (fail-open). "
-                    f"Eyeball the prompts manually.")
+            s["note"] = f"spend held: image-reviewer could not run the pre-spend review ({detail})"
+            sf.save()
+            line = (f"🛑 Video {video}: image-reviewer could not run the pre-spend prompts "
+                    f"review ({detail}) — refusing to spend (binary gate, fail-CLOSED). "
+                    f"Retry /pipeline {video} spend-ok when it recovers, or override with --force.")
             print(line)
             notify(line)
+            return 2
         elif verdict == "SHIP":
             line = f"✅ Video {video}: image-reviewer pre-spend verdict SHIP ({vrel})."
             print(line)
@@ -1874,8 +2029,8 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     except subprocess.TimeoutExpired:
         ok, out = False, f"generate_images timed out after {cfg['timeout']}s"
 
-    if ok:
-        _on_success(s, key, video, out)
+    done_ok, art_reason = (False, "") if not ok else _on_success(s, key, video, out)
+    if ok and done_ok:
         sf.save()
         nxt = select_next(stages)
         tail = f" → next: stage {nxt} ({STAGE_LABEL[nxt]})." if nxt else ""
@@ -1884,6 +2039,10 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
         notify(line)
         return 0
     else:
+        if ok and not done_ok:
+            # generate_images exited 0 but the HD render dir is empty — don't
+            # silently mark a billed stage done with no output.
+            out = f"generate_images exited 0 but {art_reason}"
         _on_failure(s, out)
         sf.save()
         line = f"⚠️ Video {video}: stage 5 (images) spend FAILED — {out[:200]}"

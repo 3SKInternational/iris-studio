@@ -65,6 +65,25 @@ trap 'rq_release_lock' EXIT
 TS_START="$(date '+%Y-%m-%d %H:%M %Z')"
 echo "run_job: '${JOB}' starting at ${TS_START} — $*" >> "$LOG"
 
+# /Volumes mount guard. This wrapper + the retry queue live on the EXTERNAL
+# AI_Workspace volume, and many jobs (pipeline sweeps, drive-sync) operate on
+# workspace paths. If the volume detaches, its mountpoint can linger as an empty
+# dir — so a bare `[ -d ]` is not enough. Confirm a sentinel file inside the repo
+# is present; if not, don't run the job against a phantom tree. Enqueue the 30-min
+# retry so it re-runs once the volume returns. (No cd — safe if already detached.)
+WORKSPACE_ROOT="${SCRIPT_DIR%/*}"
+if [ ! -f "$WORKSPACE_ROOT/iris.py" ]; then
+    TSW="$(date '+%Y-%m-%d %H:%M %Z')"
+    echo "run_job: '${JOB}' SKIPPED — AI_Workspace volume unavailable (sentinel $WORKSPACE_ROOT/iris.py missing) at ${TSW}" >> "$LOG"
+    if [ "${IRIS_RETRY:-0}" != "1" ]; then
+        alert "🔴 launchd job '${JOB}' could not run — AI_Workspace volume unavailable (not mounted).
+Time: ${TSW}
+The 30-min auto-retry will re-run it once the volume is back."
+    fi
+    rq_record_failure "$JOB" "infra" "AI_Workspace volume unavailable (not mounted)" -- "${ORIG_ARGV[@]}"
+    exit 1
+fi
+
 "$@" >> "$LOG" 2>&1
 rc=$?
 

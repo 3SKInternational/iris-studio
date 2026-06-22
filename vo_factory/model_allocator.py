@@ -201,26 +201,116 @@ def choose_model(text: str, state: dict, cfg: dict) -> Decision:
     )
 
 
+def model_key_for_id(cfg: dict, model_id: str) -> str | None:
+    """Reverse-lookup a config model_key ('v2'/'flash') from an ElevenLabs id."""
+    for k, v in cfg.get("models", {}).items():
+        if v.get("id") == model_id:
+            return k
+    return None
+
+
 def commit(state: dict, d: Decision, cfg: dict, note: str = "",
-           actual_credits: int | None = None) -> dict:
+           actual_credits: int | None = None, replace: bool = True,
+           est_override: int | None = None) -> dict:
     """Record a SUCCESSFUL generation against the monthly budget.
 
     Pass `actual_credits` (the real usage ElevenLabs returns in the TTS
     response/headers, e.g. the 'character-cost' header or the subscription
     usage endpoint) to book the true cost and keep the cycle total exact.
-    If omitted, the pre-flight estimate (`d.credits_est`) is used as a fallback.
+    If omitted, the booked amount falls back to an estimate.
+
+    `est_override` is the estimate-fallback for THIS booking when no real
+    `actual_credits` reading is available. It exists because `d.credits_est`
+    is computed once over the WHOLE kit, but a PARTIAL top-up (`replace=False`)
+    only rendered the still-missing scenes -- booking the full-kit estimate on
+    an additive top-up would OVER-count real spend by the already-rendered
+    remainder (the mirror of the under-count bug `replace` fixed). The caller
+    that knows how many chars it actually rendered this run passes that run's
+    estimate here; if None, the full-kit `d.credits_est` is used (correct for a
+    `--force` full re-render, where this run IS the whole kit).
+
+    NOTE (the video id) is the per-cycle idempotency key. How a same-note booking
+    combines with prior ones depends on `replace`:
+
+      replace=True  (a FULL re-render -- generate_vo's `--force`, which re-renders
+                    EVERY scene): SUPERSEDE. The old same-note entries' credits and
+                    any v2 slot are reversed before the new full-kit booking is
+                    applied, so a re-render can't double-book.
+
+      replace=False (a PARTIAL top-up -- a non-`--force` run that renders ONLY the
+                    scenes whose mp3s are still missing): ADD. The new booking
+                    covers only the just-rendered scenes, so it must STACK on top
+                    of the prior same-note credits (which paid for the scenes that
+                    already existed) -- reversing them would under-count real spend
+                    by the size of the already-rendered remainder. The v2 slot is
+                    counted at most ONCE per note: a top-up does not consume a
+                    second slot if this note already holds one.
+
+    A top-up never double-books a scene: non-`--force` runs skip existing mp3s, so
+    a scene is rendered (and booked) exactly once across the original run + top-ups.
+    An empty note never matches, so note-less commits always append.
     """
-    booked = int(actual_credits) if actual_credits is not None else d.credits_est
-    state["credits_used"] += booked
-    if d.model_key == "v2":
-        state["v2_count"] += 1
-    state.setdefault("log", []).append(
+    if actual_credits is not None:
+        booked = int(actual_credits)
+    elif est_override is not None:
+        booked = int(est_override)
+    else:
+        booked = d.credits_est
+    log = state.setdefault("log", [])
+    note_has_v2 = False
+    if note and replace:
+        kept = []
+        for e in log:
+            if e.get("note") == note:
+                state["credits_used"] = state.get("credits_used", 0) - int(e.get("credits", 0))
+                if e.get("model") == "v2":
+                    state["v2_count"] = state.get("v2_count", 0) - 1
+            else:
+                kept.append(e)
+        log[:] = kept
+    elif note and not replace:
+        # Additive top-up: keep prior same-note entries; only flag whether this
+        # note already consumed a v2 slot so we don't book a second one.
+        note_has_v2 = any(e.get("note") == note and e.get("model") == "v2" for e in log)
+    state["credits_used"] = state.get("credits_used", 0) + booked
+    if d.model_key == "v2" and not note_has_v2:
+        state["v2_count"] = state.get("v2_count", 0) + 1
+    # Reversing superseded entries must never push a counter below zero.
+    state["credits_used"] = max(state["credits_used"], 0)
+    state["v2_count"] = max(state["v2_count"], 0)
+    log.append(
         {"ts": datetime.now().isoformat(timespec="seconds"),
          "model": d.model_key, "credits": booked,
          "estimated": d.credits_est, "reconciled": actual_credits is not None,
+         "replace": bool(replace),
          "score": d.score, "chars": d.chars, "note": note}
     )
     return state
+
+
+def commit_fallback(state: dict, cfg: dict, model_id: str, chars: int,
+                    note: str = "", actual_credits: int | None = None,
+                    replace: bool = True) -> dict:
+    """Book a budget entry when no allocator Decision was available.
+
+    Used when generate_vo fell back to a fixed model (allocator import/classify
+    failed) but still produced billable audio -- so the ledger isn't blind.
+    Credits are estimated from `chars` at the model's configured rate unless a
+    real `actual_credits` reading is supplied. Goes through `commit`, so it shares
+    the same replace-vs-add semantics (`replace`) as any other booking.
+    """
+    key = model_key_for_id(cfg, model_id) or cfg["allocation"]["fallback_model"]
+    rate = cfg["models"][key]["credits_per_char"]
+    est = int(math.ceil(max(int(chars), 0) * rate))
+    d = Decision(
+        model_key=key, model_id=model_id,
+        voice_id=cfg.get("default_voice_id", ""),
+        score=0.0, credits_est=est,
+        reason="allocator-unavailable fallback",
+        would_exceed_budget=False, chars=int(chars),
+    )
+    return commit(state, d, cfg, note=note, actual_credits=actual_credits,
+                  replace=replace)
 
 
 # --------------------------------------------------------------------------- #
