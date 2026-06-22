@@ -718,9 +718,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fit", choices=["cover", "contain"], default=None,
                    help="Override the edit-manifest default fit. 'cover' = crop-to-fill "
                         "(V1's original look); 'contain' = blurred-fill, no crop (default).")
-    p.add_argument("--still", action="store_true",
+    p.add_argument("--still", action=argparse.BooleanOptionalAction, default=True,
                    help="Lock every shot to a static frame (motion 'hold') — no Ken "
-                        "Burns pan/zoom. Use to kill on-screen motion drift.")
+                        "Burns pan/zoom. ON BY DEFAULT (Steve, 2026-06-22: 3SK videos "
+                        "ship as stills — no on-screen motion drift on the flat 2D art). "
+                        "Pass --no-still to re-enable the gentle Ken Burns pan/zoom cycle.")
     p.add_argument("--no-cta", action="store_true",
                    help="Omit the shared reusable CTA segments (mid-roll subscribe "
                         "bump + outro like/comment/subscribe). On by default; they "
