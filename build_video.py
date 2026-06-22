@@ -710,9 +710,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vo-source", help="Vault-relative dir of existing VO mp3s to assemble from (e.g. Voice_Files/Video_01).")
     p.add_argument("--image-set", help="Vault-relative dir of existing image PNGs to assemble from (e.g. Raw_Assets/Video_01_HD). Mutually exclusive with --images.")
     p.add_argument("--force", action="store_true", help="Pass --force to the billed stages (re-render existing).")
-    p.add_argument("--align", action="store_true",
+    p.add_argument("--align", action=argparse.BooleanOptionalAction, default=True,
                    help="Cut multi-shot scenes at REAL spoken-word boundaries via local "
-                        "forced alignment (fixes within-scene A/V drift). Local, free, no API.")
+                        "forced alignment (fixes within-scene A/V drift). Local, free, no API. "
+                        "ON BY DEFAULT (Steve, 2026-06-20: all shots align to the voice). "
+                        "Pass --no-align to fall back to even-split proportional timing.")
     p.add_argument("--fit", choices=["cover", "contain"], default=None,
                    help="Override the edit-manifest default fit. 'cover' = crop-to-fill "
                         "(V1's original look); 'contain' = blurred-fill, no crop (default).")
