@@ -1,0 +1,68 @@
+You are Claude Code running the AFFILIATE-CHECK routine on the Mac Mini, once a week (Tue 06:20 ET). Your job is a compliance + link-rot sweep over 3SK Finance's PUBLISHED YouTube videos: confirm every affiliate/external link in each live description still resolves, and that the FTC affiliate disclosure is present exactly when policy requires it and absent when it does not. Alert Steve ONLY when something is wrong. On a clean week you stay quiet beyond the routine's completion signal.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+RECEIPTS DIR: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Production_Kits   (Video_NN_youtube_upload.json — has video_id, url, privacy, publish_at)
+POLICY:  /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Compliance/Affiliate_Disclosure_Policy.md
+INDEX:   /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Lead_Magnets/_Lead_Magnet_Index.md   (the "Affiliate slot in description" column is the source of truth for which videos carry affiliate links)
+REPORT DIR: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Compliance/Affiliate_Checks
+NOTIFY: /Volumes/AI_Workspace/iris_studio/scripts/notify.sh
+YT-DLP: /Volumes/AI_Workspace/iris_studio/.venv/bin/yt-dlp
+
+HARD RULES (read before doing anything):
+- NEVER fabricate a link status. Every "alive"/"dead" verdict MUST come from a real HTTP check you ran (curl) this cycle. Every description you analyze MUST be the LIVE text you fetched from YouTube (yt-dlp), not a guess or a vault copy. If you cannot fetch a video's live description, mark it "could not verify" — never assume it is fine.
+- Do NOT echo raw fetched description bodies into your stdout/output. Work with them internally; in the report and your output, quote ONLY the extracted URLs, their status codes, and your disclosure verdict. (The job wrapper scans run output for auth/credit error strings; a finance description that happens to contain a phrase like "out of usage credits" could trip a false auth alert if dumped verbatim.)
+- This routine writes ONLY: one dated report under REPORT DIR and your one daily-note line. Do NOT edit receipts, the policy, the index, descriptions on YouTube, or anything else. You report problems; Steve fixes them in Studio.
+- Do NOT delete or move any file.
+- ALERT DISCIPLINE — silent by default. Fire the Telegram alert ONLY when there is at least one finding (dead link, missing/incorrect disclosure, or a false disclosure on a clean video, or a verification failure worth Steve knowing). A fully clean sweep raises no alert. The wrapper sends its own ✅; do not duplicate it.
+
+PASS 1 — ENUMERATE PUBLISHED VIDEOS:
+  Read every RECEIPTS DIR/Video_NN_youtube_upload.json. A video is IN SCOPE only if it is actually PUBLIC now: privacy == "public" AND (publish_at is null/empty OR publish_at is in the past). Skip private/unlisted/scheduled-future videos (a scheduled video isn't live yet → nothing to check). Collect each in-scope video's NN, video_id, and url.
+  If there are zero in-scope videos, end ROUTINE_COMPLETE with a daily-note line saying "no published videos in scope".
+
+PASS 2 — FETCH EACH LIVE DESCRIPTION (real data, never guessed):
+  For each in-scope video, fetch its CURRENT live description from YouTube (no API key needed):
+      /Volumes/AI_Workspace/iris_studio/.venv/bin/yt-dlp --skip-download --no-warnings --socket-timeout 30 --print "%(description)s" "<url>"
+  - If yt-dlp fails or returns empty (rate limit, region lock, removed video), record this video as "could not verify (description fetch failed)" and move on. Do NOT treat a fetch failure as a pass or a fail of the disclosure check — it is an explicit unknown that goes in the report.
+
+PASS 3 — CHECK LINKS ARE ALIVE (real HTTP, never guessed):
+  From each fetched description, extract every URL (http/https). De-duplicate. For each unique URL, run a real liveness check:
+      curl -sS -A "Mozilla/5.0 (compatible; 3SK-affiliate-check)" -o /dev/null -w "%{http_code}" --max-time 20 -L "<url>"
+  - 2xx/3xx (final) = ALIVE. 4xx/5xx = DEAD. A timeout / connection error = UNREACHABLE (report it, but note transient sites can false-positive — phrase it as "unreachable this run", not a hard dead-link claim, unless it is a clear 404/410).
+  - Affiliate/redirect links (Impact, refer-a-friend, etc.) often 30x-redirect — follow redirects (-L) and judge on the FINAL status.
+
+PASS 4 — CHECK DISCLOSURE CORRECTNESS (per the locked policy):
+  FIRST read POLICY in full and anchor your definition of "an affiliate disclosure" to it. Per Rule 2, a real affiliate disclosure is the specific plain-language block built from the approved templates — it leads with "Affiliate disclosure:" and names the affiliated program(s) (e.g. "The M1 link below is an affiliate link…"). That anchored definition is what you match on. Do NOT treat generic, non-affiliate boilerplate as a disclosure: "this is not financial advice", a plain "no affiliate links" note, channel/CTA/subscribe text, or a bare tool mention with a non-affiliate URL are NOT affiliate disclosures. The retired vague blanket text "some links may be affiliate links" is a DISCLOSURE (a defective one) — flag it where it appears.
+  Read the INDEX "Affiliate slot in description" column. For each in-scope video determine its EXPECTED disclosure state:
+    • Index row says "None — clean (trust deposit)" / "none" → CLEAN: the description must carry NO affiliate disclosure block (as defined above).
+    • Index row names real affiliate program(s) → AFFILIATE: the description MUST carry a plain-language affiliate disclosure that (a) is present, (b) names the actual program(s), and (c) sits above the links it describes (per Rule 2).
+  Then compare against the LIVE description you fetched:
+    - AFFILIATE video MISSING a disclosure, or carrying the retired vague "some links may be affiliate links" blanket text, or with the disclosure placed BELOW the links → FINDING (🔴 compliance).
+    - CLEAN video that UNAMBIGUOUSLY carries a real affiliate disclosure block (matches the anchored definition — a "Affiliate disclosure:" block naming a program, or the retired blanket affiliate text) → FINDING (🔴 false disclosure — the exact V3 failure the policy exists to prevent).
+    - CLEAN video carrying text that is only DISCLOSURE-ADJACENT or borderline (you are not confident it is a real affiliate disclosure under the anchored definition) → do NOT raise a 🔴. Report it as 🟠 "needs Steve's eye — possible disclosure on a clean video" with the exact quoted snippet, so Steve judges. Anti-false-positive: when unsure, downgrade to 🟠, never assert 🔴.
+    - Disclosure present and correct on an affiliate video, absent on a clean video → PASS.
+  If the index and a receipt disagree about a video, follow the INDEX (it is the documented source of truth) and note the discrepancy in the report.
+
+PASS 5 — REPORT + ALERT:
+  Write REPORT DIR/<today>_affiliate-check.md (create the dir if needed) with frontmatter (date, type: affiliate-check) and a per-video table: NN, video_id, expected state (clean/affiliate), # links checked, any dead/unreachable links (with status code + URL), disclosure verdict (pass / finding + what's wrong), or "could not verify".
+  IF there is at least one FINDING or could-not-verify:
+    Fire ONE Telegram alert (most severe first; compliance 🔴 before link-rot 🟠):
+        /Volumes/AI_Workspace/iris_studio/scripts/notify.sh "🟠 Affiliate-check — <N> finding(s):
+    • V0N: <one-line problem + the fix Steve makes in Studio>
+    ...
+    Full report: <report path>"
+  IF the sweep is fully clean (every link alive, every disclosure correct, nothing unverifiable): no alert. The report still gets written.
+
+PASS 6 — LOG (always, exactly one short line):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md under a section headed EXACTLY:
+      ## 🔗 Affiliate-check (weekly Tue 06:20)
+  ONE line: N videos checked, M links checked, K findings (or "all clean"), + the report path. Create the daily note from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub) if missing. Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the sweep ran and a report was written (whether clean or with findings; could-not-verify items are reported, not a routine failure).
+- `ROUTINE_INCOMPLETE: <one-line reason>` — you could not enumerate receipts or could not run the checks at all (e.g. receipts dir missing).
+
+Output nothing after that line.

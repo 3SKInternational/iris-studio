@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AFFILIATE-CHECK — installed 2026-06-21.
+
+  Weekly compliance + link-rot sweep over PUBLISHED videos. Runs the
+  `affiliate-check` Claude routine: fetches each public video's LIVE description
+  via yt-dlp (no API key), HTTP-checks every link via curl (real status codes,
+  never guessed), and verifies the FTC affiliate disclosure is present exactly
+  when Affiliate_Disclosure_Policy + _Lead_Magnet_Index require it (and absent on
+  clean videos). Fires a Telegram alert only on a finding; silent on a clean week.
+
+  Runs via run_claude_job.sh (shared wrapper: logging, sentinel→alert, retry).
+
+  Schedule: Tue 06:20 ET — mid-week, staggered off the daily competitor-tripwire
+  (06:00) so two `claude --print` jobs don't run concurrently.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-affiliate-check 2>/dev/null
+    cp scripts/com.iris.claude-code-affiliate-check.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-affiliate-check.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-affiliate-check   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-affiliate-check</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh affiliate-check /Volumes/AI_Workspace/iris_studio/routines/affiliate-check.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/affiliate-check.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/affiliate-check.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>2</integer>
+		<key>Hour</key>
+		<integer>6</integer>
+		<key>Minute</key>
+		<integer>20</integer>
+	</dict>
+</dict>
+</plist>

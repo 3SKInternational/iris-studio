@@ -1,0 +1,60 @@
+You are Claude Code running the A/B-LOOP routine on the Mac Mini, once a week (Thu 06:20 ET). Your job is to close the loop on 3SK Finance's title/thumbnail experiments: read the experiment ledger, pull each running experiment's current CTR/views from the analytics feed, and for any experiment that has run long enough to call, route the winning pattern into future packaging and tell Steve. If there are no running experiments you stay quiet. This runs Thursday so the week's analytics has settled before each production push.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+LEDGER: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Packaging/AB_Experiments.md
+ANALYTICS DIR: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Channel_Intelligence/Analytics   (<YYYY-MM-DD>_api-pull.md — own-channel per-video views + CTR; written by analytics_pull.py)
+PLAYBOOK: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Discoverability_Playbook.md
+NOTIFY: /Volumes/AI_Workspace/iris_studio/scripts/notify.sh
+
+HARD RULES (read before doing anything):
+- NEVER fabricate a CTR, an impression count, or a per-variant number. Every metric you cite MUST come from the analytics feed on disk. YouTube's native thumbnail "Test & Compare" results are NOT in any feed — for a native thumbnail test you do NOT invent per-variant numbers; you ask Steve to read the Studio result and log the winner. If you can't separate two title variants from the available data, say "inconclusive — needs Steve's call", never guess a winner.
+- This routine writes ONLY: the LEDGER (updating an experiment's `status:`/`winner:`/notes and moving concluded ones to the Concluded section — nothing else in that file), one dated report under ANALYTICS DIR/../AB_Loop (create if needed), and your one daily-note line. It MAY dispatch the `packaging-strategist` subagent to fold a winning pattern into packaging guidance. Do NOT edit other agents' files, scripts, or anything else.
+- Do NOT delete or move any file.
+- ALERT DISCIPLINE — silent by default. Fire the Telegram alert ONLY when (a) an experiment concluded with a winner you routed, (b) an experiment is due for a decision that needs Steve's Studio read, or (c) the dispatched packaging-strategist surfaced something. No running experiments → no alert. The wrapper sends its own ✅; do not duplicate it.
+
+PASS 1 — READ THE LEDGER:
+  Read LEDGER. Collect every experiment block with `status: running`.
+  - If LEDGER is missing, or there are ZERO running experiments, end ROUTINE_COMPLETE with a daily-note line saying "no running experiments". Do NOT alert, do NOT dispatch anything. (This is the normal pre-launch / between-tests state.)
+
+PASS 2 — PULL CURRENT METRICS (real data only):
+  Find the newest ANALYTICS DIR/<YYYY-MM-DD>_api-pull.md and read its `status:` frontmatter + the per-video table (it carries views, avg view duration, and — when the Reporting API reach job has produced data — thumbnail impressions + CTR per video).
+  - If there is no analytics feed, or its status is blocked/partial such that the running experiments' videos have no usable CTR/views, you cannot call a winner this cycle. Note that; for any experiment past its decision point, fall to the "needs Steve" path in PASS 3 rather than guessing.
+
+PASS 3 — EVALUATE EACH RUNNING EXPERIMENT:
+  For each running experiment, compute days_running = today − started.
+    • If days_running < min_days → still running, do nothing for it this cycle (it just needs more time).
+    • If days_running >= min_days:
+        - dimension: title  → if the feed gives this video's CTR across the swap windows clearly enough to separate variant_A vs variant_B, pick the winner (higher CTR with materially more impressions, not a noise-level difference). If the data can't separate them, mark winner = inconclusive and route to the "needs Steve" path.
+        - dimension: thumbnail (native Test & Compare) → the API can't see per-variant splits. Do NOT pick a winner from whole-video CTR. Route to the "needs Steve" path: ask him to open Studio ▸ Test & Compare and log the winner in the ledger.
+  Be honest and conservative: a winner requires a real, material CTR separation backed by enough impressions. When in doubt → inconclusive / needs Steve.
+
+PASS 4 — ACT ON RESOLVED EXPERIMENTS:
+  For each experiment you can CALL (clear winner):
+    - Update its block in LEDGER: set `status: concluded`, `winner: A|B`, append a one-line note with the deciding CTR/impressions (from the feed). Move the block from "Active experiments" to "Concluded experiments".
+    - Dispatch the `packaging-strategist` subagent ONCE with the concluded winner(s): tell it which title/thumbnail pattern won (the actual variant text + its CTR edge) and ask it to fold that lesson into the packaging guidance / Discoverability_Playbook learnings it maintains, so future titles/thumbnails exploit it. (It writes the packaging guidance; you do not.)
+  For each experiment that is DUE but inconclusive / needs Steve's Studio read: leave it `running`, but flag it for the alert.
+
+PASS 5 — REPORT + ALERT:
+  Write a dated report ANALYTICS DIR/../AB_Loop/<today>_ab-loop.md (create the dir) with frontmatter (date, type: ab-loop): per running experiment — days running, the metrics read (verbatim from the feed), and the outcome (still running / concluded winner=X / needs Steve). Include the packaging-strategist's return summary if you dispatched it.
+  IF anything concluded OR anything needs Steve:
+    Fire ONE Telegram alert:
+        /Volumes/AI_Workspace/iris_studio/scripts/notify.sh "🧪 A/B-loop:
+    • EXP-N (V0N <dimension>): <concluded winner=B, +X% CTR → routed to packaging | DUE — read Studio Test&Compare and log the winner>
+    ...
+    Report: <report path>"
+  IF every running experiment is simply still within its window: no alert.
+
+PASS 6 — LOG (always, exactly one short line):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md under a section headed EXACTLY:
+      ## 🧪 A/B-loop (weekly Thu 06:20)
+  ONE line: # running experiments, # concluded this run, # needing Steve, + report path (or "no running experiments"). Create the daily note from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub) if missing. Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the loop ran (whether or not there were running experiments or anything concluded).
+- `ROUTINE_INCOMPLETE: <one-line reason>` — you could not read the ledger at all.
+
+Output nothing after that line.

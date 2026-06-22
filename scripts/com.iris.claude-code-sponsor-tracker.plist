@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SPONSOR-TRACKER — installed 2026-06-21.
+
+  Weekly sponsor-pipeline tracker. Runs the `sponsor-tracker` Claude routine:
+  tracks each prospect's status, evaluates whether the outreach SEND GATE has
+  opened, surfaces follow-ups due, and (only when the gate is open and a high-fit
+  prospect has no draft) dispatches sponsor-outreach-drafter to DRAFT — never
+  send. Every external send stays Steve's, performed personally. Fires a Telegram
+  alert only when Steve has an action (gate opened / follow-up due / draft ready);
+  silent on a quiet pre-send week.
+
+  Runs via run_claude_job.sh (shared wrapper: logging, sentinel→alert, retry).
+
+  Schedule: Mon 07:00 ET — start-of-week pipeline review, staggered off the daily
+  competitor-tripwire (06:00) and the other weekly routines.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-sponsor-tracker 2>/dev/null
+    cp scripts/com.iris.claude-code-sponsor-tracker.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-sponsor-tracker.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-sponsor-tracker   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-sponsor-tracker</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh sponsor-tracker /Volumes/AI_Workspace/iris_studio/routines/sponsor-tracker.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/sponsor-tracker.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/sponsor-tracker.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>7</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>
