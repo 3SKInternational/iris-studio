@@ -54,6 +54,75 @@ def _eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
+# Re-exec sentinel: set on the child after we hand off to the venv interpreter, so
+# a still-missing dep there fails loudly instead of looping execve forever.
+_VENV_REEXEC_ENV = "IRIS_VENV_REEXEC"
+_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+
+
+def _ensure_runtime_deps() -> None:
+    """Guarantee the Google API deps are importable, self-correcting if they aren't.
+
+    The google-* packages only live in the iris_studio venv (``REPO_ROOT/.venv``).
+    The launchd jobs run under it (run_iris.sh sources the venv), but a MANUAL CLI
+    invocation with the macOS system python (``python3 scripts/upload_video.py``)
+    has no google-auth and used to crash with ModuleNotFoundError deep inside
+    ``load_credentials`` (it bit a real V4 upload). Every feature script imports
+    this module at top level, so doing the check here once heals all of them.
+
+    Behavior:
+      * deps already importable  -> no-op (the venv / launchd happy path).
+      * deps missing, venv python exists, not yet re-exec'd -> re-exec the SAME
+        argv under the venv interpreter (transparent self-correction).
+      * deps missing and we ARE the re-exec'd child -> the venv is broken; fail
+        loudly with a pip remediation rather than execve-loop.
+      * deps missing and no venv python on disk -> fail loudly naming the path.
+    """
+    try:
+        import google.auth  # noqa: F401  cheap probe for the API dep set.
+        import googleapiclient.discovery  # noqa: F401  catch a partial install too.
+        return
+    except ImportError:
+        pass
+
+    if os.environ.get(_VENV_REEXEC_ENV) == "1":
+        _eprint(
+            f"error: Google API deps still missing after switching to {_VENV_PYTHON}. "
+            f"The venv is incomplete — run: {_VENV_PYTHON} -m pip install -r "
+            f"{REPO_ROOT / 'requirements.txt'}"
+        )
+        raise SystemExit(3)
+
+    if not _VENV_PYTHON.exists():
+        _eprint(
+            f"error: Google API deps (google-auth, google-api-python-client) are not "
+            f"installed for this interpreter ({sys.executable}), and no venv was found "
+            f"at {_VENV_PYTHON}. Run this script with the iris_studio venv python, e.g. "
+            f"{REPO_ROOT / '.venv/bin/python'} {' '.join(sys.argv) or 'scripts/...'}"
+        )
+        raise SystemExit(3)
+
+    # Hand off: replace this process with the venv interpreter running the same
+    # argv. argv[0] is the entry script (e.g. scripts/upload_video.py) because
+    # this module is imported by it, so the re-exec re-runs the user's command.
+    try:
+        os.execve(
+            str(_VENV_PYTHON),
+            [str(_VENV_PYTHON), *sys.argv],
+            {**os.environ, _VENV_REEXEC_ENV: "1"},
+        )
+    except OSError as exc:  # dangling symlink, wrong-arch python, not executable…
+        _eprint(
+            f"error: could not launch the venv interpreter {_VENV_PYTHON} ({exc}). "
+            f"The venv looks corrupt — recreate it, then run: {_VENV_PYTHON} -m pip "
+            f"install -r {REPO_ROOT / 'requirements.txt'}"
+        )
+        raise SystemExit(3)
+
+
+_ensure_runtime_deps()
+
+
 def _save_token(creds, token_path: Path) -> None:
     """Persist the token JSON owner-only (0600), same contract as the authorizer.
 
