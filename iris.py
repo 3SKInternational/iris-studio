@@ -4135,6 +4135,26 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
             "Iris timed out waiting for a response. Try again, or send a "
             "shorter / simpler message."
         )
+    except Exception as exc:
+        # The Agent SDK forwards the turn's ResultMessage, THEN — when the CLI
+        # marks that result is_error=True and exits non-zero — raises during
+        # iteration (e.g. "Claude Code returned an error result: success", where
+        # subtype is 'success' so the turn actually completed). All AssistantMessage
+        # text was already collected into `parts` before the raise, so a completed
+        # generation gets discarded by the propagating exception. Salvage it: when
+        # we saw a terminal result message (result_was_error) AND produced text,
+        # return the text instead of crashing the briefing/chat turn. A raise with
+        # no result message (genuine mid-stream transport failure) still propagates.
+        collected = "".join(parts).strip()
+        if result_was_error and collected:
+            logger.warning(
+                f"Cloud query raised after a completed turn ({len(collected)} chars "
+                f"produced); returning collected text. Suppressed: {exc}; "
+                f"result={result_summary}"
+            )
+            return collected
+        logger.error(f"Cloud query failed before producing output: {type(exc).__name__}: {exc}")
+        raise
 
     if result_was_error:
         logger.warning(f"Cloud result indicated error: {result_summary}")
