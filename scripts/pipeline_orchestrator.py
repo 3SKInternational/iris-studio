@@ -1673,6 +1673,60 @@ def cmd_status(sf: StateFile) -> int:
     return 0
 
 
+# Deterministic pre-spend guard (added 2026-06-21). The recurring, $-wasting
+# failure mode is a `use_references: false` card whose billed prompt OMITS the
+# verbatim no-people suppressor, so gpt-image-2 hallucinates a generic off-model
+# figure onto a data card (14 V3 cards re-spent 2026-06-19; the soft phrasing
+# slipped past again on V4's first manifest). On_Model_Verification_Protocol §2
+# mandates this exact string. The LLM PROMPTS gate catches it, but is
+# LLM-dependent; this check makes the failure impossible to BILL — it is
+# deterministic, runs FIRST in the non-force spend path, and fails CLOSED. The
+# fix is always a single global manifest edit.
+NO_PEOPLE_SUPPRESSOR = ("ABSOLUTELY NO PEOPLE, NO CHARACTERS, NO FIGURES, "
+                        "NO CHIBI, NO CARTOON HUMANS OF ANY KIND.")
+
+
+def manifest_suppressor_offenders(manifest_abs: Path) -> list[str]:
+    """Names of every `use_references: false` image whose billed prompt is MISSING
+    the verbatim no-people suppressor. Empty list == clean. Raises on
+    unreadable/malformed JSON so the caller decides (we treat read errors as
+    fail-open, mirroring the other best-effort pre-spend guards). A Three shot
+    (use_references defaults True) legitimately depicts a figure and is skipped.
+
+    Shape-defensive: a well-formed-JSON-but-wrong-shape manifest (top-level not a
+    dict, or non-dict img entries) yields an empty/partial offender list rather
+    than an AttributeError, so the caller's documented fail-open path triggers
+    instead of crashing the spend command. The exact-substring match is
+    intentional and case-sensitive — it mirrors the verbatim canon string in
+    On_Model_Verification_Protocol §2; do NOT loosen it to a fuzzy match."""
+    data = json.loads(manifest_abs.read_text())
+    images = data.get("images", []) if isinstance(data, dict) else []
+    # The .get default only covers an ABSENT key; a present-but-non-iterable
+    # value ("images": null / int / bool) would still blow up the `for` below.
+    if not isinstance(images, list):
+        images = []
+    offenders: list[str] = []
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        if img.get("use_references", True):
+            continue
+        # A non-string prompt (scalar/None/list) can't contain the verbatim
+        # suppressor and would make `<str> not in <scalar>` raise TypeError, so
+        # coerce to "" — that correctly flags the card as an offender (fail
+        # CLOSED on a malformed real card) rather than crashing the spend path.
+        prompt = img.get("prompt")
+        if not isinstance(prompt, str):
+            prompt = ""
+        if NO_PEOPLE_SUPPRESSOR not in prompt:
+            # Coerce a non-string/empty name to "<unnamed>" — a truthy non-string
+            # name (e.g. 0-typo'd to an int) would slip past `or` and put a
+            # non-str in offenders, crashing the call-site `", ".join(...)`.
+            name = img.get("name")
+            offenders.append(name if isinstance(name, str) and name else "<unnamed>")
+    return offenders
+
+
 def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     """Decision 4 (C1): the ONLY billed-spend path. Confirms stage 5 is ready,
     confirms the scene manifest exists, runs the pre-spend image-review gate,
@@ -1735,7 +1789,45 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     # this spend — don't block the billed path on review tooling failing to run).
     if force:
         print(f"⏭️  Video {video}: --force — skipping pre-spend image-review gate.")
+        # The deterministic suppressor guard is cheap ($0) and catches the exact
+        # V3 re-spend bug. Even under --force we still RUN it — but downgrade from
+        # a block to a loud warning, so a Steve override never silently bills an
+        # off-model batch he forgot to clean. The LLM gate is the thing --force
+        # skips; this guard just shouts.
+        try:
+            offenders = manifest_suppressor_offenders(manifest_abs)
+        except (json.JSONDecodeError, OSError):
+            offenders = []
+        if offenders:
+            preview = ", ".join(offenders[:8]) + (" …" if len(offenders) > 8 else "")
+            line = (f"⚠️ Video {video}: --force spend with {len(offenders)} no-character "
+                    f"card(s) MISSING the verbatim no-people suppressor ({preview}). "
+                    f"Proceeding because you overrode, but these will likely hallucinate "
+                    f"off-model figures (the V3 re-spend bug). Drop --force to block.")
+            print(line)
+            notify(line)
     else:
+        # Deterministic suppressor guard — runs BEFORE the LLM gate, fails CLOSED.
+        # Cheap, no model call, catches the exact V3 re-spend bug instantly. A
+        # read/parse error fails OPEN (the LLM gate + downstream schema checks
+        # still run); only a genuinely-missing suppressor blocks.
+        try:
+            offenders = manifest_suppressor_offenders(manifest_abs)
+        except (json.JSONDecodeError, OSError):
+            offenders = []
+        if offenders:
+            preview = ", ".join(offenders[:8]) + (" …" if len(offenders) > 8 else "")
+            s["note"] = (f"spend refused: {len(offenders)} no-character card(s) missing the "
+                         f"verbatim no-people suppressor ({preview})")
+            sf.save()
+            line = (f"🛑 Video {video}: {len(offenders)} no-character card(s) in {manifest_rel} "
+                    f"are MISSING the verbatim no-people suppressor — refusing to spend "
+                    f"(deterministic guard; this is the V3 re-spend bug). Offenders: {preview}. "
+                    f"Fix: every use_references:false prompt must contain "
+                    f"\"{NO_PEOPLE_SUPPRESSOR}\" — then re-run spend-ok.")
+            print(line)
+            notify(line)
+            return 2
         verdict, vrel, detail = run_prompt_review_loop(video, manifest_rel)
         # BINARY allow-list (Steve, 2026-06-20): spend ONLY on a clean SHIP — a
         # 100% sign-off. UNAVAILABLE is the single fail-OPEN exception (a human
