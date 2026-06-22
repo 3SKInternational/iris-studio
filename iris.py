@@ -526,13 +526,83 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 600,  # 10 min — Sonnet, reads bridge+git+digests, drafts 1-3 posts
         "deliverable_dir": "BRANDS/Building_Iris/Build_Log/_drafts",
     },
+    # --- Added 2026-06-21: the "everything to streamline" agent pass (6 new) ---
+    # All six built in one session, each cleared a skeptical-code-reviewer binary
+    # gate before this registration. Each deliverable_dir is DEDICATED + non-nested
+    # / non-shared (the packaging-strategist / asset-librarian collision doctrine):
+    # _find_deliverable rglobs the agent's dir, so a shared/parent dir would let a
+    # concurrent dispatch's newer file be mis-returned as this agent's deliverable.
+    #
+    # shorts-cutter: mines a PUBLISHED flagship's script + already-generated PNGs
+    # into 3-4 vertical Short packs, reusing owned assets (≈zero new image spend).
+    # Reach multiplier off sunk assets. Weekly cron.
+    "shorts-cutter": {
+        "timeout_seconds": 900,  # 15 min — Sonnet, reads script + asset_index, drafts 3-4 packs
+        "deliverable_dir": "BRANDS/3SK_Finance/Shorts",
+    },
+    # community-manager: triages INCOMING viewer comments (manual paste/export until
+    # a YouTube comment API lands — same posture as channel-analyst), drafts replies
+    # in Brand Bible voice, rolls recurring questions up to topic-scout, escalates
+    # compliance/abuse. DRAFT-ONLY. Interactive/enum (needs a comment source in the
+    # prompt) — no blind cron until a comment pull exists.
+    "community-manager": {
+        "timeout_seconds": 600,  # 10 min — Sonnet, triage + draft replies, no web
+        "deliverable_dir": "BRANDS/3SK_Finance/Community",
+    },
+    # figures-watcher: web-verifies current IRS/SSA/DOL figures from PRIMARY sources,
+    # then greps the vault for stale cited numbers (the $7,000→$7,500 fire-drill,
+    # automated). Report-only; never edits source docs. Monthly cron. Dir is a
+    # dedicated subdir under Channel_Intelligence (its OWN dispatch resolves there;
+    # same nesting precedent as channel-analyst/Analytics).
+    "figures-watcher": {
+        "timeout_seconds": 1500,  # 25 min — web-verify many figures + vault-wide grep
+        "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence/Figures_Watch",
+    },
+    # topic-scout: maintains the living ranked TOPIC BACKLOG, fusing Channel_Intel +
+    # competitor gaps + community-manager rollups + channel-analyst signal + light
+    # web demand. Weekly cron. deliverable_dir is a SIBLING of Channel_Intelligence
+    # (NOT nested) so youtube-researcher's Channel_Intelligence rglob can't grab it.
+    "topic-scout": {
+        "timeout_seconds": 1200,  # 20 min — multi-source read + web demand-check + merge
+        "deliverable_dir": "BRANDS/3SK_Finance/Topic_Backlog",
+    },
+    # vo-reviewer: read-only TTS QC gate on a script's VO text BEFORE the billed
+    # ElevenLabs render (number/ticker/abbrev/homograph/SSML/pacing/banned-vocab),
+    # binary SHIP/REVISE like script-reviewer/image-reviewer. Pipeline gate, not
+    # cron. Dedicated dir _VO_Review_Prep (NOT script-reviewer's _REVIEW_PREP) to
+    # avoid the newest-in-window mis-attribution between the two reviewers.
+    "vo-reviewer": {
+        "timeout_seconds": 600,  # 10 min — read-only single-pass VO critique, no web
+        "deliverable_dir": "BRANDS/3SK_Finance/Scripts/_VO_Review_Prep",
+    },
+    # newsletter-writer: turns a published video into a Beehiiv newsletter issue
+    # (subject variants + body + single CTA + link-gated FTC disclosure). DRAFT-ONLY,
+    # never sends. Weekly cron (drafts for the newest published video lacking one).
+    # Dedicated dir, distinct from build-logger's Build_Log/_drafts.
+    "newsletter-writer": {
+        "timeout_seconds": 600,  # 10 min — Sonnet, reads script + magnet index, drafts issue
+        "deliverable_dir": "BRANDS/3SK_Finance/Newsletter/_drafts",
+    },
     # The 4 engineering agents (senior-systems-architect, senior-engineer,
     # skeptical-code-reviewer, performance-optimizer) are deliberately NOT in this
-    # enum yet — their target is a codebase (typically /Volumes/AI_Workspace/iris_studio/),
-    # not the vault, and this dispatcher hardcodes cwd=WORKSPACE_DIR. Add them
-    # once a per-agent working_dir override is wired (the dispatch spawn block uses
-    # WORKSPACE_DIR in two places; parameterize via cfg.get("working_dir", ...)).
-    # They remain fully usable via interactive Claude Code's Task tool.
+    # enum yet — their target is a codebase (typically PROJECT_DIR, the iris_studio
+    # repo), not the vault. The per-agent `working_dir` override is now WIRED (the
+    # spawn block resolves cwd + the base --add-dir from cfg["working_dir"], and
+    # _find_deliverable bases its search there too; default = WORKSPACE_DIR, so
+    # every vault agent above is unaffected). To enable one, add an entry like:
+    #     "skeptical-code-reviewer": {
+    #         "timeout_seconds": 900,
+    #         "working_dir": str(PROJECT_DIR),
+    #         "deliverable_dir": "_reviews",   # or omit → stdout-only verdict
+    #     },
+    # SECURITY NOTE before enabling: each is spawned with
+    # --dangerously-skip-permissions, so its tools: frontmatter is the ONLY
+    # capability limit. skeptical-code-reviewer is read-only (Read/Grep/Glob +
+    # Bash for tests/linters) → low blast radius. senior-engineer,
+    # senior-systems-architect, performance-optimizer carry Edit/Write/Bash → an
+    # unattended Telegram /agent dispatch could mutate + run code in the repo.
+    # Enabling those 3 is a conscious trust decision (Steve), not just wiring.
+    # All 4 remain fully usable via interactive Claude Code's Task tool today.
 }
 # Agent names the MODEL is allowed to dispatch (the dispatch_subagent enum).
 DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
@@ -2596,11 +2666,16 @@ def _find_deliverable(agent_name: str, started_epoch: float,
     agent's deliverable. When other dispatches are active the caller passes
     allow_vault_wide=False so we only trust the agent's own dir."""
     cfg = DISPATCH_AGENTS.get(agent_name, {})
+    # Resolve deliverable_dir (and the wide fallback) against the agent's own
+    # working_dir, so a code-facing agent's outputs are found in its repo rather
+    # than the vault. Defaults to WORKSPACE_DIR → identical to prior behavior for
+    # every vault agent. Matches the spawn block's _work_dir resolution.
+    _base = Path(cfg.get("working_dir", WORKSPACE_DIR))
     search_dirs = []
     if cfg.get("deliverable_dir"):
-        search_dirs.append(WORKSPACE_DIR / cfg["deliverable_dir"])
+        search_dirs.append(_base / cfg["deliverable_dir"])
     if allow_vault_wide:
-        search_dirs.append(WORKSPACE_DIR)
+        search_dirs.append(_base)
     for base in search_dirs:
         if not base.exists():
             continue
@@ -2918,15 +2993,21 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes,
 
             _cfg = DISPATCH_AGENTS[agent_name]
             timeout = _cfg["timeout_seconds"]
+            # Per-agent working dir: the cwd the subagent runs in + its primary
+            # --add-dir grant. Defaults to WORKSPACE_DIR (the vault) so every
+            # existing agent behaves identically; a code-facing agent can set
+            # `working_dir` (e.g. str(PROJECT_DIR), the iris_studio repo) to run
+            # against a codebase instead. See the enable note in DISPATCH_AGENTS.
+            _work_dir = Path(_cfg.get("working_dir", WORKSPACE_DIR))
             # Per-agent extra working dirs (e.g. decision-feeder needs read of the
             # second-brain vault, which lives outside WORKSPACE_DIR). Each extra dir
             # adds another `--add-dir`. Default [] = identical to prior behavior.
-            _add_dir_args: list[str] = ["--add-dir", str(WORKSPACE_DIR)]
+            _add_dir_args: list[str] = ["--add-dir", str(_work_dir)]
             for _extra in _cfg.get("extra_add_dirs", []):
                 _add_dir_args += ["--add-dir", str(_extra)]
             logger.info(
                 f"Dispatch {d_id}: spawning {agent_name} via {CLAUDE_CLI_PATH} "
-                f"(timeout {timeout}s, add-dirs={_add_dir_args[1::2]})"
+                f"(timeout {timeout}s, cwd={_work_dir}, add-dirs={_add_dir_args[1::2]})"
             )
             proc = await asyncio.create_subprocess_exec(
                 CLAUDE_CLI_PATH,
@@ -2935,7 +3016,7 @@ async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes,
                 *_add_dir_args,
                 "--dangerously-skip-permissions",
                 "--", prompt,
-                cwd=str(WORKSPACE_DIR),
+                cwd=str(_work_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

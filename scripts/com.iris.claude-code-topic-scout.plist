@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TOPIC SCOUT — installed 2026-06-21.
+
+  Weekly autonomous fire of the `topic-scout` agent (via the topic-scout Claude
+  routine): fuses Channel_Intelligence + competitor gaps + community-manager
+  comment rollups + channel-analyst signal + light web demand-checking into a
+  living, ranked TOPIC BACKLOG (Demand + 2×Moat + Gap + Monetizability). Merges
+  into the existing backlog; retires shipped/dead topics. Ranks only — the go
+  decision on what to script is downstream.
+
+  Runs via run_claude_job.sh (it's a `claude --print` routine) so the same wrapper
+  handles logging, the ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and
+  the retry queue.
+
+  Schedule: Wednesday 2:45 AM ET — between the Mon and Thu youtube-research pulls
+  (so it re-ranks against fresh Monday intel) and ahead of the Thu–Sun production
+  push. 02:45 (not 02:30) clears the DAILY book-update job at 02:30, youtube-research
+  at 02:00, and the nightly at 03:00 — no concurrent `claude --print` fd-race.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-topic-scout 2>/dev/null
+    cp scripts/com.iris.claude-code-topic-scout.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-topic-scout.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-topic-scout   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-topic-scout</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh topic-scout /Volumes/AI_Workspace/iris_studio/routines/topic-scout.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/topic-scout.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/topic-scout.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>45</integer>
+			<key>Weekday</key>
+			<integer>3</integer>
+		</dict>
+	</array>
+</dict>
+</plist>

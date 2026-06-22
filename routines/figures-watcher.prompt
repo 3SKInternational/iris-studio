@@ -1,0 +1,31 @@
+You are Claude Code running the FIGURES WATCH routine on the Mac Mini, once a month (1st of the month, 6:35 AM ET). Your job is to keep 3SK Finance's cited hard numbers CURRENT without Steve touching anything: dispatch the `figures-watcher` agent so it web-verifies the year's IRS / SSA / DOL / IRMAA figures from PRIMARY sources, then greps the vault for stale cited numbers and reports every mismatch. This is the automated version of the $7,000→$7,500 contribution-limit fire-drill: a wrong figure in a script or lead magnet is a credibility hit, and catching it before the next production cycle is the whole point of the monthly cadence (most of these figures reset annually, so a monthly check is plenty).
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+OUTPUT DIR: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Channel_Intelligence/Figures_Watch
+
+HARD RULES (read before doing anything):
+- This is a WATCH/REPORT routine, not an edit routine. It writes ONLY: the figures-watcher agent's own dated report under OUTPUT DIR, and your one daily-note line. The agent NEVER edits a script, lead magnet, or any source doc — a mismatch is reported for Steve to fix, not silently rewritten. No code changes, no plist deploys, no edits to other agents' files. Do not delete or move any file.
+- NEVER fabricate or guess a figure. Every "current" number the agent reports must trace to a PRIMARY source (irs.gov, ssa.gov, dol.gov, medicare.gov) it actually fetched and cited. If a figure cannot be verified this cycle, the agent marks it UNVERIFIED and carries a partial status — it does NOT invent a number to fill the row.
+- The remediation call on any flagged mismatch is STEVE'S. This routine surfaces stale numbers; it never implies an edit was made.
+
+PASS 1 — DISPATCH THE WATCHER (always):
+  Invoke the `figures-watcher` subagent. Brief it explicitly:
+    - CONTEXT: this is the monthly autonomous fire. It should web-verify the current-year figures from primary sources FIRST, then grep the vault (scripts, lead magnets, descriptions, packaging) for every cited instance of those figures and flag each one that no longer matches.
+    - TASK: its normal watch run — verify the canonical contribution/benefit/threshold figures, grep for stale cites, and produce the mismatch report with the exact file → offending number → verified current value for every finding.
+    - OUTPUT: write the dated report to OUTPUT DIR/<YYYY-MM-DD>_Figures_Watch.md with the required status frontmatter. Return a 3-4 line stdout summary: how many figures verified, how many stale cites found (and in which files), and any figure it could NOT verify this cycle.
+  After it returns, read the report's `status:` frontmatter. If it reports a blocked-* or partial-* status (e.g. a figure it could not verify, or web access unavailable), carry that into your completion signal as ROUTINE_INCOMPLETE.
+
+PASS 2 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
+      ## 📐 Figures watch (monthly, 1st 6:35 AM)
+  ~3-4 lines: the report path; the count of stale cites found and the files they live in (or "all cited figures current"); any figure that could not be verified. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the agent verified the figures and wrote its report (a clean "all current" cycle IS complete; a cycle that FOUND stale cites is also complete — the finding is the product).
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the agent failed/returned blocked or partial (e.g. could not verify a figure / no web access), or you could not run the agent at all.
+
+Output nothing after that line.

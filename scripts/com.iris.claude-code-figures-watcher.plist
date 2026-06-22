@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  FIGURES WATCH — installed 2026-06-21.
+
+  Monthly autonomous fire of the `figures-watcher` agent (via the figures-watcher
+  Claude routine): web-verifies the current-year IRS/SSA/DOL/IRMAA figures from
+  PRIMARY sources, then greps the vault for stale cited numbers and reports every
+  mismatch (file → offending number → verified current value). Report-only; the
+  agent NEVER edits a source doc. This is the automated $7,000→$7,500 fire-drill.
+
+  Runs via run_claude_job.sh (it's a `claude --print` routine) so the same wrapper
+  handles logging, the ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and
+  the retry queue.
+
+  Schedule: 1st of the month, 6:35 AM ET — after pre-brief (05:00), clear of the
+  other 1st-of-month jobs (venture-scout 03:45, credential-check 04:15,
+  contradiction-detector 04:45) AND of the DAILY competitor-tripwire at 06:00 and
+  the 06:20 affiliate-check/ab-loop slots (06:35 dodges all, on any weekday the 1st
+  lands on). Most of these figures reset annually, so monthly is plenty.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-figures-watcher 2>/dev/null
+    cp scripts/com.iris.claude-code-figures-watcher.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-figures-watcher.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-figures-watcher   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-figures-watcher</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh figures-watcher /Volumes/AI_Workspace/iris_studio/routines/figures-watcher.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/figures-watcher.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/figures-watcher.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Day</key>
+			<integer>1</integer>
+			<key>Hour</key>
+			<integer>6</integer>
+			<key>Minute</key>
+			<integer>35</integer>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,32 @@
+You are Claude Code running the TOPIC SCOUT routine on the Mac Mini, once a week (Wednesday, 2:45 AM ET). Your job is to keep the 3SK Finance video TOPIC BACKLOG fresh and ranked without Steve touching anything: dispatch the `topic-scout` agent so it fuses the channel's own intel signals into a living, prioritized list of the next videos worth making. This runs mid-week — after Monday's youtube-research pull and before the Thu–Sun production push — so when the scriptwriter pulls the next topic, it's the highest-leverage one available right now, not whatever was top-of-mind.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+OUTPUT DIR: /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Topic_Backlog
+
+HARD RULES (read before doing anything):
+- This is a BACKLOG-MAINTENANCE routine. It writes ONLY: the topic-scout agent's own backlog file under OUTPUT DIR, and your one daily-note line. No code changes, no plist deploys, no edits to other agents' files, no script writing. Do not delete or move any file.
+- NEVER fabricate demand data or competitor metrics — the agent cites its sources or marks an estimate as `(estimated)`. A topic's score must trace to real signals on disk (Channel_Intelligence, community rollups, channel-analyst output) plus light web demand-checking, not a hunch.
+- The agent MERGES into the existing backlog — it does not blow it away. Already-ranked topics keep their history; new signals re-rank, and shipped/dead topics are retired with a note, not silently dropped.
+- topic-scout RANKS the backlog; the go decision on which topic to script next is downstream. This routine never implies a topic was selected for production.
+
+PASS 1 — DISPATCH THE SCOUT (always):
+  Invoke the `topic-scout` subagent. Brief it explicitly:
+    - CONTEXT: this is the weekly autonomous fire. It should READ its signals first — the existing backlog at OUTPUT DIR/Topic_Backlog.md, the Channel_Intelligence freshness files, any community-manager comment-triage rollups under BRANDS/3SK_Finance/Community/, channel-analyst output, and the Video_Topic_Integrity_Map — so this run RE-RANKS against current evidence and does NOT re-propose a topic already shipped or already in the backlog (reference the existing entry and say what changed instead).
+    - TASK: its normal scout run — refresh the ranked backlog using the Demand + 2×Moat + Gap + Monetizability scoring, fold in new signals, retire shipped/dead topics, and surface the top candidates for the next cycle.
+    - OUTPUT: overwrite/merge the backlog at OUTPUT DIR/Topic_Backlog.md with the required status frontmatter. Return a 3-4 line stdout summary: the current top 3 ranked topics, anything newly promoted this week, and any topic retired.
+  After it returns, read the backlog file's `status:` frontmatter. If it reports a blocked-* or partial-* status, carry that into your completion signal as ROUTINE_INCOMPLETE.
+
+PASS 2 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
+      ## 🧭 Topic scout (weekly, Wed 2:45 AM)
+  ~3-4 lines: the backlog path; the current top 3 ranked topics; anything newly promoted or retired this week. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the agent refreshed and re-ranked the backlog (a thin-signal cycle where the merge still ran IS complete).
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the agent failed/returned blocked or partial, or you could not run the agent at all.
+
+Output nothing after that line.
