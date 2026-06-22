@@ -121,10 +121,13 @@ RUN_TABLE: dict[str, dict] = {
 
 # Human-artifact gates that CAN auto-promote needs-steve→done when a real
 # artifact lands on disk (non-empty AND fresher than deps). Only gates with a
-# fixed, unambiguous on-disk artifact convention are listed. Gates NOT here
-# (3 vo_expand, 10 publish) have no fixed local artifact path, so they NEVER
-# auto-promote — Steve clears them by hand-editing status:done (the
-# always-available manual exit). The orchestrator never guesses.
+# fixed, unambiguous on-disk artifact convention are listed. 10 publish has no
+# fixed local artifact path, so it NEVER auto-promotes — Steve clears it by
+# hand-editing status:done (the always-available manual exit). The orchestrator
+# never guesses. NOTE on 3 vo_expand: it is NOT in this plain-artifact table — it
+# has its OWN reviewed auto-promote (promote_gate_exits → _maybe_promote_vo_expand),
+# advancing only when the billed VO kit clears the vo-reviewer SHIP gate, while the
+# ElevenLabs render stays manual (Cowork). Hand-editing status:done stays available.
 # NOTE on 8 thumbnail: for videos initialised AFTER 2026-06-20 it is an
 # orchestrator-run $0 script-stage (the thumbnail ART renders inside the stage-5
 # billed batch, then card_overlay.py burns the title text), so it advances via
@@ -410,12 +413,17 @@ def _artifact_nonempty_and_fresh(spec: dict, video: int, threshold: float | None
     return True, ""
 
 
-def promote_gate_exits(stages: dict, video: int) -> list[str]:
+def promote_gate_exits(stages: dict, video: int) -> tuple[list[str], bool]:
     """Decision 2 step 3: re-evaluate needs-steve exits for gate-parked stages.
     Human-artifact gates auto-promote ONLY when the artifact is non-empty AND
     fresher than deps. failed-parked stages are skipped entirely. The billed
-    gate (5) is promoted only by --spend-ok, never here."""
-    promoted = []
+    gate (5) is promoted only by --spend-ok, never here. 3_vo_expand is a special
+    REVIEWED auto-promote: it advances only when the billed VO kit clears the
+    vo-reviewer gate (SHIP) — see _maybe_promote_vo_expand — while the render stays
+    manual. Returns (promoted_keys, changed): `changed` is True when a non-promoting
+    mutation (the vo-review verdict cache) must still be persisted by the caller."""
+    promoted: list[str] = []
+    changed = False
     for key in STAGE_ORDER:
         s = stages.get(key)
         if not s or s.get("status") != "needs-steve":
@@ -423,6 +431,13 @@ def promote_gate_exits(stages: dict, video: int) -> list[str]:
         if s.get("park_reason") != "gate":  # N2: failed-parked never auto-promotes
             continue
         if key == "5_images":  # billed gate: spend-ok only
+            continue
+        if key == "3_vo_expand":  # reviewed auto-promote: vo-reviewer gates the kit
+            outcome = _maybe_promote_vo_expand(s, video, deps_max_completed(key, stages))
+            if outcome == "promoted":
+                promoted.append(key)
+            elif outcome == "changed":
+                changed = True
             continue
         spec = GATE_ARTIFACTS.get(key)
         if not spec:  # no fixed artifact convention → manual hand-edit only
@@ -439,7 +454,7 @@ def promote_gate_exits(stages: dict, video: int) -> list[str]:
             promoted.append(key)
         else:
             s["note"] = f"still needs Steve: {reason}"
-    return promoted
+    return promoted, changed
 
 
 def reconcile_orphans(stages: dict, video: int) -> list[str]:
@@ -772,6 +787,18 @@ PROMPT_FIXER_AGENT = "scene-image-prompt-generator"
 # it is re-reviewed — a closed loop, $0, mirroring the image PROMPTS gate.
 SCRIPT_REVIEWER_AGENT = "script-reviewer"
 SCRIPT_FIXER_AGENT = "scriptwriter"
+# Stage-3 VO gate (BINARY, same policy): vo-reviewer audits the billed VO kit for
+# TTS hazards (tickers read as words, $7,500, 401(k), homographs, …) BEFORE the
+# ElevenLabs render. The render itself STAYS MANUAL (Cowork) — billed, weekly, and
+# better with a human who can react to ElevenLabs account warnings and actually
+# HEAR a bad clip — so this gate does NOT own the spend. It is wired as a REVIEWED
+# AUTO-PROMOTE on the existing manual 3_vo_expand gate (see promote_gate_exits),
+# not as an --advance stage: it certifies the kit TTS-clean and emits the SHIP
+# go-signal, a REVISE keeps the stage parked with the fix list, and the human
+# renders only on SHIP. vo-reviewer is read-only ($0) so re-review is free, but the
+# kit mtime is cached so it is dispatched at most once per kit revision.
+VO_REVIEWER_AGENT = "vo-reviewer"
+VO_REVIEW_TIMEOUT = 600
 IMAGE_REVIEW_TIMEOUT = 900
 # Closed review→fix→re-review loop budget at the PROMPTS gate. Fixing prompts is
 # free, so we iterate, but bounded: after this many fix dispatches still HOLD-
@@ -1067,6 +1094,158 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
                    f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})")
 
 
+# === Stage-3 VO-kit review (vo-reviewer) — reviewed auto-promote, render manual ===
+def vo_kit_rel(video: int) -> str:
+    """The billed VO kit — the EXACT markdown generate_vo.py parses into scene mp3s
+    (`## Scene N -> \`Video_NN_VO_Scene_MM.mp3\``). This is the truest text to gate,
+    so vo-reviewer reviews THIS, not the script or the expanded prose draft."""
+    return f"{VAULT_REL}/Voice_Files/Video_{nn(video)}/_VO_Session_B_Kit.md"
+
+
+def _vo_review_verdict_rel(video: int) -> str:
+    # vo-reviewer's OWN dir, deliberately separate from script-reviewer's _REVIEW_PREP.
+    return f"{VAULT_REL}/Scripts/_VO_Review_Prep/Video_{nn(video)}_VO_Review.md"
+
+
+def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
+    """Dispatch vo-reviewer on the billed VO kit and read back its BINARY verdict.
+    Returns (verdict, vrel, detail): SHIP (clean → safe to render), REVISE (block),
+    or the sentinel UNAVAILABLE (could not run / no parseable VERDICT). Reuses the
+    shared _parse_image_verdict, which also ranks the retired SHIP WITH FIXES token
+    as blocking so a drifting reviewer can't sneak it past. $0 — read-only review."""
+    verdict_rel = _vo_review_verdict_rel(video)
+    agent_file = AGENTS_DIR / f"{VO_REVIEWER_AGENT}.md"
+    if not agent_file.exists():
+        return "UNAVAILABLE", verdict_rel, f"agent definition not found at {agent_file}"
+    v = f"Video_{nn(video)}"
+    prompt = (
+        f"Run vo-reviewer for {v} (3SK Finance). video_number: {video}. "
+        f"script: {kit_rel} — review THIS exact VO kit (the billed ElevenLabs text "
+        f"generate_vo.py renders), not the script or expanded draft. WRITE your verdict "
+        f"to {verdict_rel} including a one-line 'VERDICT:' line. The verdict is BINARY: "
+        f"SHIP (every dimension passes, zero fixes) or REVISE (anything less — list every "
+        f"offending substring → TTS-safe rewrite under REVISE). There is no 'ship with "
+        f"fixes': if it is not all good to go, none of it goes to the billed render."
+    )
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", VO_REVIEWER_AGENT,
+           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+           "--", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=VO_REVIEW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "UNAVAILABLE", verdict_rel, f"timed out after {VO_REVIEW_TIMEOUT}s"
+    except OSError as e:
+        return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
+    if proc.returncode != 0:
+        return "UNAVAILABLE", verdict_rel, \
+            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+    verdict_abs = vault_abs(verdict_rel)
+    text = ""
+    if verdict_abs and verdict_abs.exists():
+        text = verdict_abs.read_text(encoding="utf-8", errors="replace")
+    verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
+    if verdict is None:
+        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in file or stdout"
+    return verdict, verdict_rel, f"VO kit verdict {verdict}"
+
+
+def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None) -> str:
+    """Reviewed auto-promote for the manual 3_vo_expand gate. Promote to done ONLY
+    when the billed VO kit exists, is fresh vs deps, AND vo-reviewer returns a clean
+    SHIP on it; a REVISE keeps it parked with the fix-list path. The kit mtime is
+    cached in s['vo_review'] so vo-reviewer is dispatched at most ONCE per kit
+    revision (a parked REVISE does NOT re-dispatch or re-notify every hourly sweep —
+    only a fresh kit edit, which bumps the mtime, triggers a re-review). The render
+    itself stays MANUAL (Cowork) — a SHIP is the go-signal, never an auto-spend.
+    UNAVAILABLE does NOT fail open here (unlike the free script path): a money-
+    adjacent gate must not green-light an unreviewed kit because the reviewer was
+    down — it parks for the human, and the render is manual anyway.
+
+    Returns one of:
+      'promoted' — stage flipped to done (caller counts it; triggers a save)
+      'changed'  — state mutated and must be persisted (cache write / note change)
+      'parked'   — no persistable change this sweep
+    """
+    kit_rel = vo_kit_rel(video)
+    kit_abs = vault_abs(kit_rel)
+    if kit_abs is None or not kit_abs.exists() or kit_abs.stat().st_size <= 0:
+        note = "still needs Steve/Cowork: VO kit not produced yet (_VO_Session_B_Kit.md)"
+        changed = s.get("note") != note
+        s["note"] = note
+        return "changed" if changed else "parked"
+    kit_mtime = kit_abs.stat().st_mtime
+    if threshold is not None and not (kit_mtime > threshold):
+        note = "still needs Steve/Cowork: VO kit older than its deps (stale) — re-expand"
+        changed = s.get("note") != note
+        s["note"] = note
+        return "changed" if changed else "parked"
+    cache = s.get("vo_review") or {}
+    detail = ""
+    if cache.get("kit_mtime") == kit_mtime:
+        # A DECIDED verdict (any parseable token — SHIP, REVISE, or the retired
+        # HOLD-SPEND / SHIP WITH FIXES block tokens) is on file for THIS exact kit
+        # revision — reuse it, no re-dispatch. Only the could-not-run sentinel
+        # UNAVAILABLE is deliberately never cached (see below), so a reviewer outage
+        # re-dispatches next sweep and recovers rather than parking the gate forever.
+        verdict, vrel, dispatched = cache.get("verdict"), cache.get("verdict_rel"), False
+    else:
+        verdict, vrel, detail = run_vo_review(video, kit_rel)
+        dispatched = True
+    # NOTE on force=True: the production invocation is the hourly fleet drain
+    # (`--advance-all --quiet-idle`), which sets SUPPRESS_NOTIFY to collapse per-stage
+    # pings into one digest. But a parked VO gate returns 'parked_gate', which is NOT a
+    # NEWS_OUTCOME, so that digest is itself suppressed — meaning a plain notify() here
+    # would be swallowed while the dedup markers below still arm, permanently muting the
+    # alert. These three VO lines are each already deduped to fire at most ONCE per kit
+    # revision (SHIP/REVISE via `dispatched`; UNAVAILABLE via vo_unavail_mtime), so
+    # forcing them through is safe — they cannot spam — and guarantees delivery.
+    if verdict == "SHIP":
+        if dispatched:
+            s["vo_review"] = {"kit_mtime": kit_mtime, "verdict": "SHIP", "verdict_rel": vrel}
+            s.pop("vo_unavail_mtime", None)
+            notify(f"✅ Video {video}: VO kit SHIP (vo-reviewer, {vrel}) — TTS-clean, "
+                   f"safe to render in ElevenLabs.", force=True)
+        s["status"] = "done"
+        s["completed_at"] = now_iso()
+        s["park_reason"] = None
+        s["pid"] = None
+        s["pid_start_token"] = None
+        s["artifact_path"] = kit_rel
+        s["note"] = f"auto-promoted: VO kit reviewed SHIP by vo-reviewer ({vrel})"
+        return "promoted"
+    if verdict != "UNAVAILABLE":
+        # Any parseable BLOCK token — REVISE, and the retired HOLD-SPEND / SHIP WITH
+        # FIXES, which _parse_image_verdict still ranks as blocking. The reviewer DID
+        # run and said "not clean," so cache it (no re-dispatch) and surface the actual
+        # token — never the misleading "could not run" message in the UNAVAILABLE tail.
+        if dispatched:
+            s["vo_review"] = {"kit_mtime": kit_mtime, "verdict": verdict, "verdict_rel": vrel}
+            s.pop("vo_unavail_mtime", None)
+            notify(f"⚠️ Video {video}: VO kit {verdict} (vo-reviewer) — fix the TTS hazards "
+                   f"per {vrel} BEFORE rendering (a billed garbled re-read otherwise).",
+                   force=True)
+        note = f"still needs Steve/Cowork: vo-reviewer {verdict} on the VO kit — fix per {vrel}"
+        changed = dispatched or s.get("note") != note
+        s["note"] = note
+        return "changed" if changed else "parked"
+    # UNAVAILABLE — reviewer down / unparseable. Do NOT cache it (so recovery re-
+    # dispatches next sweep) and do NOT fail open (a money-adjacent manual gate must
+    # never green-light an unreviewed kit). Notify at most ONCE per kit revision while
+    # the reviewer is down, then retry silently so we don't spam Telegram hourly.
+    first_outage = s.get("vo_unavail_mtime") != kit_mtime
+    if first_outage:
+        notify(f"⚠️ Video {video}: vo-reviewer could not review the VO kit ({detail}) "
+               f"— review it by hand before rendering (auto-retries when it recovers).",
+               force=True)
+    s["vo_unavail_mtime"] = kit_mtime
+    note = ("still needs Steve/Cowork: vo-reviewer could not run on the VO kit "
+            "— review it by hand before rendering")
+    changed = first_outage or s.get("note") != note
+    s["note"] = note
+    return "changed" if changed else "parked"
+
+
 # === Generic producer-stage review gate (every-step QC, Steve 2026-06-20) ====
 # The PRODUCE-THEN-REVIEW analogue of the stage-2 script gate, generalised across
 # every producer stage that emits a publishable artifact but previously had NO
@@ -1346,8 +1525,8 @@ def advance_once(sf: StateFile) -> AdvanceResult:
     stages = sf.data["stages"]
     video = sf.data["video"]
     reset = reconcile_orphans(stages, video)   # may die() on a genuinely-live run
-    promoted = promote_gate_exits(stages, video)
-    if reset or promoted:
+    promoted, vo_changed = promote_gate_exits(stages, video)
+    if reset or promoted or vo_changed:
         sf.save()
 
     nxt = select_next(stages)
