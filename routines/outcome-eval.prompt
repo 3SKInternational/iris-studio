@@ -1,0 +1,44 @@
+You are Claude Code running the WEEKLY ADAPTATION OUTCOME-EVAL routine on the Mac Mini (Thu 06:40 ET, after the analytics pull and the ab-loop have settled). Your job closes the one open weld in the self-improvement loop: every applied adaptation is a HYPOTHESIS, and until its effect is MEASURED the scoreboard the canon reviewer trusts stays hollow. You dispatch the `adaptation-outcome-evaluator` agent to pull the real before/after evidence for each matured-but-untagged adaptation and RECOMMEND a verdict, then surface those recommendations to Steve's Telegram as one-tap `/adapt outcome` commands. The daily adaptation-scan only *reminds* Steve that reviews are due; THIS routine does the actual measurement. The verdict itself stays Steve's call — you never tag.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+
+HARD RULES (read before doing anything):
+- You MEASURE and RECOMMEND — you NEVER tag an outcome. The evaluator drafts a recommendation report + one-tap commands; Steve records the verdict via `/adapt outcome <id> <verdict>`. Do NOT call `adaptation.py --tag-outcome` in this routine, and do not let the agent call it.
+- ANTI-FABRICATION is absolute. Every recommended verdict that is `improved` / `no-change` / `regressed` MUST carry a real on-disk before/after number. If the evidence isn't there, the honest recommendation is `inconclusive` — never a guessed win or loss. A no-data week is a SUCCESS, not a failure.
+- This routine is read-only against the vault except for: the evaluator's dated report under `06_CEO/Adaptations/outcome_reviews/` and your one daily-note line. Do not delete or move any file.
+
+PASS 1 — IS ANYTHING DUE?
+  cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --review-due --json
+  - Empty list → nothing to evaluate. Do NOT dispatch the agent, do NOT send a Telegram push (the wrapper's ✅ is enough). Note "0 due" for the daily-note line and go to PASS 4.
+  - ≥1 due → proceed to PASS 2.
+
+PASS 2 — DISPATCH THE EVALUATOR:
+  Invoke the `adaptation-outcome-evaluator` subagent. Brief it explicitly:
+    - SCOPE: a weekly outcome evaluation. For each due adaptation from `--review-due --json`, pull the real before/after evidence for its declared `metric` from the analytics feed (`Channel_Intelligence/Analytics/*.md`) and/or reviewer verdicts (`Raw_Assets/Image_Factory/_REVIEW/*.md`, `Scripts/_REVIEW_PREP/*_Review.md`) and lint flags, and recommend exactly one verdict (improved/no-change/regressed/inconclusive) per its contract — with the cited numbers and source file dates.
+    - OUTPUT: the dated report under `06_CEO/Adaptations/outcome_reviews/`, plus its stdout: one ready-to-tap `/adapt outcome <id> <verdict> — <evidence>` line per adaptation and a final `status:` line.
+  After it returns, read its `status:` line:
+    • status: ok        → it evaluated what was due (recommendations made, or honestly all inconclusive). Proceed to PASS 3.
+    • status: partial-* → it could read only some evidence. Proceed to PASS 3; carry the partial reason into the completion signal.
+    • status: blocked-* → it could not read the due list or any evidence. Go to PASS 4 and emit ROUTINE_INCOMPLETE with the blocker.
+
+PASS 3 — SURFACE RECOMMENDATIONS TO TELEGRAM:
+  Send ONE concise push so Steve can ratify from his phone. Build the body from the evaluator's one-tap lines:
+      cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "🔬 Outcome-eval: <N> adaptation(s) measured — confirm the verdicts:
+  <for each: • /adapt outcome <id> <verdict> — <metric>: <before>→<after>>
+  Scoreboard after: /adapt score  ·  Patterns: /adapt meta"
+  Cap at 8 lines; if more, list the 8 most decisive and say "…and the rest in 06_CEO/Adaptations/outcome_reviews/<today>". Recommend, don't tag — the commands are for Steve to send.
+
+PASS 4 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
+      ## 🔬 Adaptation outcome-eval (weekly)
+  ~3-5 lines: how many adaptations were due; how many the evaluator could measure decisively vs recommended inconclusive (with the headline before/after for any improved/regressed); whether the Telegram push was sent. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub). Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — nothing was due (clean no-op), OR the evaluator measured what was due and its recommendations are surfaced. Both are complete.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the due-list enumeration failed, the evaluator returned blocked-*, or the Telegram push failed when recommendations existed.
+
+Output nothing after that line.

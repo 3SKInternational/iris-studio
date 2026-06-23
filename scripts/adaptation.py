@@ -104,6 +104,35 @@ EVAL_HORIZON_DAYS = 14
 # unmeasured change. Only improved/no-change/regressed feed the hit-rate.
 OUTCOME_VALUES = ("improved", "no-change", "regressed", "inconclusive")
 
+# --- Evidence floor (sample-size gate: observational → experimental) ----------
+# A signal seen on a handful of views is noise, not a law. A permanent canon/agent
+# edit drafted off a thin sample overfits — the right home for a thin signal is the
+# A/B ledger (test it), not the prompt that steers EVERY future video. The proposer
+# is instructed to route thin signals to experiments; this core is the backstop: it
+# parses the sample size the proposer recorded and flags a thin-evidence edit so
+# Steve (and the daemon) see it BEFORE applying. SOFT gate by design — an explicit
+# `/adapt approve` still wins (Steve is sovereign) — but he approves with eyes open,
+# and the apply log records that a thin-evidence edit went in. A high-confidence
+# severe single miss (an off-model hero shot, a banned-vocab leak) is exempt: n=1 is
+# enough when the defect is categorical, not statistical.
+MIN_EVIDENCE_N = 1000   # views/impressions/sample behind a signal to call it non-thin
+# Recognized `evidence_basis:` tokens that EXEMPT a proposal from the thin flag even
+# at small n — the miss is categorical (one occurrence proves the rule), not a trend.
+EVIDENCE_EXEMPT_TOKENS = ("severe-single-miss", "categorical", "compliance", "primary-source")
+
+# --- Risk-tiered auto-apply (capability; INERT by default) --------------------
+# Most proposals shape voice/strategy and MUST stay human-gated via /adapt. A narrow
+# class is mechanical + independently machine-verified (e.g. a stale IRS figure
+# confirmed against a primary source by figures-watcher). Such a proposal may carry
+# `tier: auto` + a `verified_by:` token naming the trusted verifier. apply_auto_pending()
+# applies ONLY those, ONLY when explicitly enabled, capped per run, reusing the full
+# apply_proposal safety path. It is OFF unless ADAPT_AUTO_APPLY=1 AND the proposal's
+# verified_by is in the trusted set below — nothing auto-applies until a producer
+# emits the token AND Steve flips the switch. This is the scaffolding for safe
+# autonomy, deliberately gated shut, not a live behavior change.
+AUTO_APPLY_VERIFIERS = frozenset({"figures-watcher"})
+AUTO_APPLY_MAX_PER_RUN = 3
+
 
 class AdaptError(Exception):
     """Any refusal/validation failure. Carries a one-line, user-facing reason."""
@@ -124,6 +153,51 @@ class Proposal:
     @property
     def summary(self) -> str:
         return self.meta.get("summary", "(no summary)")
+
+    @property
+    def tier(self) -> str:
+        """Apply tier: 'gated' (default — needs /adapt) or 'auto' (eligible for the
+        inert-by-default auto-apply path; see apply_auto_pending)."""
+        return (self.meta.get("tier") or "gated").strip().lower()
+
+    @property
+    def evidence_basis(self) -> str:
+        return self.meta.get("evidence_basis", "")
+
+    @property
+    def verified_by(self) -> str:
+        """The trusted verifier that machine-confirmed this edit (auto-apply gate)."""
+        return (self.meta.get("verified_by") or "").strip().lower()
+
+    @property
+    def evidence_n(self) -> int | None:
+        """The sample size behind the signal (views/impressions/occurrences), or None
+        if the proposer didn't record one. Parsed leniently from `evidence_n:` so
+        '1,200', '~1200 impressions', or '4 views' all read as an int."""
+        raw = self.meta.get("evidence_n")
+        if raw is None or str(raw).strip() == "":
+            return None
+        m = re.search(r"\d[\d,]*", str(raw))
+        if not m:
+            return None
+        try:
+            return int(m.group(0).replace(",", ""))
+        except ValueError:
+            return None
+
+    @property
+    def thin_evidence(self) -> bool:
+        """True when the recorded sample is below MIN_EVIDENCE_N and the miss is NOT
+        flagged categorical/compliance via evidence_basis. Unknown sample (None) is
+        NOT flagged here — that's surfaced separately as 'evidence_n missing' so a
+        proposer omission can't masquerade as a clean signal."""
+        n = self.evidence_n
+        if n is None or n >= MIN_EVIDENCE_N:
+            return False
+        basis = self.evidence_basis.lower()
+        if any(tok in basis for tok in EVIDENCE_EXEMPT_TOKENS):
+            return False
+        return True
 
 
 # --- Parsing -----------------------------------------------------------------
@@ -248,10 +322,18 @@ def list_proposals() -> list[Proposal]:
 
 def show_proposal(pid: str) -> str:
     prop = _load_proposal_file(_queue_path(pid))
+    if prop.thin_evidence:
+        ev = f"{prop.evidence_n} ⚠ thin (< {MIN_EVIDENCE_N} — A/B-test before baking in)"
+    elif prop.evidence_n is None:
+        ev = "not recorded ⚠"
+    else:
+        ev = str(prop.evidence_n)
     lines = [
         f"Proposal {prop.pid}",
         f"  target:     {prop.target}",
         f"  confidence: {prop.meta.get('confidence', '?')}",
+        f"  evidence_n: {ev}",
+        f"  tier:       {prop.tier}",
         f"  signal:     {prop.meta.get('signal_source', '?')}",
         f"  summary:    {prop.summary}",
         "",
@@ -357,6 +439,16 @@ def apply_proposal(pid: str) -> dict:
             f"OLD text matches {n} places in target — ambiguous; proposal must quote "
             "more surrounding context"
         )
+    # Soft sample-size gate: surface (never block) a thin-evidence content edit so an
+    # approver sees it went in over a weak signal. Steve's approval is sovereign.
+    warnings: list[str] = []
+    if prop.thin_evidence:
+        warnings.append(
+            f"thin evidence (n={prop.evidence_n} < {MIN_EVIDENCE_N}) — this signal would be "
+            "better A/B-tested before being baked into canon"
+        )
+    elif prop.evidence_n is None:
+        warnings.append("evidence_n not recorded — sample size behind this signal is unknown")
     # Backup, then atomic single-occurrence replace.
     backup = target.with_name(f"{target.name}.bak-pre-adapt-{prop.pid}")
     shutil.copy2(target, backup)
@@ -370,7 +462,10 @@ def apply_proposal(pid: str) -> dict:
         prop, APPLIED_DIR, "applied",
         {"applied": _now(), "backup": str(backup), "evaluate_after": eval_after},
     )
-    _append_log("APPLIED", prop, f"backup {backup.name}; evaluate_after {eval_after}")
+    detail = f"backup {backup.name}; evaluate_after {eval_after}"
+    if warnings:
+        detail += f"; WARN: {'; '.join(warnings)}"
+    _append_log("APPLIED", prop, detail)
     return {
         "pid": prop.pid,
         "target": str(target),
@@ -378,6 +473,7 @@ def apply_proposal(pid: str) -> dict:
         "proposal": str(moved),
         "summary": prop.summary,
         "evaluate_after": eval_after,
+        "warnings": warnings,
     }
 
 
@@ -486,23 +582,167 @@ def scoreboard() -> dict:
     }
 
 
+# Repeated-failure flag: a group the loop keeps trying and losing on is a canon
+# root-cause signal (the rule it edits is fighting reality), not a cue for more
+# retries. Conservative thresholds so a single miss never trips it.
+REPEATED_FAILURE_MIN_DECISIVE = 2
+REPEATED_FAILURE_MAX_HITRATE = 1.0 / 3.0
+
+
+def _meta_group(buckets: dict, key: str, outcome: str) -> None:
+    g = buckets.setdefault(key, {v: 0 for v in OUTCOME_VALUES})
+    if outcome in g:
+        g[outcome] += 1
+
+
+def _meta_finalize(buckets: dict) -> list[dict]:
+    """Turn raw per-group counts into ranked rows with hit-rate + repeated-failure
+    flag. Sorted worst-first (lowest hit-rate among decisive groups) so the canon
+    reviewer reads the problem groups at the top."""
+    rows = []
+    for key, c in buckets.items():
+        decisive = c["improved"] + c["no-change"] + c["regressed"]
+        hit = (c["improved"] / decisive) if decisive else None
+        rows.append({
+            "group": key,
+            "counts": c,
+            "decisive": decisive,
+            "hit_rate": hit,
+            "repeated_failure": (
+                decisive >= REPEATED_FAILURE_MIN_DECISIVE
+                and hit is not None
+                and hit <= REPEATED_FAILURE_MAX_HITRATE
+            ),
+        })
+    # worst decisive hit-rate first; groups with no decisive outcomes sink to the end.
+    rows.sort(key=lambda r: (r["hit_rate"] is None, r["hit_rate"] if r["hit_rate"] is not None else 1.0))
+    return rows
+
+
+def meta_scoreboard() -> dict:
+    """Second-order view over applied-adaptation outcomes: group decisive outcomes
+    by TARGET (which agent/standard the loop keeps editing) and by SIGNAL-SOURCE
+    class (which kind of signal drives wins vs losses), each with a per-group
+    hit-rate and a repeated-failure flag. This is the input the canon reviewer uses
+    to ask 'is the canon line itself wrong?' instead of proposing yet another edit
+    to a target that keeps regressing."""
+    by_target: dict = {}
+    by_signal: dict = {}
+    if APPLIED_DIR.is_dir():
+        for f in sorted(APPLIED_DIR.glob("*.md")):
+            prop = _load_applied(f)
+            if prop is None:
+                continue
+            oc = (prop.meta.get("outcome") or "").strip().lower()
+            if oc not in OUTCOME_VALUES:
+                continue
+            tgt = Path(prop.target).name if prop.target else "(no target)"
+            sig = prop.meta.get("signal_source", "")
+            sig_class = Path(sig).name if sig else "(no signal_source)"
+            _meta_group(by_target, tgt, oc)
+            _meta_group(by_signal, sig_class, oc)
+    target_rows = _meta_finalize(by_target)
+    signal_rows = _meta_finalize(by_signal)
+    return {
+        "by_target": target_rows,
+        "by_signal": signal_rows,
+        "repeated_failures": [r["group"] for r in target_rows if r["repeated_failure"]],
+    }
+
+
+# --- Risk-tiered auto-apply (capability; inert unless explicitly enabled) ------
+def auto_apply_eligible(prop: Proposal) -> bool:
+    """A proposal may be auto-applied ONLY if it declares tier:auto AND names a
+    trusted machine-verifier in verified_by. Everything else stays human-gated."""
+    return prop.tier == "auto" and prop.verified_by in AUTO_APPLY_VERIFIERS
+
+
+def apply_auto_pending(enabled: bool = False, cap: int = AUTO_APPLY_MAX_PER_RUN) -> list[dict]:
+    """Apply queued tier:auto, trusted-verifier proposals — ONLY when `enabled` —
+    reusing the full apply_proposal safety path (allowlist, exact-once, backup,
+    audit log). Capped per run. Returns the applied results (each stamped auto:True).
+
+    INERT by default: enabled=False (the only caller passes ADAPT_AUTO_APPLY==1) →
+    returns [] without touching anything. A non-eligible proposal is left in the
+    queue for /adapt. A proposal that fails apply (drift/ambiguity) is skipped, not
+    retried — it surfaces normally via /adapt list."""
+    if not enabled:
+        return []
+    out: list[dict] = []
+    for prop in list_proposals():
+        if len(out) >= cap:
+            break
+        if not auto_apply_eligible(prop):
+            continue
+        try:
+            res = apply_proposal(prop.pid)
+        except AdaptError:
+            continue
+        res["auto"] = True
+        res["verified_by"] = prop.verified_by
+        out.append(res)
+    return out
+
+
 # --- CLI ---------------------------------------------------------------------
-def _cli_list() -> int:
+def _proposal_json(p: Proposal) -> dict:
+    """The machine-readable view of a proposal the outcome-evaluator/agents read
+    (via --json). Flat, JSON-safe — no Path objects."""
+    return {
+        "id": p.pid,
+        "target": p.target,
+        "target_name": Path(p.target).name if p.target else "",
+        "summary": p.summary,
+        "confidence": p.meta.get("confidence", ""),
+        "signal_source": p.meta.get("signal_source", ""),
+        "metric": p.meta.get("metric", ""),
+        "expected_effect": p.meta.get("expected_effect", ""),
+        "applied": p.meta.get("applied", ""),
+        "evaluate_after": p.meta.get("evaluate_after", ""),
+        "evidence_n": p.evidence_n,
+        "evidence_basis": p.evidence_basis,
+        "thin_evidence": p.thin_evidence,
+        "tier": p.tier,
+        "verified_by": p.verified_by,
+    }
+
+
+def _emit_json(obj) -> int:
+    import json
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _evidence_tag(p: Proposal) -> str:
+    if p.thin_evidence:
+        return f"  ⚠ thin evidence (n={p.evidence_n})"
+    if p.evidence_n is None:
+        return "  ⚠ evidence_n missing"
+    return f"  evidence n={p.evidence_n}"
+
+
+def _cli_list(as_json: bool = False) -> int:
     props = list_proposals()
+    if as_json:
+        return _emit_json([_proposal_json(p) for p in props])
     if not props:
         print("No pending adaptation proposals.")
         return 0
     print(f"{len(props)} pending adaptation proposal(s):\n")
     for p in props:
         tgt = p.target.replace(str(Path.home()), "~")
-        print(f"  [{p.pid}] ({p.meta.get('confidence', '?')}) {tgt}")
+        tier = "" if p.tier == "gated" else f" [tier:{p.tier}]"
+        print(f"  [{p.pid}] ({p.meta.get('confidence', '?')}){tier} {tgt}")
         print(f"      {p.summary}")
+        print(f"    {_evidence_tag(p).strip()}")
     print("\nApply:  python3 adaptation.py --apply <id>")
     return 0
 
 
-def _cli_review_due() -> int:
+def _cli_review_due(as_json: bool = False) -> int:
     props = due_for_review()
+    if as_json:
+        return _emit_json([_proposal_json(p) for p in props])
     if not props:
         print("No applied adaptations are due for an outcome review.")
         return 0
@@ -512,14 +752,17 @@ def _cli_review_due() -> int:
         eff = p.meta.get("expected_effect") or p.meta.get("metric") or "(no hypothesis recorded)"
         print(f"  [{p.pid}] applied, due {p.meta.get('evaluate_after', '?')} → {tgt}")
         print(f"      {p.summary}")
+        print(f"      metric:   {p.meta.get('metric', '(none)')}")
         print(f"      expected: {eff}")
     print("\nTag:  python3 adaptation.py --tag-outcome <id> --outcome "
           f"<{'|'.join(OUTCOME_VALUES)}> [--note \"...\"]")
     return 0
 
 
-def _cli_scoreboard() -> int:
+def _cli_scoreboard(as_json: bool = False) -> int:
     sb = scoreboard()
+    if as_json:
+        return _emit_json(sb)
     c = sb["counts"]
     print("Adaptation outcome scoreboard")
     print(f"  applied total : {sb['total']}")
@@ -536,6 +779,41 @@ def _cli_scoreboard() -> int:
     return 0
 
 
+def _cli_meta(as_json: bool = False) -> int:
+    ms = meta_scoreboard()
+    if as_json:
+        return _emit_json(ms)
+    def _hr(r):
+        return "n/a" if r["hit_rate"] is None else f"{r['hit_rate']*100:.0f}%"
+    print("Adaptation meta-scoreboard (second-order patterns)\n")
+    print("By target (which agent/standard the loop edits):")
+    for r in ms["by_target"]:
+        flag = "  ⚠ REPEATED FAILURE" if r["repeated_failure"] else ""
+        print(f"  {r['group']}: hit-rate {_hr(r)} over {r['decisive']} decisive{flag}")
+    print("\nBy signal-source class:")
+    for r in ms["by_signal"]:
+        print(f"  {r['group']}: hit-rate {_hr(r)} over {r['decisive']} decisive")
+    if ms["repeated_failures"]:
+        print("\nRepeated-failure targets (canon root-cause candidates): "
+              + ", ".join(ms["repeated_failures"]))
+    return 0
+
+
+def _cli_auto_apply() -> int:
+    enabled = os.environ.get("ADAPT_AUTO_APPLY") == "1"
+    results = apply_auto_pending(enabled=enabled)
+    if not enabled:
+        print("Auto-apply is OFF (set ADAPT_AUTO_APPLY=1 to enable). No action taken.")
+        return 0
+    if not results:
+        print("Auto-apply ON: no eligible tier:auto proposals to apply.")
+        return 0
+    print(f"Auto-applied {len(results)} proposal(s):")
+    for r in results:
+        print(f"  {r['pid']} → {r['target']} (verified_by {r.get('verified_by')})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ADAPTS loop apply core")
     g = ap.add_mutually_exclusive_group(required=True)
@@ -549,16 +827,22 @@ def main(argv: list[str] | None = None) -> int:
                    help="record the outcome of an applied adaptation (needs --outcome)")
     g.add_argument("--scoreboard", action="store_true",
                    help="tally applied-adaptation outcomes + hit-rate")
+    g.add_argument("--meta", action="store_true",
+                   help="second-order patterns: per-target / per-signal hit-rates + repeated-failure flags")
+    g.add_argument("--auto-apply", action="store_true",
+                   help="apply queued tier:auto trusted-verifier proposals (INERT unless ADAPT_AUTO_APPLY=1)")
     g.add_argument("--selftest", action="store_true")
     ap.add_argument("--reason", default="")
     ap.add_argument("--outcome", default="",
                     help=f"outcome verdict for --tag-outcome: {', '.join(OUTCOME_VALUES)}")
     ap.add_argument("--note", default="", help="optional note for --tag-outcome")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output for --list/--review-due/--scoreboard/--meta")
     args = ap.parse_args(argv)
 
     try:
         if args.list:
-            return _cli_list()
+            return _cli_list(args.json)
         if args.show:
             print(show_proposal(args.show))
             return 0
@@ -573,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"REJECTED {res['pid']}")
             return 0
         if args.review_due:
-            return _cli_review_due()
+            return _cli_review_due(args.json)
         if args.tag_outcome:
             if not args.outcome:
                 print("error: --tag-outcome requires --outcome "
@@ -583,7 +867,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"OUTCOME {res['pid']} → {res['outcome']}")
             return 0
         if args.scoreboard:
-            return _cli_scoreboard()
+            return _cli_scoreboard(args.json)
+        if args.meta:
+            return _cli_meta(args.json)
+        if args.auto_apply:
+            return _cli_auto_apply()
         if args.selftest:
             return _selftest()
     except AdaptError as e:
@@ -767,6 +1055,109 @@ def _selftest() -> int:
             self.assertEqual(sb["untagged"], 0)
             self.assertEqual(sb["decisive"], 2)  # inconclusive excluded
             self.assertAlmostEqual(sb["hit_rate"], 0.5)
+
+        # --- evidence floor (sample-size gate) --------------------------------
+        def _write_ex(self, pid, target, old, new, extra=""):
+            """Like _write but lets a test inject extra frontmatter lines."""
+            QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+            (QUEUE_DIR / f"{pid}.md").write_text(
+                f"---\nid: {pid}\nstatus: pending\ntarget: {target}\n"
+                f"confidence: high\nsummary: test {pid}\n{extra}---\n\n"
+                f"## Rationale\nbecause\n\n{OLD_OPEN}\n{old}\n{OLD_CLOSE}\n\n{NEW_OPEN}\n{new}\n{NEW_CLOSE}\n",
+                encoding="utf-8",
+            )
+
+        def test_evidence_n_parsing(self):
+            self._write_ex("e1", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="evidence_n: ~1,200 impressions\n")
+            p = _load_proposal_file(QUEUE_DIR / "e1.md")
+            self.assertEqual(p.evidence_n, 1200)
+            self.assertFalse(p.thin_evidence)
+
+        def test_thin_evidence_flagged_below_floor(self):
+            self._write_ex("e2", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="evidence_n: 4 views\n")
+            p = _load_proposal_file(QUEUE_DIR / "e2.md")
+            self.assertEqual(p.evidence_n, 4)
+            self.assertTrue(p.thin_evidence)
+
+        def test_thin_evidence_exempt_categorical(self):
+            self._write_ex("e3", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="evidence_n: 1\nevidence_basis: severe-single-miss off-model hero\n")
+            p = _load_proposal_file(QUEUE_DIR / "e3.md")
+            self.assertFalse(p.thin_evidence)  # categorical miss exempt at n=1
+
+        def test_apply_warns_thin_then_applies(self):
+            self._write_ex("e4", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="evidence_n: 4\n")
+            res = apply_proposal("e4")
+            self.assertTrue(any("thin evidence" in w for w in res["warnings"]))
+            self.assertIn("hook style B.", self.agent.read_text())  # soft gate: still applied
+            self.assertIn("WARN", LOG_FILE.read_text())
+
+        def test_apply_warns_missing_evidence_n(self):
+            self._write("e5", str(self.agent), "Use hook style A.", "Use hook style B.")
+            res = apply_proposal("e5")
+            self.assertTrue(any("evidence_n not recorded" in w for w in res["warnings"]))
+
+        # --- meta scoreboard --------------------------------------------------
+        def _apply_tagged(self, pid, new, outcome, target=None, signal=None):
+            self.agent.write_text("You are the scriptwriter.\nUse hook style A.\nEnd.\n",
+                                  encoding="utf-8")
+            extra = f"signal_source: {signal}\n" if signal else ""
+            self._write_ex(pid, target or str(self.agent), "Use hook style A.",
+                           f"Use hook style {new}", extra=extra)
+            apply_proposal(pid)
+            tag_outcome(pid, outcome)
+
+        def test_meta_scoreboard_repeated_failure(self):
+            # same target regresses twice → flagged; signal grouping present
+            self._apply_tagged("m1", "B.", "regressed", signal="Analytics/read-1.md")
+            self._apply_tagged("m2", "C.", "no-change", signal="Analytics/read-2.md")
+            self._apply_tagged("m3", "D.", "improved", signal="Analytics/read-3.md")
+            ms = meta_scoreboard()
+            tgt = self.agent.name
+            self.assertIn(tgt, ms["repeated_failures"])  # 1/3 hit-rate over 3 decisive
+            names = {r["group"] for r in ms["by_signal"]}
+            self.assertIn("read-1.md", names)
+
+        # --- risk-tiered auto-apply (inert by default) ------------------------
+        def test_auto_apply_inert_by_default(self):
+            self._write_ex("a1", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="tier: auto\nverified_by: figures-watcher\n")
+            self.assertEqual(apply_auto_pending(enabled=False), [])
+            self.assertIn("hook style A.", self.agent.read_text())  # untouched
+            self.assertTrue((QUEUE_DIR / "a1.md").exists())
+
+        def test_auto_apply_applies_when_enabled_and_trusted(self):
+            self._write_ex("a2", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="tier: auto\nverified_by: figures-watcher\n")
+            res = apply_auto_pending(enabled=True)
+            self.assertEqual([r["pid"] for r in res], ["a2"])
+            self.assertTrue(res[0]["auto"])
+            self.assertIn("hook style B.", self.agent.read_text())
+
+        def test_auto_apply_skips_untrusted_verifier(self):
+            self._write_ex("a3", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="tier: auto\nverified_by: some-random-agent\n")
+            self.assertEqual(apply_auto_pending(enabled=True), [])
+            self.assertIn("hook style A.", self.agent.read_text())  # untouched
+
+        def test_auto_apply_skips_gated_tier(self):
+            self._write_ex("a4", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="verified_by: figures-watcher\n")  # tier defaults to gated
+            self.assertEqual(apply_auto_pending(enabled=True), [])
+
+        def test_proposal_json_shape(self):
+            self._write_ex("j1", str(self.agent), "Use hook style A.", "Use hook style B.",
+                           extra="evidence_n: 4\nmetric: block-rate\n")
+            p = _load_proposal_file(QUEUE_DIR / "j1.md")
+            j = _proposal_json(p)
+            self.assertEqual(j["id"], "j1")
+            self.assertEqual(j["evidence_n"], 4)
+            self.assertTrue(j["thin_evidence"])
+            self.assertEqual(j["tier"], "gated")
+            self.assertEqual(j["metric"], "block-rate")
 
     suite = unittest.TestLoader().loadTestsFromTestCase(T)
     result = unittest.TextTestRunner(verbosity=2).run(suite)

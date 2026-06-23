@@ -2482,7 +2482,14 @@ async def _handle_adapt_command(update, chat_id: str, subcommand: str, arg: str)
         for p in props:
             tgt = _vault_rel(p.target) if p.target else "(no target)"
             conf = p.meta.get("confidence", "?")
-            lines.append(f"• `{p.pid}` [{conf}] → {tgt}")
+            tier = "" if p.tier == "gated" else f" tier:{p.tier}"
+            if p.thin_evidence:
+                ev = f" ⚠thin(n={p.evidence_n})"
+            elif p.evidence_n is None:
+                ev = " ⚠n?"
+            else:
+                ev = ""
+            lines.append(f"• `{p.pid}` [{conf}]{tier}{ev} → {tgt}")
             lines.append(f"   {p.summary}")
         lines.append("")
         lines.append("Review one: `/adapt show <id>` · then `/adapt approve <id>` or `/adapt reject <id> [reason]`")
@@ -2518,11 +2525,14 @@ async def _handle_adapt_command(update, chat_id: str, subcommand: str, arg: str)
         except Exception as exc:  # noqa: BLE001
             await update.message.reply_text(f"Apply failed for `{pid}`: {exc}")
             return
+        warn = ""
+        if res.get("warnings"):
+            warn = "\n⚠️ " + "\n⚠️ ".join(res["warnings"])
         await update.message.reply_text(
             f"✅ Applied `{res['pid']}`.\n"
             f"📝 {res['summary']}\n"
             f"📂 Target: `{_vault_rel(res['target'])}`\n"
-            f"💾 Backup: `{Path(res['backup']).name}`\n"
+            f"💾 Backup: `{Path(res['backup']).name}`{warn}\n"
             "The next dispatch of that agent/standard will use the new text."
         )
         return
@@ -2593,6 +2603,30 @@ async def _handle_adapt_command(update, chat_id: str, subcommand: str, arg: str)
         )
         return
 
+    if subcommand == "meta":
+        try:
+            ms = await _run(_adaptation.meta_scoreboard)
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Couldn't build meta-scoreboard: {exc}")
+            return
+
+        def _hr(r):
+            return "n/a" if r["hit_rate"] is None else f"{int(round(r['hit_rate']*100))}%"
+
+        lines = ["🧭 Adaptation meta-scoreboard (second-order patterns)", ""]
+        if not ms["by_target"]:
+            lines.append("No decisive outcomes yet — nothing to pattern on.")
+        else:
+            lines.append("*By target:*")
+            for r in ms["by_target"]:
+                flag = " ⚠ REPEATED FAILURE" if r["repeated_failure"] else ""
+                lines.append(f"• {r['group']}: {_hr(r)} over {r['decisive']} decisive{flag}")
+            if ms["repeated_failures"]:
+                lines.append("")
+                lines.append("Canon root-cause candidates: " + ", ".join(ms["repeated_failures"]))
+        await update.message.reply_text("\n".join(lines))
+        return
+
     if subcommand == "outcome":
         parts = arg.split(None, 2) if arg else []
         if len(parts) < 2:
@@ -2617,7 +2651,7 @@ async def _handle_adapt_command(update, chat_id: str, subcommand: str, arg: str)
 
     await update.message.reply_text(
         "Usage: /adapt [list | show <id> | approve <id> | reject <id> [reason] | "
-        "due | score | outcome <id> <verdict> [note]]"
+        "due | score | meta | outcome <id> <verdict> [note]]"
     )
 
 
