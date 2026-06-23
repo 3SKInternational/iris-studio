@@ -1879,6 +1879,40 @@ def manifest_suppressor_offenders(manifest_abs: Path) -> list[str]:
     return offenders
 
 
+# Deterministic thumbnail-presence guard (added 2026-06-22). The thumbnail ART
+# now renders INSIDE the stage-5 billed batch (scene-image-prompt-generator must
+# append `Video_NN_Thumbnail_A`/`_B` entries to video_NN_hd.json). When those
+# entries are ABSENT, the batch bills the scene shots but produces NO thumbnail
+# backplate — stage 8 then has nothing to burn and the video ships with a bland
+# late-patched (or missing) thumbnail. This recurred: V2/V3 hd manifests carried
+# ZERO thumbnail entries, V4 carried only A (the B A/B-alternate was dropped). The
+# LLM PROMPTS gate is supposed to notice, but it's LLM-dependent; this check makes
+# a thumbnail-less billed batch impossible to BILL — deterministic, $0, runs in
+# the non-force spend path, fails CLOSED on zero entries (the catastrophic case)
+# and WARNS on an incomplete A/B pair. Fix is always a single manifest edit
+# (append the missing Thumbnail entry per the scene-image-prompt-generator def).
+def manifest_thumbnail_entries(manifest_abs: Path, video: int) -> list[str]:
+    """Sorted names of every image entry that is a thumbnail backplate for this
+    video (name starts with `Video_NN_Thumbnail`). Empty list == the manifest
+    carries no thumbnail art at all (the V2/V3 bug). Raises on unreadable/malformed
+    JSON so the caller decides (treated as fail-open, mirroring the suppressor
+    guard). Shape-defensive against a wrong-shaped manifest exactly like
+    manifest_suppressor_offenders."""
+    data = json.loads(manifest_abs.read_text())
+    images = data.get("images", []) if isinstance(data, dict) else []
+    if not isinstance(images, list):
+        images = []
+    prefix = f"Video_{nn(video)}_Thumbnail"
+    names: list[str] = []
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        name = img.get("name")
+        if isinstance(name, str) and name.startswith(prefix):
+            names.append(name)
+    return sorted(names)
+
+
 def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     """Decision 4 (C1): the ONLY billed-spend path. Confirms stage 5 is ready,
     confirms the scene manifest exists, runs the pre-spend image-review gate,
@@ -1958,6 +1992,20 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
                     f"off-model figures (the V3 re-spend bug). Drop --force to block.")
             print(line)
             notify(line)
+        # Thumbnail-presence: under --force we never block, but shout if the batch
+        # would bill with no thumbnail backplate (the V2/V3 no-thumbnail bug).
+        try:
+            thumbs = manifest_thumbnail_entries(manifest_abs, video)
+        except (json.JSONDecodeError, OSError):
+            thumbs = ["<unreadable>"]
+        if not thumbs:
+            line = (f"⚠️ Video {video}: --force spend with NO thumbnail entries in "
+                    f"{manifest_rel} — this batch will render no thumbnail backplate and "
+                    f"stage 8 will have nothing to burn (the V2/V3 bland-thumbnail bug). "
+                    f"Append Video_{nn(video)}_Thumbnail_A/_B per the "
+                    f"scene-image-prompt-generator def. Drop --force to block.")
+            print(line)
+            notify(line)
     else:
         # Deterministic suppressor guard — runs BEFORE the LLM gate, fails CLOSED.
         # Cheap, no model call, catches the exact V3 re-spend bug instantly. A
@@ -1980,6 +2028,37 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
             print(line)
             notify(line)
             return 2
+        # Deterministic thumbnail-presence guard — runs BEFORE the LLM gate, fails
+        # CLOSED on ZERO thumbnail entries (the catastrophic V2/V3 no-thumbnail
+        # bug: a billed batch with no backplate for stage 8 to burn). A read/parse
+        # error fails OPEN (the LLM gate + downstream checks still run). An
+        # incomplete A/B pair (e.g. V4 had only _A) is a loud WARNING, not a block —
+        # one backplate still yields a usable thumbnail, so we don't refuse the
+        # whole scene batch, but we make the gap impossible to miss.
+        try:
+            thumbs = manifest_thumbnail_entries(manifest_abs, video)
+        except (json.JSONDecodeError, OSError):
+            thumbs = None  # fail OPEN: let the LLM gate / schema checks handle it
+        if thumbs is not None:
+            if not thumbs:
+                s["note"] = (f"spend refused: {manifest_rel} has no Video_{nn(video)}_Thumbnail "
+                             f"entries — billed batch would produce no thumbnail backplate")
+                sf.save()
+                line = (f"🛑 Video {video}: {manifest_rel} has NO thumbnail entries — refusing "
+                        f"to spend (deterministic guard; the V2/V3 bland-thumbnail bug). The "
+                        f"thumbnail ART must render in this billed batch. Fix: append "
+                        f"Video_{nn(video)}_Thumbnail_A and _B image entries per the "
+                        f"scene-image-prompt-generator def, then re-run spend-ok.")
+                print(line)
+                notify(line)
+                return 2
+            if len(thumbs) < 2:
+                line = (f"⚠️ Video {video}: only {thumbs} in {manifest_rel} — the canonical "
+                        f"set is BOTH Video_{nn(video)}_Thumbnail_A and _B (A/B test). "
+                        f"Proceeding (one backplate is usable), but append the missing "
+                        f"variant before stage 8 for the A/B pair.")
+                print(line)
+                notify(line)
         verdict, vrel, detail = run_prompt_review_loop(video, manifest_rel)
         # BINARY allow-list (Steve, 2026-06-20; fail-closed hardened 2026-06-22):
         # spend ONLY on a clean SHIP — a 100% sign-off. EVERYTHING else fails

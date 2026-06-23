@@ -799,6 +799,125 @@ class TestSpendOkImageGate(unittest.TestCase):
             restore()
 
 
+class TestSpendOkThumbnailGuard(unittest.TestCase):
+    """Deterministic pre-spend thumbnail-presence guard inside cmd_spend_ok.
+
+    The thumbnail ART renders in the stage-5 billed batch via Video_NN_Thumbnail_A/_B
+    entries. A batch with ZERO such entries bills the scene shots but produces no
+    backplate for stage 8 to burn (the V2/V3 bland-thumbnail bug). The guard fails
+    CLOSED on zero, WARNS on an incomplete A/B pair, and passes a full pair through."""
+
+    def _ready_stages(self):
+        return _mark_done(_stages(), "2_review")
+
+    def _patch(self, manifest_obj):
+        """Patch cmd_spend_ok's side effects, pointing vault_abs at a REAL temp JSON
+        manifest with the given shape. Returns (restore, manifest_path, spy)."""
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_hd.json", delete=False, encoding="utf-8")
+        json.dump(manifest_obj, tmp)
+        tmp.close()
+        manifest_path = Path(tmp.name)
+
+        saved = (po.reconcile_orphans, po.vault_abs, po.notify,
+                 po.subprocess.run, po.run_prompt_review_loop)
+        po.reconcile_orphans = lambda _s, _v: None
+        po.vault_abs = lambda rel: manifest_path
+        po.notify = lambda *a, **k: None
+        spy = {"gen": False}
+
+        def _spy_run(*a, **k):
+            spy["gen"] = True
+            return _Proc(0, stdout="generated")
+        po.subprocess.run = _spy_run
+        # If the guard lets us through, SHIP so we reach the (stubbed) spend.
+        po.run_prompt_review_loop = lambda video, manifest_rel: ("SHIP", "rel", "ok")
+
+        def restore():
+            (po.reconcile_orphans, po.vault_abs, po.notify,
+             po.subprocess.run, po.run_prompt_review_loop) = saved
+            try:
+                manifest_path.unlink()
+            except OSError:
+                pass
+        return restore, manifest_path, spy
+
+    def test_zero_thumbnail_entries_blocks_spend(self):
+        # The V2/V3 bug: a manifest with only scene shots, no thumbnail backplate.
+        manifest = {"images": [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Shot_02", "use_references": True, "prompt": "Three points."},
+        ]}
+        restore, _path, spy = self._patch(manifest)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 2)
+            self.assertFalse(spy["gen"], "no thumbnail entries must fail CLOSED — no spend")
+        finally:
+            restore()
+
+    def test_full_ab_pair_passes_guard(self):
+        # Canonical: both A and B present → guard passes → SHIP → billed spend runs.
+        manifest = {"images": [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Thumbnail_A", "use_references": True, "prompt": "Split."},
+            {"name": "Video_03_Thumbnail_B", "use_references": True, "prompt": "Closeup."},
+        ]}
+        restore, _path, spy = self._patch(manifest)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "a full A/B pair must NOT block the billed spend")
+        finally:
+            restore()
+
+    def test_partial_pair_warns_but_proceeds(self):
+        # V4 case: only _A present. One backplate is usable — WARN, don't block.
+        manifest = {"images": [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Thumbnail_A", "use_references": True, "prompt": "Split."},
+        ]}
+        restore, _path, spy = self._patch(manifest)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "an incomplete A/B pair warns but still spends")
+        finally:
+            restore()
+
+    def test_unreadable_manifest_fails_open_to_llm_gate(self):
+        # A malformed-JSON manifest must NOT crash the guard; it fails OPEN so the
+        # LLM gate (here stubbed SHIP) and downstream checks still run.
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_hd.json", delete=False, encoding="utf-8")
+        tmp.write("{ this is not json ")
+        tmp.close()
+        manifest_path = Path(tmp.name)
+        saved = (po.reconcile_orphans, po.vault_abs, po.notify,
+                 po.subprocess.run, po.run_prompt_review_loop)
+        po.reconcile_orphans = lambda _s, _v: None
+        po.vault_abs = lambda rel: manifest_path
+        po.notify = lambda *a, **k: None
+        spy = {"gen": False}
+
+        def _spy_run(*a, **k):
+            spy["gen"] = True
+            return _Proc(0, stdout="generated")
+        po.subprocess.run = _spy_run
+        po.run_prompt_review_loop = lambda video, manifest_rel: ("SHIP", "rel", "ok")
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "unreadable manifest must fail OPEN, not block")
+        finally:
+            (po.reconcile_orphans, po.vault_abs, po.notify,
+             po.subprocess.run, po.run_prompt_review_loop) = saved
+            try:
+                manifest_path.unlink()
+            except OSError:
+                pass
+
+
 class TestAssembleImageGate(unittest.TestCase):
     """Pass B: the pre-assemble RENDERS gate inside run_script_stage."""
 
