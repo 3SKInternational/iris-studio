@@ -1,0 +1,45 @@
+You are Claude Code running the DAILY COMMENT-INGEST routine on the Mac Mini (06:50 ET). Your job closes the LEARNS-side comment gap: until now incoming viewer comments reached the `community-manager` agent only by manual paste, so the audience's own words — the richest new-video-topic and sentiment signal — never flowed into the loop automatically. THIS routine pulls them live, triages them, and surfaces what needs Steve. The fetch is cheap and READ-ONLY against YouTube; the agent is dispatched ONLY when there are real incoming comments, so a quiet (pre-launch) day is a silent no-op, never spam.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+
+HARD RULES (read before doing anything):
+- ANTI-FABRICATION is absolute. community-manager triages only the real comments in the export `fetch_comments.py` writes — never invented or "typical" comments. A zero-comment day is a SUCCESS.
+- DRAFT-ONLY. community-manager drafts replies + an escalation list; it NEVER posts. Posting replies stays Steve's (or Cowork's) call. Do NOT post any comment in this routine.
+- This routine is read-only against the vault except for: the comment exports (written by fetch_comments.py), community-manager's `Community/*_Comment_Triage.md` deliverables, and your one daily-note line. Do not delete or move any file.
+
+PASS 1 — FETCH INCOMING COMMENTS:
+  cd /Volumes/AI_Workspace/iris_studio && python3 scripts/fetch_comments.py
+  This pulls live incoming comments (our own outgoing pinned comment AND our own replies are filtered out) for every PUBLIC published video and writes one export per video to BRANDS/3SK_Finance/Channel_Intelligence/Engagement/<label>_comments_latest.md. The CANONICAL signal is the LAST line of stdout, always exactly `status: ok (<N> comments)` (printed in every success branch, including a no-published-videos day); the per-video count lines above it tell you WHICH videos have comments.
+    • If the run dies with a NON-ZERO exit (auth/credential failure → exit 2 "could not load YouTube credentials"; OR a hard mid-run API fault → exit 2 after a "HARD API ERRORS" block; in both cases NO `status: ok` line is printed) → go to PASS 4 and emit ROUTINE_INCOMPLETE with the blocker (this is the same token the comment-sweep + analytics jobs use; a failure here likely means the Claude/YouTube token needs Steve).
+    • `status: ok (0 comments)` → nothing to triage. Do NOT dispatch the agent, do NOT send a Telegram push. Note "0 incoming comments" for the daily-note line and go to PASS 4.
+    • `status: ok (<N> comments)` with N ≥ 1 → read the per-video lines and proceed to PASS 2 for ONLY the videos whose own count is ≥1.
+
+PASS 2 — DISPATCH community-manager (one per video that has comments):
+  For EACH video with ≥1 incoming comment, invoke the `community-manager` subagent. Brief it explicitly:
+    - `video_number`: the Video_NN label.
+    - comment source: the absolute path to that video's export, e.g. /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Channel_Intelligence/Engagement/<label>_comments_latest.md — tell it to READ that file as its input.
+    - SCOPE: triage each comment, draft Brand-Bible-voice replies for the reply-worthy ones, roll up recurring questions as topic signal, and build the escalation list — per its contract. Write its `Community/<label>_Comment_Triage.md` deliverable.
+  Collect each return's stdout summary (comments triaged, replies drafted, escalations, topic signals) + its `status:` line.
+
+PASS 3 — SURFACE ESCALATIONS TO TELEGRAM (only what needs Steve):
+  Build ONE consolidated push from the dispatched deliverables. Send it ONLY if there is ≥1 escalation OR ≥1 reply-worthy draft awaiting Steve across all videos; if every video was all-low-effort-praise with nothing to act on, skip the push (the wrapper's ✅ is enough) and note that.
+      cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "💬 Comment-ingest: <total> incoming comment(s) across <V> video(s).
+  <for each video with action: • <label>: <N> triaged — <R> reply draft(s), <E> escalation(s)>
+  <if any escalations, list the most urgent (advice-request / correction / abuse-legal) one per line>
+  Replies + escalations: BRANDS/3SK_Finance/Community/  ·  Topic signal → topic-scout (weekly)"
+  Cap at 10 lines; if more, surface the videos with escalations first and say "…rest in Community/". Recommend, don't act — Steve posts the replies.
+
+PASS 4 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
+      ## 💬 Comment ingest (daily)
+  ~3-4 lines: how many incoming comments were fetched across how many videos; how many community-manager triaged + drafted + escalated (or "0 incoming — silent no-op"); whether the Telegram push was sent. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub). Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the fetch ran AND (there were 0 incoming comments → clean no-op, OR community-manager triaged what was fetched and any escalations are surfaced). All are complete.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the fetch failed (auth/credential), a community-manager dispatch could not run, or the Telegram push failed when escalations existed.
+
+Output nothing after that line.
