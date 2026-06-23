@@ -2178,6 +2178,32 @@ EXPENSE_CATEGORIZER_HOUR = 4   # 04:00 ET — weekly Sunday early-morning receip
 EXPENSE_CATEGORIZER_MINUTE = 0
 EXPENSE_CATEGORIZER_LOOKBACK_DAYS = 9  # was 7 (daily); bumped for weekly cadence margin
 
+# Flat, agent-readable mirror of the binary Expense_Tracker.xlsx "Expense Log".
+# Regenerated right before every sweep so the agent's vendor+date+amount dedup
+# reflects the latest filed state (the .xlsx itself is unreadable by the agent —
+# that gap let a duplicate-risk charge through, 2026-06-22). Best-effort: a stale
+# CSV is degraded dedup, not a hard failure (SQLite msg_id table is primary).
+EXPORT_EXPENSE_CSV_SCRIPT = PROJECT_DIR / "scripts" / "export_expense_csv.py"
+
+
+def _regen_expense_csv_sync() -> bool:
+    """Run scripts/export_expense_csv.py. Returns True on success. Never raises."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(EXPORT_EXPENSE_CSV_SCRIPT)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode == 0:
+            logger.info(f"Expense CSV ledger regenerated: {proc.stdout.strip()}")
+            return True
+        logger.warning(
+            f"Expense CSV regen exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout).strip()}"
+        )
+    except Exception as exc:
+        logger.warning(f"Expense CSV regen failed to run: {exc}")
+    return False
+
 
 async def fire_expense_categorizer_sweep(chat_id: int) -> None:
     """Daily 09:00 ET job: kick the expense-categorizer subagent in scheduled mode.
@@ -2193,6 +2219,12 @@ async def fire_expense_categorizer_sweep(chat_id: int) -> None:
         until_iso = now_local.strftime("%Y-%m-%d")
         since_iso = (now_local - timedelta(days=EXPENSE_CATEGORIZER_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
         await _db_call(_insert_expense_run_sync, run_id, since_iso, until_iso)
+        # Refresh the agent-readable dedup ledger from the live xlsx before the
+        # sweep so vendor+date+amount dedup sees the latest filed rows. Run in a
+        # plain executor (not _db_call — this is a subprocess, not a DB op, and
+        # must not hold the DB lock).
+        loop = asyncio.get_event_loop()
+        csv_ok = await loop.run_in_executor(None, _regen_expense_csv_sync)
         processed_ids = await _db_call(_list_processed_msg_ids_sync, 500)
         processed_sample = ", ".join(processed_ids[:200])
         if len(processed_ids) > 200:
@@ -2204,6 +2236,10 @@ async def fire_expense_categorizer_sweep(chat_id: int) -> None:
             f"until: {until_iso}\n"
             f"already_processed_msg_ids ({len(processed_ids)} total — these MUST be skipped):\n"
             f"{processed_sample or '(none yet — first scheduled run)'}\n\n"
+            f"dedup_ledger: `02_Finance/Expense_Tracker.csv` "
+            f"({'freshly regenerated from the xlsx for this run' if csv_ok else 'REGEN FAILED — may be stale; rely on the msg_id list and note the staleness in your draft'}). "
+            "Read it and dedup every candidate (vendor+date+amount) against it before drafting; "
+            "do NOT try to read the binary `.xlsx`.\n\n"
             "Write your draft to "
             f"`02_Finance/Expense_Tracker_Drafts/{until_iso}_{run_id}.md` "
             "per your Deliverable contract. After writing, return a one-sentence "
