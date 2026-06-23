@@ -22,7 +22,7 @@ routine runs it first, then hands the file to the agent (see
 routines/youtube-research.prompt), exactly mirroring the analytics-feedback loop.
 
 Quota: ``search.list`` costs 100 units/call, ``videos.list`` 1 unit per ≤50 ids.
-Default run (allowlist only, 3 channels) ≈ 300 units; ``--keyword-search`` adds
+Default run (allowlist only, 4 channels) ≈ 400 units; ``--keyword-search`` adds
 ~800 — both well under the 10k/day default quota.
 
 Output: Channel_Intelligence/Niche_Views/<YYYY-MM-DD>_niche-views.md (under $SK_VAULT).
@@ -83,6 +83,7 @@ CREATOR_HANDLES = [
     "willie_finance",   # Willie Finance — STYLE ANCHOR, animated-documentary (~24K)
     "ryanfinanceus",    # Finance With Ryan — animated finance, near-identical (~184K)
     "hypotheticallyhq", # Hypothetically — animated "every level of wealth" (~297K)
+    "markbuildsus",     # Mark Invests — animated-character finance (added 2026-06-22, Steve)
 ]
 
 # SECONDARY source: keyword search. INTENTIONALLY finance-anchored (every query
