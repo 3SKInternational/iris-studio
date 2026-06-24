@@ -72,7 +72,7 @@ def parse_pull(path: Path) -> dict:
     subs = (re.search(r"^subscribers:\s*(.+)$", text, re.M) or [None, ""])[1].strip()
     chvids = (re.search(r"^channel_videos:\s*(.+)$", text, re.M) or [None, ""])[1].strip()
 
-    videos, in_video, in_traffic, top_source = [], False, False, None
+    videos, sources, in_video, in_traffic = [], [], False, False
     for line in text.splitlines():
         if line.startswith("## Per-video"):
             in_video, in_traffic = True, False; continue
@@ -90,8 +90,8 @@ def parse_pull(path: Path) -> dict:
                 "avg_pct": cells[5], "subs": _int(cells[6]) or 0,
                 "likes": _int(cells[7]) or 0, "comments": _int(cells[8]) or 0,
             })
-        elif in_traffic and len(cells) >= 2 and top_source is None:
-            top_source = f"{cells[0]} ({cells[1]})"
+        elif in_traffic and len(cells) >= 2:
+            sources.append({"src": cells[0], "views": _int(cells[1]) or 0})
 
     age = None
     try:
@@ -108,7 +108,8 @@ def parse_pull(path: Path) -> dict:
         "total_comments": sum(v["comments"] for v in videos),
         # Channel upload count (truth) falls back to parsed-row count if absent.
         "video_count": _int(chvids) if _int(chvids) is not None else len(videos),
-        "top_source": top_source or "—",
+        "sources": sources,
+        "top_source": f"{sources[0]['src']} ({sources[0]['views']})" if sources else "—",
     }
 
 
@@ -133,7 +134,8 @@ def vitals() -> dict:
     base.update(parse_pull(p) if p else {"window": "—", "videos": [],
                 "total_views": 0, "subs_gained": 0, "subscribers": None,
                 "video_count": 0, "total_likes": 0, "total_comments": 0,
-                "top_source": "—", "pull_date": "", "pull_age_days": None})
+                "sources": [], "top_source": "—", "pull_date": "",
+                "pull_age_days": None})
     base["claude"] = claude_spend()
     return base
 
@@ -221,134 +223,191 @@ def build_app():
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>V.A.U.L.T.</title><style>
-:root{--bg:#08090b;--panel:#0c0e11;--fg:#e8e3d8;--dim:#6b6f76;
---accent:#d2683f;--accent2:#f0a878;--line:#1c1f24;--glow:rgba(210,104,63,.55)}
+:root{--bg:#050608;--fg:#d8d4cb;--dim:#5f636b;--accent:#d2683f;--accent2:#f0a878;
+--line:#191c21;--glow:rgba(210,104,63,.5)}
 *{box-sizing:border-box}
-body{margin:0;color:var(--fg);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
-background:
- linear-gradient(rgba(210,104,63,.025) 1px,transparent 1px) 0 0/100% 34px,
- linear-gradient(90deg,rgba(210,104,63,.025) 1px,transparent 1px) 0 0/34px 100%,
- radial-gradient(120% 80% at 50% -10%,#15110d 0%,var(--bg) 60%);
-min-height:100vh}
-/* scanline overlay */
-body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9;
-background:repeating-linear-gradient(rgba(0,0,0,0) 0 2px,rgba(0,0,0,.18) 2px 3px)}
-.wrap{max-width:1100px;margin:0 auto;padding:22px 24px 40px;position:relative;z-index:1}
-/* header */
-header{display:flex;align-items:flex-end;justify-content:space-between;
-border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:22px}
-.brand{font-size:26px;letter-spacing:.5em;font-weight:700;
-color:var(--accent);text-shadow:0 0 18px var(--glow)}
-.brand small{display:block;font-size:9px;letter-spacing:.35em;color:var(--dim);
-text-shadow:none;font-weight:400;margin-top:4px}
-.status{text-align:right;font-size:10px;letter-spacing:.18em;color:var(--dim);text-transform:uppercase}
-.status #clock{color:var(--accent2);font-size:18px;letter-spacing:.1em;display:block;margin-bottom:3px}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#6fae6f;
-margin-right:6px;box-shadow:0 0 8px #6fae6f;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-/* HUD panels with corner brackets */
-.panel{position:relative;background:linear-gradient(180deg,rgba(255,255,255,.012),transparent);
-border:1px solid var(--line);padding:16px 18px;margin-bottom:18px}
-.panel::before,.panel::after{content:"";position:absolute;width:14px;height:14px;
-border:2px solid var(--accent)}
+body{margin:0;color:var(--fg);background:var(--bg);
+font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;min-height:100vh}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:50;
+background:repeating-linear-gradient(rgba(0,0,0,0) 0 2px,rgba(0,0,0,.16) 2px 3px)}
+.wrap{max-width:1340px;margin:0 auto;padding:16px 20px 32px;position:relative;z-index:1}
+/* top bar */
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;
+border-bottom:1px solid var(--line);padding-bottom:10px}
+.brand{font-size:22px;letter-spacing:.42em;font-weight:700;color:var(--accent);
+text-shadow:0 0 16px var(--glow);white-space:nowrap}
+.brand small{display:block;font-size:8px;letter-spacing:.3em;color:var(--dim);
+text-shadow:none;font-weight:400;margin-top:3px}
+.statusbar{flex:1;text-align:center;font-size:10px;letter-spacing:.28em;color:var(--dim);text-transform:uppercase}
+.statusbar b{color:var(--accent2);font-weight:400}
+.statusbar .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#6fae6f;
+margin:0 4px 0 14px;box-shadow:0 0 7px #6fae6f;animation:pulse 2s infinite;vertical-align:middle}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+#clock{font-size:22px;letter-spacing:.08em;color:var(--accent2);
+text-shadow:0 0 12px var(--glow);white-space:nowrap}
+#clock small{font-size:11px;color:var(--dim);text-shadow:none}
+/* 3-column cockpit */
+.cols{display:grid;grid-template-columns:1fr 1.45fr 1fr;gap:14px;margin-top:14px}
+@media(max-width:1000px){.cols{grid-template-columns:1fr}}
+.col{display:flex;flex-direction:column;gap:14px}
+.panel{position:relative;border:1px solid var(--line);padding:13px 14px;background:rgba(255,255,255,.01)}
+.panel::before,.panel::after{content:"";position:absolute;width:11px;height:11px;border:1px solid var(--accent);opacity:.8}
 .panel::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
 .panel::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
-.ptitle{font-size:10px;letter-spacing:.3em;color:var(--accent);text-transform:uppercase;
-margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.ptitle::before{content:"▸"}
-.ptitle::after{content:"";flex:1;height:1px;background:var(--line)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.tile{border:1px solid var(--line);padding:14px;background:rgba(255,255,255,.015);position:relative}
-.tile::before{content:"";position:absolute;top:6px;left:6px;width:6px;height:6px;
-border-top:1px solid var(--accent);border-left:1px solid var(--accent);opacity:.6}
-.tile .k{color:var(--dim);font-size:9px;letter-spacing:.18em;text-transform:uppercase}
-.tile .v{font-size:30px;margin-top:8px;color:var(--accent2);text-shadow:0 0 12px var(--glow)}
-.tile .v small{font-size:11px;color:var(--dim);text-shadow:none}
-.accent{color:var(--accent)}
-/* claude ring gauge */
-.ring{display:flex;align-items:center;gap:14px}
-.gauge{width:62px;height:62px;border-radius:50%;flex:0 0 62px;display:grid;place-items:center}
-.hole{width:48px;height:48px;border-radius:50%;background:var(--panel);display:grid;place-items:center;
-font-size:14px;color:var(--accent2);text-shadow:0 0 10px var(--glow)}
-.deck{display:flex;flex-wrap:wrap;gap:10px}
-button{background:rgba(210,104,63,.06);color:var(--fg);border:1px solid var(--line);
-padding:11px 18px;font:inherit;cursor:pointer;letter-spacing:.05em;transition:.15s;position:relative}
-button:hover{border-color:var(--accent);color:var(--accent2);
-box-shadow:0 0 14px var(--glow);background:rgba(210,104,63,.12)}
+.ptitle{font-size:9px;letter-spacing:.32em;color:var(--accent);text-transform:uppercase;
+margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.ptitle::before{content:"▸"}.ptitle::after{content:"";flex:1;height:1px;background:var(--line)}
+/* vitals rows */
+.stat{display:flex;align-items:baseline;justify-content:space-between;
+padding:9px 0;border-bottom:1px solid var(--line)}
+.stat:last-child{border-bottom:0}
+.stat .k{font-size:9px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+.stat .v{font-size:23px;color:var(--fg);text-shadow:0 0 10px var(--glow)}
+.stat .d{font-size:10px;color:var(--accent2)}
+.bar{height:4px;background:var(--line);margin-top:7px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--glow)}
+.srcrow{display:flex;justify-content:space-between;font-size:11px;padding:5px 0;color:var(--dim)}
+.srcrow b{color:var(--fg);font-weight:400}
+/* center reactor */
+.center{position:relative;border:1px solid var(--line);background:#000;min-height:520px;overflow:hidden}
+.center::before,.center::after{content:"";position:absolute;width:13px;height:13px;border:1px solid var(--accent);opacity:.8;z-index:3}
+.center::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
+.center::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
+#net{position:absolute;inset:0;width:100%;height:100%}
+.cdir{position:absolute;top:14px;left:0;right:0;text-align:center;z-index:2;
+font-size:9px;letter-spacing:.3em;color:var(--accent);text-transform:uppercase}
+.bignum{position:absolute;bottom:64px;left:0;right:0;text-align:center;z-index:2}
+.bignum b{font-size:52px;font-weight:700;color:#fff;text-shadow:0 0 30px var(--glow);letter-spacing:.03em}
+.bignum span{display:block;font-size:9px;letter-spacing:.45em;color:var(--dim);margin-top:6px}
+.cfoot{position:absolute;bottom:16px;left:0;right:0;text-align:center;z-index:2;
+font-size:9px;letter-spacing:.18em;color:var(--dim)}
+/* command deck */
+.deck{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{display:flex;align-items:center;gap:8px;background:rgba(210,104,63,.05);color:var(--fg);
+border:1px solid var(--line);padding:9px 11px;font:inherit;font-size:11px;cursor:pointer;
+letter-spacing:.04em;transition:.14s;text-align:left}
+button:hover{border-color:var(--accent);color:var(--accent2);background:rgba(210,104,63,.13);box-shadow:0 0 12px var(--glow)}
 button:active{transform:translateY(1px)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
-td:first-child{color:var(--fg)}td{color:var(--dim)}
-th{color:var(--accent);font-weight:400;font-size:9px;letter-spacing:.15em;text-transform:uppercase}
-tr:hover td{background:rgba(210,104,63,.04)}
-.job{font-size:12px;padding:7px 8px;border-bottom:1px solid var(--line)}
+button .g{color:var(--accent);font-size:10px}
+.job{font-size:11px;padding:6px 0;border-bottom:1px solid var(--line)}
+.job:last-child{border-bottom:0}
 .run{color:var(--accent2)}.done{color:#6fae6f}.fail{color:#c4564a}
-.foot{color:var(--dim);font-size:9px;letter-spacing:.1em;margin-top:18px;text-align:right}
+.jtail{color:var(--dim);font-size:10px;white-space:pre-wrap;margin-top:3px;max-height:60px;overflow:hidden}
+/* telemetry table */
+table{width:100%;border-collapse:collapse;font-size:11px}
+td,th{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+td:first-child{color:var(--fg)}td{color:var(--dim)}
+th{color:var(--accent);font-weight:400;font-size:9px;letter-spacing:.14em;text-transform:uppercase}
+tr:hover td{background:rgba(210,104,63,.04)}
+.foot{color:var(--dim);font-size:9px;letter-spacing:.1em;margin-top:14px;text-align:right}
 </style></head><body><div class=wrap>
 <header>
  <div class=brand>V.A.U.L.T.<small>VITALS · AGENTS · UPLINK · LEDGER · TELEMETRY</small></div>
- <div class=status><span id=clock>--:--:--</span>
-  <div><span class=dot></span>SYSTEM ONLINE</div>
-  <div id=sub>3SK FINANCE · COMMAND CENTER</div></div>
+ <div class=statusbar id=statusbar>● CORE<span class=dot></span>ONLINE · LINK · HUMAN · ALIVE</div>
+ <div id=clock>--:--:--</div>
 </header>
-<section class=panel><div class=ptitle>Channel vitals</div><div class=grid id=tiles></div></section>
-<section class=panel><div class=ptitle>Command deck</div><div class=deck id=deck></div></section>
-<section class=panel><div class=ptitle>Job queue</div><div id=jobs></div></section>
-<section class=panel><div class=ptitle>Video telemetry</div>
+<div class=cols>
+ <div class=col>
+  <section class=panel><div class=ptitle>System vitals</div><div id=vitals></div></section>
+  <section class=panel><div class=ptitle>Traffic sources</div><div id=sources></div></section>
+ </div>
+ <div class=center>
+  <div class=cdir id=cdir>Primary directive · road to —</div>
+  <canvas id=net></canvas>
+  <div class=bignum><b id=bigsubs>—</b><span>Subscribers</span></div>
+  <div class=cfoot id=cfoot></div>
+ </div>
+ <div class=col>
+  <section class=panel><div class=ptitle>Command deck</div><div class=deck id=deck></div></section>
+  <section class=panel><div class=ptitle>Job queue</div><div id=jobs></div></section>
+ </div>
+</div>
+<section class=panel style=margin-top:14px><div class=ptitle>Video telemetry</div>
 <table id=vids><thead><tr><th>Title</th><th>Views</th><th>CTR</th>
-<th>Avg %</th><th>AVD</th><th>Subs+</th><th>Likes</th></tr></thead><tbody></tbody></table></section>
+<th>Avg %</th><th>AVD</th><th>Subs+</th><th>Likes</th><th>Comments</th></tr></thead><tbody></tbody></table></section>
 <div class=foot id=foot></div></div>
 <script>
 async function j(u,o){return (await fetch(u,o)).json()}
 function esc(s){return String(s).replace(/</g,'&lt;')}
-function tile(k,v,s){return `<div class=tile><div class=k>${k}</div>
-<div class=v>${v}${s?` <small>${s}</small>`:''}</div></div>`}
-function ring(c){
- const p=c.pct==null?0:c.pct;
- const sub=c.spend_usd==null?'DB N/A':`$${c.spend_usd} / $${c.cap_usd}`;
- return `<div class="tile ring">
-  <div class=gauge style="background:conic-gradient(var(--accent) ${p*3.6}deg,var(--line) 0)">
-   <div class=hole>${c.pct==null?'n/a':p+'%'}</div></div>
-  <div><div class=k>Claude window</div><div style="font-size:11px;color:var(--dim);margin-top:6px">${sub}</div></div>
- </div>`;
-}
-function clock(){document.getElementById('clock').textContent=
- new Date().toLocaleTimeString([],{hour12:false})}
+function nf(n){return n==null?'n/a':n.toLocaleString()}
+function stat(k,v,d){return `<div class=stat><div><div class=k>${k}</div>${d||''}</div>
+ <div class=v>${v}</div></div>`}
+function milestone(n){if(n==null)return 1000;
+ const steps=[100,250,500,1000,2500,5000,10000,25000,50000,100000,250000,1000000];
+ for(const s of steps)if(n<s)return s; return Math.ceil(n/1e6)*1e6}
+function fmtK(n){return n>=1000?(n%1000?(n/1000).toFixed(1):n/1000)+'K':n}
 async function vitals(){
  const d=await j('/api/vitals');const c=d.claude||{};
- document.getElementById('tiles').innerHTML=
-  tile('Total views',d.total_views)+
-  tile('Subscribers',d.subscribers==null?'n/a':d.subscribers,
-       d.subs_gained!=null?`${d.subs_gained>=0?'+':''}${d.subs_gained} window`:'')+
-  tile('Videos',d.video_count)+
-  tile('Likes',d.total_likes)+
-  tile('Comments',d.total_comments)+
-  tile('Top source',`<span style="font-size:15px">${esc(d.top_source)}</span>`)+
-  ring(c);
- document.getElementById('sub').textContent=
-  `3SK FINANCE · PULL ${d.pull_date||'—'}`+
-  (d.pull_age_days!=null?` (${d.pull_age_days}D OLD)`:'');
+ const spend=c.spend_usd==null?'DB N/A':`$${c.spend_usd} / $${c.cap_usd}`;
+ const cpct=c.pct==null?0:c.pct;
+ document.getElementById('vitals').innerHTML=
+  stat('YT Subscribers',nf(d.subscribers),
+    d.subs_gained!=null?`<div class=d>${d.subs_gained>=0?'+':''}${d.subs_gained} /window</div>`:'')+
+  stat('Total views',nf(d.total_views))+
+  stat('Videos live',nf(d.video_count))+
+  stat('Latest video',(d.videos&&d.videos[0])?nf(d.videos[0].views):'n/a',
+    (d.videos&&d.videos[0])?`<div class=d>${esc(d.videos[0].ctr)} CTR</div>`:'')+
+  `<div class=stat><div style=width:100%><div class=k>Claude $ / window</div>
+    <div class=bar><i style=width:${cpct}%></i></div></div>
+    <div class=v style=margin-left:12px>${c.pct==null?'n/a':cpct+'%'}</div></div>
+   <div style=font-size:9px;color:var(--dim);text-align:right;margin-top:4px>${spend}</div>`;
+ document.getElementById('sources').innerHTML=(d.sources||[]).length?
+  d.sources.map(s=>`<div class=srcrow><span>${esc(s.src)}</span><b>${nf(s.views)}</b></div>`).join('')
+  :'<div style=color:var(--dim)>no traffic data</div>';
+ const goal=milestone(d.subscribers);
+ document.getElementById('cdir').textContent=`Primary directive · road to ${fmtK(goal)} subs`;
+ document.getElementById('bigsubs').textContent=nf(d.subscribers);
+ document.getElementById('cfoot').textContent=
+  `3SK FINANCE · PULL ${d.pull_date||'—'}`+(d.pull_age_days!=null?` (${d.pull_age_days}D OLD)`:'')
+  +` · WINDOW ${d.window||'—'}`;
+ document.getElementById('statusbar').innerHTML=
+  `● CORE<span class=dot></span>ONLINE · LINK · <b>${nf(d.subscribers)}</b> SUBS · ALIVE`;
  document.querySelector('#vids tbody').innerHTML=(d.videos||[]).map(v=>
   `<tr><td>${esc(v.title)}</td><td>${v.views}</td><td>${esc(v.ctr)}</td>
-   <td>${esc(v.avg_pct)}</td><td>${esc(v.avd)}</td><td>${v.subs}</td><td>${v.likes}</td></tr>`).join('');
+   <td>${esc(v.avg_pct)}</td><td>${esc(v.avd)}</td><td>${v.subs}</td><td>${v.likes}</td><td>${v.comments}</td></tr>`).join('');
  document.getElementById('foot').textContent='SOURCE: '+(d.source||'no pull file');
 }
+/* command deck */
 const DECK=%DECK%;
 document.getElementById('deck').innerHTML=DECK.map(b=>
- `<button onclick="fire('${b.key}')">${b.label}</button>`).join('');
+ `<button onclick="fire('${b.key}')"><span class=g>▸</span>${esc(b.label)}</button>`).join('');
 async function fire(k){await j('/api/fire',{method:'POST',
  headers:{'content-type':'application/json'},body:JSON.stringify({key:k})});jobs()}
 async function jobs(){
  const js=await j('/api/jobs');
  document.getElementById('jobs').innerHTML=js.length?js.map(g=>{
   const cls=g.status=='running'?'run':g.status=='done'?'done':'fail';
-  return `<div class=job><span class=${cls}>[${g.status}]</span> ${g.label}
-   <span style=color:#6b6f76>· ${g.started}${g.ended?' → '+g.ended:''}</span>
-   ${g.tail?`<div style=color:#6b6f76;font-size:11px;white-space:pre-wrap;margin-top:4px>${g.tail.replace(/</g,'&lt;')}</div>`:''}</div>`
- }).join(''):'<div style=color:#6b6f76>no jobs yet</div>';
+  return `<div class=job><span class=${cls}>[${g.status}]</span> ${esc(g.label)}
+   <span style=color:var(--dim)>· ${g.started}${g.ended?' → '+g.ended:''}</span>
+   ${g.tail?`<div class=jtail>${g.tail.replace(/</g,'&lt;')}</div>`:''}</div>`
+ }).join(''):'<div style=color:var(--dim)>no jobs yet — fire a command</div>';
 }
+/* reactor: center-clustered particle network */
+const cv=document.getElementById('net'),cx=cv.getContext('2d');let W,H,nodes;
+function initNet(){const r=cv.getBoundingClientRect();W=cv.width=r.width;H=cv.height=r.height;
+ const N=Math.max(40,Math.min(110,Math.floor(W*H/7000)));
+ nodes=Array.from({length:N},()=>{const a=Math.random()*6.283,
+  rad=Math.pow(Math.random(),.62)*Math.min(W,H)*0.43;
+  return {x:W/2+Math.cos(a)*rad,y:H/2+Math.sin(a)*rad,
+   vx:(Math.random()-.5)*.22,vy:(Math.random()-.5)*.22}})}
+function drawNet(){if(!W)return;cx.clearRect(0,0,W,H);
+ const g=cx.createRadialGradient(W/2,H/2,0,W/2,H/2,Math.min(W,H)*0.5);
+ g.addColorStop(0,'rgba(210,104,63,.16)');g.addColorStop(1,'rgba(0,0,0,0)');
+ cx.fillStyle=g;cx.fillRect(0,0,W,H);
+ for(let i=0;i<nodes.length;i++){const a=nodes[i];a.x+=a.vx;a.y+=a.vy;
+  if(a.x<0||a.x>W)a.vx*=-1;if(a.y<0||a.y>H)a.vy*=-1;
+  for(let k=i+1;k<nodes.length;k++){const b=nodes[k],dx=a.x-b.x,dy=a.y-b.y,
+   dd=Math.hypot(dx,dy);if(dd<88){cx.strokeStyle='rgba(210,104,63,'+(.13*(1-dd/88))+')';
+   cx.beginPath();cx.moveTo(a.x,a.y);cx.lineTo(b.x,b.y);cx.stroke();}}}
+ cx.shadowColor='rgba(240,168,120,.9)';cx.shadowBlur=6;cx.fillStyle='rgba(240,168,120,.95)';
+ for(const a of nodes){cx.beginPath();cx.arc(a.x,a.y,1.4,0,6.283);cx.fill();}
+ cx.shadowBlur=0;requestAnimationFrame(drawNet)}
+function clock(){const t=new Date();
+ document.getElementById('clock').innerHTML=t.toLocaleTimeString([],{hour12:false})
+  +` <small>${String(t.getMilliseconds()).padStart(3,'0').slice(0,2)}</small>`}
+initNet();drawNet();addEventListener('resize',initNet);
 clock();vitals();jobs();
-setInterval(clock,1000);setInterval(vitals,15000);setInterval(jobs,4000);
+setInterval(clock,80);setInterval(vitals,15000);setInterval(jobs,4000);
 </script></body></html>"""
 
 
