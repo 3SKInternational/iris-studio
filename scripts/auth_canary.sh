@@ -131,6 +131,15 @@ _has() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac ; }
 # two overlapping instances could both observe the same transition and double-send
 # the alert. mkdir is atomic, so it is a clean mutex. Fail-OPEN is NOT wanted here
 # (a duplicate run is only cosmetic spam) — if the lock is held, just skip.
+# Break a lock orphaned by a hard kill / panic / power-loss mid-run — the EXIT
+# trap can't fire then, and the lockdir lives on the internal disk so it survives
+# reboot. A legitimate run holds the lock <~90s (AUTH_TIMEOUT caps the only slow
+# step at 60s), so a lock older than 10 min is certainly dead. Clearing it stops an
+# orphaned lock from silently darking the canary forever (the very silent-failure
+# class this canary exists to prevent).
+if [ -d "$LOCK_DIR" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null && log "cleared a stale lock (orphaned >10m by a killed run)."
+fi
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     log "another instance holds the lock — skipping this invocation."
     exit 0
