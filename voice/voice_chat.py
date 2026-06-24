@@ -24,6 +24,9 @@ import numpy as np
 SR = 16000                      # mic sample rate (whisper wants 16k)
 TTS_SR = 24000                  # kokoro output rate
 WHISPER_MODEL = os.environ.get("IRIS_WHISPER", "base.en")
+# Kokoro voice. First letter = accent (a=US, b=UK), second = gender (f/m).
+# Default bf_emma = UK female. Other UK women: bf_isabella, bf_alice, bf_lily.
+VOICE = os.environ.get("IRIS_VOICE", "bf_emma")
 OLLAMA_MODEL = os.environ.get("IRIS_OLLAMA", "llama3.2:3b")
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 CLAUDE_CLI = os.environ.get("CLAUDE_CLI_PATH", "/opt/homebrew/bin/claude")
@@ -129,7 +132,7 @@ def record_utterance(sd) -> np.ndarray | None:
 
 
 def speak(sd, tts, text: str) -> None:
-    for chunk in tts(text, voice="af_heart"):
+    for chunk in tts(text, voice=VOICE):
         sd.play(chunk[2], TTS_SR)
         sd.wait()
 
@@ -174,7 +177,7 @@ def main() -> int:
 
     print(f"Loading STT={WHISPER_MODEL} TTS=kokoro brain={OLLAMA_MODEL}/claude …")
     stt = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    tts = KPipeline(lang_code="a")
+    tts = KPipeline(lang_code=VOICE[0])     # 'b' = British phonemization
     agents = agent_names()
     session = str(uuid.uuid4())
     first_claude = True
