@@ -1616,17 +1616,6 @@ async def get_today_stats() -> dict:
         }
 
 
-async def is_tier4_capped() -> bool:
-    """Return True if today's Tier 4 spend has reached or exceeded the daily cap.
-
-    Used by future Pitch #16 full (auto-fallback to Tier 4) to refuse calls
-    once the daily safety net is breached. Today this function returns False
-    because no Tier 4 calls fire (OAuth path handles everything).
-    """
-    stats = await get_today_stats()
-    return stats["tier4_spend_usd"] >= DAILY_TIER4_CAP_USD
-
-
 # ============================================================
 # Phase 5 (P5-2) — Multi-agent dispatcher
 # Implements the locked Interface Contract:
@@ -1737,25 +1726,6 @@ def _update_expense_run_sync(run_id: str, fields: dict) -> None:
         conn.execute(
             f"UPDATE expense_categorizer_runs SET {cols} WHERE id = ?", vals
         )
-
-
-def _get_expense_run_sync(run_id: str) -> dict | None:
-    with _db() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM expense_categorizer_runs WHERE id = ?", (run_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def _get_last_expense_run_until_sync() -> str | None:
-    """Most recent run's until_date (any status). Used to pick the next since."""
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT until_date FROM expense_categorizer_runs "
-            "ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row else None
 
 
 def _list_processed_msg_ids_sync(limit: int = 500) -> list[str]:
@@ -3038,7 +3008,7 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
         )
 
 
-async def _run_dispatch(d_id, agent_name, prompt, chat_id, expected_minutes,
+async def _run_dispatch(d_id, agent_name, prompt, chat_id,
                         autonomous_label=None):
     """Background task: acquire a slot, spawn the subagent, wait with timeout,
     detect the deliverable, notify Steve. Never raises (logs + notifies).
@@ -3154,7 +3124,7 @@ async def _start_dispatch(agent_name, prompt, chat_id, expected, *,
     # Fire-and-forget: the loop stays unblocked; the task captures the current
     # context (incl. chat_id) at creation.
     asyncio.create_task(
-        _run_dispatch(d_id, agent_name, prompt, chat_id_str, expected, autonomous_label)
+        _run_dispatch(d_id, agent_name, prompt, chat_id_str, autonomous_label)
     )
     return {"dispatch_id": d_id, "queued": queued, "expected_turnaround_minutes": expected}
 

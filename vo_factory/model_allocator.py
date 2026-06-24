@@ -33,7 +33,6 @@ import json
 import math
 import os
 import re
-import sys
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -169,7 +168,6 @@ def choose_model(text: str, state: dict, cfg: dict) -> Decision:
     fb = a["fallback_model"]
     score = classify_script(text, cfg)["score"]
     v2_cost = estimate_credits(text, "v2", cfg)
-    fb_cost = estimate_credits(text, fb, cfg)
     budget = usable_budget(cfg)
     used = state["credits_used"]
 

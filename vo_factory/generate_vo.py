@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch voice-over generator for the 3SK video factory (Build E1).
+r"""Batch voice-over generator for the 3SK video factory (Build E1).
 
 VO kit (markdown) in -> one scene mp3 out per kit block, via the ElevenLabs
 text-to-speech API. The upstream sibling of image_factory (prompts -> PNGs) and

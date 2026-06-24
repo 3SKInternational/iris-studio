@@ -884,11 +884,9 @@ def _selftest() -> int:
     """Self-contained tests using a temp sandbox (no real vault writes)."""
     import unittest
 
-    global VAULT, AGENTS_DIR, ALLOWED_STANDARDS, ADAPT_DIR, QUEUE_DIR, APPLIED_DIR, REJECTED_DIR, LOG_FILE
-
     class T(unittest.TestCase):
         def setUp(self):
-            global VAULT, AGENTS_DIR, ALLOWED_STANDARDS, ADAPT_DIR, QUEUE_DIR, APPLIED_DIR, REJECTED_DIR, LOG_FILE
+            global AGENTS_DIR, ALLOWED_STANDARDS, ADAPT_DIR, QUEUE_DIR, APPLIED_DIR, REJECTED_DIR, LOG_FILE
             self.tmp = Path(tempfile.mkdtemp())
             AGENTS_DIR = (self.tmp / "agents").resolve()
             AGENTS_DIR.mkdir()

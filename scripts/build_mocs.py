@@ -305,7 +305,7 @@ def main() -> int:
             for m in sorted(by_kind[kind]):
                 lines.append(f"- {wikilink(m)}")
             lines.append("")
-        lines.append(f"_Linked from [[_MAP/Vault_MOC|Vault MOC]]._")
+        lines.append("_Linked from [[_MAP/Vault_MOC|Vault MOC]]._")
         content = "\n".join(lines).rstrip() + "\n"
         if safe_write(vault, rel_hub, content, args.dry_run):
             gen_video.append(rel_hub)
@@ -343,7 +343,7 @@ def main() -> int:
         for m in members:
             lines.append(f"- {wikilink(m)}")
         lines.append("")
-        lines.append(f"_Linked from [[_MAP/Vault_MOC|Vault MOC]]._")
+        lines.append("_Linked from [[_MAP/Vault_MOC|Vault MOC]]._")
         content = "\n".join(lines).rstrip() + "\n"
         if safe_write(vault, rel_moc, content, args.dry_run):
             gen_folder.append(rel_moc)

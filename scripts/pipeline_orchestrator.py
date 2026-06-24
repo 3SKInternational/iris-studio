@@ -386,12 +386,6 @@ def effective_status(key: str, stages: dict) -> str:
     return "blocked"
 
 
-def deps_max_completed(key: str, stages: dict) -> float | None:
-    ts = [parse_iso(stages.get(d, {}).get("completed_at")) for d in stages[key].get("deps", [])]
-    ts = [t for t in ts if t is not None]
-    return max(ts) if ts else None
-
-
 def deps_freshness_threshold(key: str, stages: dict) -> tuple[float | None, bool]:
     """Freshness threshold for an auto-promotion freshness check, plus a fail-closed
     flag. Returns (threshold, deps_incomplete):
@@ -1186,7 +1180,7 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
 
 # === Stage-3 VO-kit review (vo-reviewer) — reviewed auto-promote, render manual ===
 def vo_kit_rel(video: int) -> str:
-    """The billed VO kit — the EXACT markdown generate_vo.py parses into scene mp3s
+    r"""The billed VO kit — the EXACT markdown generate_vo.py parses into scene mp3s
     (`## Scene N -> \`Video_NN_VO_Scene_MM.mp3\``). This is the truest text to gate,
     so vo-reviewer reviews THIS, not the script or the expanded prose draft."""
     return f"{VAULT_REL}/Voice_Files/Video_{nn(video)}/_VO_Session_B_Kit.md"
@@ -1931,7 +1925,6 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
         die(str(e))
     key = "5_images"
     s = stages[key]
-    eff = effective_status(key, stages)
     if s.get("status") == "done":
         line = f"Video {video}: stage 5 (images) already done — nothing to spend on."
         print(line)

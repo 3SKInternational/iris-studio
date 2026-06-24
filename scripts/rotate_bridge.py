@@ -187,7 +187,7 @@ def main():
         print(f"  entries total : {len(entries)}  -> keep {len(live)} live, move {len(move)} to archive")
         print(f"  bridge bytes  : {size} -> {_b(new_bridge)}")
         print(f"  archive bytes : {_b(arch)} -> {_b(new_arch)}")
-        print(f"  conservation  : OK (preamble + moved + live == original)")
+        print("  conservation  : OK (preamble + moved + live == original)")
         print(f"  first KEPT    : {first_kept}")
         print(f"  last MOVED    : {last_moved}")
         return 0

@@ -17,7 +17,6 @@ Output is consumed by `routines/pre-brief.prompt` Pass 12.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from dataclasses import dataclass
