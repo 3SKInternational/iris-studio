@@ -9,8 +9,14 @@ HARD RULES (read before doing anything):
 - NEVER fabricate a signal to manufacture a proposal. If no signal clears the proposer's bar, ZERO proposals is the correct, successful outcome — a clean no-op week is a SUCCESS, not a failure.
 - This routine is read-only against the vault except for: the proposal files (written by the proposer agent it dispatches) and your one daily-note line. Do not delete or move any file.
 
+PASS 0 — COMPUTE THE OUTCOME HISTORY (the loop's memory — do this BEFORE dispatching):
+  The proposer has no Bash, so run the loop's own track record here and paste it into its brief. This is what stops the loop re-proposing an edit it has already tried and lost on.
+      cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --meta --json
+  The deterministic core groups every tagged outcome by target + signal-source class, gives each group a hit-rate (improved ÷ decisive), and flags repeated-failure groups (≥2 decisive, hit-rate ≤ 1/3). Capture the JSON verbatim for PASS 1. If it errors or returns empty groups (no tagged outcomes yet — normal pre-launch), note that and pass an empty history — the proposer falls back to signals-only, which is correct early on.
+
 PASS 1 — DISPATCH THE PROPOSER:
   Invoke the `adaptation-proposer` subagent. Brief it explicitly:
+    - OUTCOME HISTORY: paste the PASS 0 `--meta --json` output verbatim into the brief, labeled as the loop's outcome track record. Tell it to consult this BEFORE drafting — do NOT re-propose a producer-edit against a target/signal-class flagged repeated-failure (that's a canon root-cause for the monthly canon-reviewer, not another producer tweak); prefer change patterns that previously tagged `improved`, citing the prior outcome. If PASS 0 produced no history, say so.
     - SCOPE: a weekly adaptation scan. Read the recent LEARNS signals (Analytics/*.md, Channel_Intelligence/*.md, Image_Factory/_REVIEW/*.md, Scripts/_REVIEW_PREP/*_Review.md, *_lint.md) and, for each pattern backed by a real cited signal that clears its bar, draft ONE surgical proposal to QUEUE DIR. Cap 5 per run.
     - OUTPUT: proposal files under QUEUE DIR per its contract, plus its stdout summary (count + ids + targets + one-line summaries + a final `status:` line).
   After it returns, read its stdout `status:` line:
