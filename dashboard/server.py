@@ -223,8 +223,8 @@ def build_app():
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>V.A.U.L.T.</title><style>
-:root{--bg:#050608;--fg:#d8d4cb;--dim:#5f636b;--accent:#d2683f;--accent2:#f0a878;
---line:#191c21;--glow:rgba(210,104,63,.5)}
+:root{--bg:#040605;--fg:#d3d8cf;--dim:#586057;--accent:#8df06a;--accent2:#c7ff9f;
+--line:#161a16;--glow:rgba(141,240,106,.45)}
 *{box-sizing:border-box}
 body{margin:0;color:var(--fg);background:var(--bg);
 font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;min-height:100vh}
@@ -234,8 +234,8 @@ background:repeating-linear-gradient(rgba(0,0,0,0) 0 2px,rgba(0,0,0,.16) 2px 3px
 /* top bar */
 header{display:flex;align-items:center;justify-content:space-between;gap:16px;
 border-bottom:1px solid var(--line);padding-bottom:10px}
-.brand{font-size:22px;letter-spacing:.42em;font-weight:700;color:var(--accent);
-text-shadow:0 0 16px var(--glow);white-space:nowrap}
+.brand{font-size:22px;letter-spacing:.42em;font-weight:700;color:#eef2ea;
+text-shadow:0 0 10px rgba(141,240,106,.18);white-space:nowrap}
 .brand small{display:block;font-size:8px;letter-spacing:.3em;color:var(--dim);
 text-shadow:none;font-weight:400;margin-top:3px}
 .statusbar{flex:1;text-align:center;font-size:10px;letter-spacing:.28em;color:var(--dim);text-transform:uppercase}
@@ -243,8 +243,8 @@ text-shadow:none;font-weight:400;margin-top:3px}
 .statusbar .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#6fae6f;
 margin:0 4px 0 14px;box-shadow:0 0 7px #6fae6f;animation:pulse 2s infinite;vertical-align:middle}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-#clock{font-size:22px;letter-spacing:.08em;color:var(--accent2);
-text-shadow:0 0 12px var(--glow);white-space:nowrap}
+#clock{font-size:22px;letter-spacing:.08em;color:#eef2ea;
+text-shadow:0 0 8px rgba(141,240,106,.16);white-space:nowrap}
 #clock small{font-size:11px;color:var(--dim);text-shadow:none}
 /* 3-column cockpit */
 .cols{display:grid;grid-template-columns:1fr 1.45fr 1fr;gap:14px;margin-top:14px}
@@ -254,9 +254,9 @@ text-shadow:0 0 12px var(--glow);white-space:nowrap}
 .panel::before,.panel::after{content:"";position:absolute;width:11px;height:11px;border:1px solid var(--accent);opacity:.8}
 .panel::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
 .panel::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
-.ptitle{font-size:9px;letter-spacing:.32em;color:var(--accent);text-transform:uppercase;
+.ptitle{font-size:9px;letter-spacing:.32em;color:#9aa39a;text-transform:uppercase;
 margin-bottom:12px;display:flex;align-items:center;gap:8px}
-.ptitle::before{content:"▸"}.ptitle::after{content:"";flex:1;height:1px;background:var(--line)}
+.ptitle::before{content:"▸";color:var(--accent)}.ptitle::after{content:"";flex:1;height:1px;background:var(--line)}
 /* vitals rows */
 .stat{display:flex;align-items:baseline;justify-content:space-between;
 padding:9px 0;border-bottom:1px solid var(--line)}
@@ -274,19 +274,19 @@ padding:9px 0;border-bottom:1px solid var(--line)}
 .center::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
 .center::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
 #net{position:absolute;inset:0;width:100%;height:100%}
-.cdir{position:absolute;top:14px;left:0;right:0;text-align:center;z-index:2;
-font-size:9px;letter-spacing:.3em;color:var(--accent);text-transform:uppercase}
-.bignum{position:absolute;bottom:64px;left:0;right:0;text-align:center;z-index:2}
+.cdir{position:absolute;bottom:120px;left:0;right:0;text-align:center;z-index:2;
+font-size:9px;letter-spacing:.3em;color:#9aa39a;text-transform:uppercase}
+.bignum{position:absolute;bottom:54px;left:0;right:0;text-align:center;z-index:2}
 .bignum b{font-size:52px;font-weight:700;color:#fff;text-shadow:0 0 30px var(--glow);letter-spacing:.03em}
 .bignum span{display:block;font-size:9px;letter-spacing:.45em;color:var(--dim);margin-top:6px}
 .cfoot{position:absolute;bottom:16px;left:0;right:0;text-align:center;z-index:2;
 font-size:9px;letter-spacing:.18em;color:var(--dim)}
 /* command deck */
 .deck{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-button{display:flex;align-items:center;gap:8px;background:rgba(210,104,63,.05);color:var(--fg);
+button{display:flex;align-items:center;gap:8px;background:rgba(141,240,106,.04);color:var(--fg);
 border:1px solid var(--line);padding:9px 11px;font:inherit;font-size:11px;cursor:pointer;
 letter-spacing:.04em;transition:.14s;text-align:left}
-button:hover{border-color:var(--accent);color:var(--accent2);background:rgba(210,104,63,.13);box-shadow:0 0 12px var(--glow)}
+button:hover{border-color:var(--accent);color:var(--accent2);background:rgba(141,240,106,.12);box-shadow:0 0 12px var(--glow)}
 button:active{transform:translateY(1px)}
 button .g{color:var(--accent);font-size:10px}
 .job{font-size:11px;padding:6px 0;border-bottom:1px solid var(--line)}
@@ -298,12 +298,12 @@ table{width:100%;border-collapse:collapse;font-size:11px}
 td,th{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
 td:first-child{color:var(--fg)}td{color:var(--dim)}
 th{color:var(--accent);font-weight:400;font-size:9px;letter-spacing:.14em;text-transform:uppercase}
-tr:hover td{background:rgba(210,104,63,.04)}
+tr:hover td{background:rgba(141,240,106,.04)}
 .foot{color:var(--dim);font-size:9px;letter-spacing:.1em;margin-top:14px;text-align:right}
 </style></head><body><div class=wrap>
 <header>
  <div class=brand>V.A.U.L.T.<small>VITALS · AGENTS · UPLINK · LEDGER · TELEMETRY</small></div>
- <div class=statusbar id=statusbar>● CORE<span class=dot></span>ONLINE · LINK · HUMAN · ALIVE</div>
+ <div class=statusbar id=statusbar>CORE · IDLE · LINK<span class=dot></span>ONLINE · RUNNER · ALIVE</div>
  <div id=clock>--:--:--</div>
 </header>
 <div class=cols>
@@ -361,7 +361,7 @@ async function vitals(){
   `3SK FINANCE · PULL ${d.pull_date||'—'}`+(d.pull_age_days!=null?` (${d.pull_age_days}D OLD)`:'')
   +` · WINDOW ${d.window||'—'}`;
  document.getElementById('statusbar').innerHTML=
-  `● CORE<span class=dot></span>ONLINE · LINK · <b>${nf(d.subscribers)}</b> SUBS · ALIVE`;
+  `CORE · IDLE · LINK<span class=dot></span>ONLINE · <b>${nf(d.subscribers)}</b> SUBS · ALIVE`;
  document.querySelector('#vids tbody').innerHTML=(d.videos||[]).map(v=>
   `<tr><td>${esc(v.title)}</td><td>${v.views}</td><td>${esc(v.ctr)}</td>
    <td>${esc(v.avg_pct)}</td><td>${esc(v.avd)}</td><td>${v.subs}</td><td>${v.likes}</td><td>${v.comments}</td></tr>`).join('');
@@ -392,14 +392,14 @@ function initNet(){const r=cv.getBoundingClientRect();W=cv.width=r.width;H=cv.he
    vx:(Math.random()-.5)*.22,vy:(Math.random()-.5)*.22}})}
 function drawNet(){if(!W)return;cx.clearRect(0,0,W,H);
  const g=cx.createRadialGradient(W/2,H/2,0,W/2,H/2,Math.min(W,H)*0.5);
- g.addColorStop(0,'rgba(210,104,63,.16)');g.addColorStop(1,'rgba(0,0,0,0)');
+ g.addColorStop(0,'rgba(120,240,90,.20)');g.addColorStop(.5,'rgba(90,200,70,.05)');g.addColorStop(1,'rgba(0,0,0,0)');
  cx.fillStyle=g;cx.fillRect(0,0,W,H);
  for(let i=0;i<nodes.length;i++){const a=nodes[i];a.x+=a.vx;a.y+=a.vy;
   if(a.x<0||a.x>W)a.vx*=-1;if(a.y<0||a.y>H)a.vy*=-1;
   for(let k=i+1;k<nodes.length;k++){const b=nodes[k],dx=a.x-b.x,dy=a.y-b.y,
-   dd=Math.hypot(dx,dy);if(dd<88){cx.strokeStyle='rgba(210,104,63,'+(.13*(1-dd/88))+')';
+   dd=Math.hypot(dx,dy);if(dd<88){cx.strokeStyle='rgba(130,235,95,'+(.14*(1-dd/88))+')';
    cx.beginPath();cx.moveTo(a.x,a.y);cx.lineTo(b.x,b.y);cx.stroke();}}}
- cx.shadowColor='rgba(240,168,120,.9)';cx.shadowBlur=6;cx.fillStyle='rgba(240,168,120,.95)';
+ cx.shadowColor='rgba(170,255,120,.95)';cx.shadowBlur=7;cx.fillStyle='rgba(190,255,140,.95)';
  for(const a of nodes){cx.beginPath();cx.arc(a.x,a.y,1.4,0,6.283);cx.fill();}
  cx.shadowBlur=0;requestAnimationFrame(drawNet)}
 function clock(){const t=new Date();
