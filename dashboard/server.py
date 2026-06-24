@@ -217,60 +217,116 @@ def build_app():
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>V.A.U.L.T.</title><style>
-:root{--bg:#0d0f12;--fg:#e8e3d8;--dim:#6b6f76;--accent:#d2683f;--line:#23262b}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-.wrap{max-width:1000px;margin:0 auto;padding:24px}
-h1{font-size:18px;letter-spacing:.4em;margin:0 0 2px}
-.sub{color:var(--dim);font-size:11px;margin-bottom:20px}
+:root{--bg:#08090b;--panel:#0c0e11;--fg:#e8e3d8;--dim:#6b6f76;
+--accent:#d2683f;--accent2:#f0a878;--line:#1c1f24;--glow:rgba(210,104,63,.55)}
+*{box-sizing:border-box}
+body{margin:0;color:var(--fg);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+background:
+ linear-gradient(rgba(210,104,63,.025) 1px,transparent 1px) 0 0/100% 34px,
+ linear-gradient(90deg,rgba(210,104,63,.025) 1px,transparent 1px) 0 0/34px 100%,
+ radial-gradient(120% 80% at 50% -10%,#15110d 0%,var(--bg) 60%);
+min-height:100vh}
+/* scanline overlay */
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9;
+background:repeating-linear-gradient(rgba(0,0,0,0) 0 2px,rgba(0,0,0,.18) 2px 3px)}
+.wrap{max-width:1100px;margin:0 auto;padding:22px 24px 40px;position:relative;z-index:1}
+/* header */
+header{display:flex;align-items:flex-end;justify-content:space-between;
+border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:22px}
+.brand{font-size:26px;letter-spacing:.5em;font-weight:700;
+color:var(--accent);text-shadow:0 0 18px var(--glow)}
+.brand small{display:block;font-size:9px;letter-spacing:.35em;color:var(--dim);
+text-shadow:none;font-weight:400;margin-top:4px}
+.status{text-align:right;font-size:10px;letter-spacing:.18em;color:var(--dim);text-transform:uppercase}
+.status #clock{color:var(--accent2);font-size:18px;letter-spacing:.1em;display:block;margin-bottom:3px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#6fae6f;
+margin-right:6px;box-shadow:0 0 8px #6fae6f;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+/* HUD panels with corner brackets */
+.panel{position:relative;background:linear-gradient(180deg,rgba(255,255,255,.012),transparent);
+border:1px solid var(--line);padding:16px 18px;margin-bottom:18px}
+.panel::before,.panel::after{content:"";position:absolute;width:14px;height:14px;
+border:2px solid var(--accent)}
+.panel::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
+.panel::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
+.ptitle{font-size:10px;letter-spacing:.3em;color:var(--accent);text-transform:uppercase;
+margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.ptitle::before{content:"▸"}
+.ptitle::after{content:"";flex:1;height:1px;background:var(--line)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.tile{border:1px solid var(--line);padding:14px;border-radius:6px}
-.tile .k{color:var(--dim);font-size:10px;letter-spacing:.15em;text-transform:uppercase}
-.tile .v{font-size:26px;margin-top:6px}.tile .v small{font-size:12px;color:var(--dim)}
+.tile{border:1px solid var(--line);padding:14px;background:rgba(255,255,255,.015);position:relative}
+.tile::before{content:"";position:absolute;top:6px;left:6px;width:6px;height:6px;
+border-top:1px solid var(--accent);border-left:1px solid var(--accent);opacity:.6}
+.tile .k{color:var(--dim);font-size:9px;letter-spacing:.18em;text-transform:uppercase}
+.tile .v{font-size:30px;margin-top:8px;color:var(--accent2);text-shadow:0 0 12px var(--glow)}
+.tile .v small{font-size:11px;color:var(--dim);text-shadow:none}
 .accent{color:var(--accent)}
-h2{font-size:11px;letter-spacing:.2em;color:var(--dim);text-transform:uppercase;
-margin:28px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+/* claude ring gauge */
+.ring{display:flex;align-items:center;gap:14px}
+.gauge{width:62px;height:62px;border-radius:50%;flex:0 0 62px;display:grid;place-items:center}
+.hole{width:48px;height:48px;border-radius:50%;background:var(--panel);display:grid;place-items:center;
+font-size:14px;color:var(--accent2);text-shadow:0 0 10px var(--glow)}
 .deck{display:flex;flex-wrap:wrap;gap:10px}
-button{background:#16191e;color:var(--fg);border:1px solid var(--line);
-padding:10px 16px;border-radius:6px;font:inherit;cursor:pointer}
-button:hover{border-color:var(--accent);color:var(--accent)}
+button{background:rgba(210,104,63,.06);color:var(--fg);border:1px solid var(--line);
+padding:11px 18px;font:inherit;cursor:pointer;letter-spacing:.05em;transition:.15s;position:relative}
+button:hover{border-color:var(--accent);color:var(--accent2);
+box-shadow:0 0 14px var(--glow);background:rgba(210,104,63,.12)}
+button:active{transform:translateY(1px)}
 table{width:100%;border-collapse:collapse;font-size:12px}
-td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
-th{color:var(--dim);font-weight:400;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
-.job{font-size:12px;padding:6px 8px;border-bottom:1px solid var(--line)}
-.run{color:var(--accent)}.done{color:#6fae6f}.fail{color:#c4564a}
-.foot{color:var(--dim);font-size:10px;margin-top:24px}
+td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
+td:first-child{color:var(--fg)}td{color:var(--dim)}
+th{color:var(--accent);font-weight:400;font-size:9px;letter-spacing:.15em;text-transform:uppercase}
+tr:hover td{background:rgba(210,104,63,.04)}
+.job{font-size:12px;padding:7px 8px;border-bottom:1px solid var(--line)}
+.run{color:var(--accent2)}.done{color:#6fae6f}.fail{color:#c4564a}
+.foot{color:var(--dim);font-size:9px;letter-spacing:.1em;margin-top:18px;text-align:right}
 </style></head><body><div class=wrap>
-<h1>V.A.U.L.T.</h1><div class=sub id=sub>3SK FINANCE · COMMAND CENTER</div>
-<div class=grid id=tiles></div>
-<h2>Command deck</h2><div class=deck id=deck></div>
-<h2>Jobs</h2><div id=jobs></div>
-<h2>Videos</h2><table id=vids><thead><tr><th>Title</th><th>Views</th><th>CTR</th>
-<th>Avg %</th><th>Subs+</th><th>Likes</th></tr></thead><tbody></tbody></table>
+<header>
+ <div class=brand>V.A.U.L.T.<small>VITALS · AGENTS · UPLINK · LEDGER · TELEMETRY</small></div>
+ <div class=status><span id=clock>--:--:--</span>
+  <div><span class=dot></span>SYSTEM ONLINE</div>
+  <div id=sub>3SK FINANCE · COMMAND CENTER</div></div>
+</header>
+<section class=panel><div class=ptitle>Channel vitals</div><div class=grid id=tiles></div></section>
+<section class=panel><div class=ptitle>Command deck</div><div class=deck id=deck></div></section>
+<section class=panel><div class=ptitle>Job queue</div><div id=jobs></div></section>
+<section class=panel><div class=ptitle>Video telemetry</div>
+<table id=vids><thead><tr><th>Title</th><th>Views</th><th>CTR</th>
+<th>Avg %</th><th>AVD</th><th>Subs+</th><th>Likes</th></tr></thead><tbody></tbody></table></section>
 <div class=foot id=foot></div></div>
 <script>
 async function j(u,o){return (await fetch(u,o)).json()}
 function esc(s){return String(s).replace(/</g,'&lt;')}
 function tile(k,v,s){return `<div class=tile><div class=k>${k}</div>
 <div class=v>${v}${s?` <small>${s}</small>`:''}</div></div>`}
+function ring(c){
+ const p=c.pct==null?0:c.pct;
+ const sub=c.spend_usd==null?'DB N/A':`$${c.spend_usd} / $${c.cap_usd}`;
+ return `<div class="tile ring">
+  <div class=gauge style="background:conic-gradient(var(--accent) ${p*3.6}deg,var(--line) 0)">
+   <div class=hole>${c.pct==null?'n/a':p+'%'}</div></div>
+  <div><div class=k>Claude window</div><div style="font-size:11px;color:var(--dim);margin-top:6px">${sub}</div></div>
+ </div>`;
+}
+function clock(){document.getElementById('clock').textContent=
+ new Date().toLocaleTimeString([],{hour12:false})}
 async function vitals(){
- const d=await j('/api/vitals');
- const c=d.claude||{};const cw=c.pct==null?'n/a':c.pct+'%';
+ const d=await j('/api/vitals');const c=d.claude||{};
  document.getElementById('tiles').innerHTML=
   tile('Total views',d.total_views)+
   tile('Subs gained',(d.subs_gained>=0?'+':'')+d.subs_gained,'window')+
   tile('Videos',d.video_count)+
   tile('Likes',d.total_likes)+
   tile('Comments',d.total_comments)+
-  tile('Top source',`<span style=font-size:14px>${esc(d.top_source)}</span>`)+
-  tile('Claude window',`<span class=accent>${cw}</span>`,c.spend_usd==null?'db n/a':`$${c.spend_usd}/$${c.cap_usd}`);
+  tile('Top source',`<span style="font-size:15px">${esc(d.top_source)}</span>`)+
+  ring(c);
  document.getElementById('sub').textContent=
-  `3SK FINANCE · COMMAND CENTER · pull ${d.pull_date||'—'}`+
-  (d.pull_age_days!=null?` (${d.pull_age_days}d old)`:'');
+  `3SK FINANCE · PULL ${d.pull_date||'—'}`+
+  (d.pull_age_days!=null?` (${d.pull_age_days}D OLD)`:'');
  document.querySelector('#vids tbody').innerHTML=(d.videos||[]).map(v=>
   `<tr><td>${esc(v.title)}</td><td>${v.views}</td><td>${esc(v.ctr)}</td>
-   <td>${esc(v.avg_pct)}</td><td>${v.subs}</td><td>${v.likes}</td></tr>`).join('');
- document.getElementById('foot').textContent='source: '+(d.source||'no pull file');
+   <td>${esc(v.avg_pct)}</td><td>${esc(v.avd)}</td><td>${v.subs}</td><td>${v.likes}</td></tr>`).join('');
+ document.getElementById('foot').textContent='SOURCE: '+(d.source||'no pull file');
 }
 const DECK=%DECK%;
 document.getElementById('deck').innerHTML=DECK.map(b=>
@@ -286,7 +342,8 @@ async function jobs(){
    ${g.tail?`<div style=color:#6b6f76;font-size:11px;white-space:pre-wrap;margin-top:4px>${g.tail.replace(/</g,'&lt;')}</div>`:''}</div>`
  }).join(''):'<div style=color:#6b6f76>no jobs yet</div>';
 }
-vitals();jobs();setInterval(vitals,15000);setInterval(jobs,4000);
+clock();vitals();jobs();
+setInterval(clock,1000);setInterval(vitals,15000);setInterval(jobs,4000);
 </script></body></html>"""
 
 
