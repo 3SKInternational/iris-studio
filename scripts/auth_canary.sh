@@ -9,28 +9,45 @@
 #            can auto-fix it. This probe runs the REAL `claude` binary, so it is a
 #            direct, trustworthy test of the exact thing the scheduled jobs do.
 #
-#   2. VAULT (secondary proxy) — can a scheduled job READ the vault at all? This
+#   2. VAULT (internal-disk proxy) — can a scheduled job READ the vault at all? This
 #            reads a vault file (on the internal Data volume) from this launchd
 #            job's own context. It catches Full Disk Access being broadly revoked
-#            for scheduled jobs (which a `brew upgrade claude-code` CAN cause, since
-#            FDA is keyed to the version-pinned Caskroom path) — i.e. the vault
-#            becomes unreadable from a background job. HONEST SCOPE: (a) macOS TCC is
-#            per-responsible-process, so a revocation that hits ONLY claude's exact
-#            binary path while this bash context still reads the vault would NOT be
-#            caught here; and (b) the probe file lives on the internal Data volume,
-#            so an UNMOUNT of a separate volume (e.g. AI_Workspace/X9) is NOT what
-#            this detects. This is a best-effort proxy, not a claude-binary-specific
-#            TCC assertion. The AUTH probe is the primary signal; this is a guard
-#            against the broader "background jobs can't read the vault" class.
+#            for scheduled jobs as it affects INTERNAL-disk reads. (Scope: macOS TCC
+#            is per-responsible-process; a revocation hitting ONLY claude's exact
+#            binary while this bash context still reads the internal vault would not
+#            be caught here. Best-effort proxy.)
 #
-# Why this exists: before this canary, both modes were detected only REACTIVELY —
-# a real scheduled routine had to fire and fail, which (a) could be hours after the
-# token expired on a quiet day and (b) surfaced as confusing "agent failed to fire"
-# alerts rather than a clean "re-auth needed" signal. (Root-caused live 2026-06-22:
-# a token expired ~06:00 and the only symptom was competitor-tripwire +
-# sponsor-tracker red alerts.) This job runs every few hours and emits ONE
-# purpose-built Telegram alert the moment either mode breaks, and a single
-# "recovered" ping when it clears.
+#   3. MOUNT (the AI_Workspace external volume — THE failure that went 16 HOURS
+#            SILENT on 2026-06-23) — the entire iris_studio repo + EVERY scheduled
+#            job's scripts (incl. notify.sh + its .env token) live on the external
+#            AI_Workspace volume. A `brew upgrade claude-code` re-symlinks
+#            /opt/homebrew/bin/claude to a new version-pinned Caskroom path, which
+#            INVALIDATES that volume's Full-Disk-Access grant (FDA is keyed to the
+#            binary's identity). The signature is EXACT and sneaky: `ls`/`stat`
+#            still succeed, but file OPEN returns EPERM. So this probe must READ a
+#            byte of a real file ON the mount, not merely stat the directory.
+#
+# ── WHY THIS SCRIPT NOW LIVES ON THE INTERNAL DISK ──────────────────────────
+# The 2026-06-22→23 outage proved the original design fatally circular: the
+# canary's script, its notify.sh, AND the Telegram token (.env) ALL lived on the
+# AI_Workspace mount it was meant to watch. When FDA was revoked on that mount,
+# launchd could not even read this script → it never ran → ZERO alerts for ~16h.
+# Fix (2026-06-24): the EXECUTED copy of this script lives at
+# ~/iris_studio/scripts/auth_canary.sh (internal disk) and the launchd job runs
+# THAT copy, so the canary survives the exact outage it detects. The repo copy
+# (scripts/auth_canary.sh) remains the version-controlled SOURCE OF TRUTH; deploy
+# with:  cp scripts/auth_canary.sh ~/iris_studio/scripts/auth_canary.sh
+#
+# ── ALERT PATH (mount-independent fallback) ─────────────────────────────────
+# alert() tries the canonical notify.sh first (unchanged behaviour when healthy).
+# If that is unreachable — which is GUARANTEED during a MOUNT outage, since
+# notify.sh + its .env token are on the dead mount — it falls back to a direct
+# Telegram send using the bot token + chat id read from the login KEYCHAIN
+# (the approved credential store; never the synced vault). Provision once:
+#   security add-generic-password -a iris-telegram -s iris_telegram_bot_token -w "<TOKEN>"   -U
+#   security add-generic-password -a iris-telegram -s iris_telegram_chat_id  -w "<CHAT_ID>" -U
+# Rotate the same way (-U updates). The fallback is internal-disk + Keychain only,
+# so it delivers even when AI_Workspace is EPERM'd.
 #
 # It does NOT attempt any fix (it can't) and it does NOT touch the retry queue — it
 # is a pure detector in front of the shared run_claude_job.sh wrapper, which still
@@ -46,20 +63,25 @@
 #
 # Usage:  auth_canary.sh            (normal launchd invocation)
 # Env overrides (for self-tests):
-#   NOTIFY_BIN   path to notify.sh  (default: alongside this script)
-#   CLAUDE_BIN   path to claude     (default: /opt/homebrew/bin/claude)
-#   STATE_FILE   path to state file (default: ~/iris_studio/state/auth_canary.state)
+#   NOTIFY_BIN   path to notify.sh   (default: canonical mount copy)
+#   CLAUDE_BIN   path to claude      (default: /opt/homebrew/bin/claude)
+#   STATE_FILE   path to state file  (default: ~/iris_studio/state/auth_canary.state)
+#   VAULT_PROBE  internal vault file  | MOUNT_PROBE  AI_Workspace file
 #
-# Exit codes: 0 = healthy, 1 = a definite failure is active (auth and/or vault),
+# Exit codes: 0 = healthy, 1 = a definite failure is active (auth/vault/mount),
 #             2 = inconclusive this run (network/transient — NOT alerted).
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NOTIFY="${NOTIFY_BIN:-$SCRIPT_DIR/notify.sh}"
+# notify.sh + its token live on the AI_Workspace mount; point at it by ABSOLUTE
+# path (this script now runs from the internal disk, so $SCRIPT_DIR is internal).
+# Primary channel when healthy; the Keychain fallback covers it being unreachable.
+NOTIFY="${NOTIFY_BIN:-/Volumes/AI_Workspace/iris_studio/scripts/notify.sh}"
 CLAUDE="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 VAULT="/Users/steve/Documents/3SK/outputs"
-VAULT_PROBE="${VAULT_PROBE:-$VAULT/CLAUDE.md}"   # a file whose read proves vault access (overridable for self-tests)
+VAULT_PROBE="${VAULT_PROBE:-$VAULT/CLAUDE.md}"          # internal-disk read proves vault access
+MOUNT_PROBE="${MOUNT_PROBE:-/Volumes/AI_Workspace/iris_studio/requirements.txt}"  # external-mount read proves AI_Workspace access
 LOG="/Users/steve/iris_studio/logs/claude-code-auth-canary.log"
 STATE_FILE="${STATE_FILE:-/Users/steve/iris_studio/state/auth_canary.state}"
 LOCK_DIR="$(dirname "$STATE_FILE")/auth_canary.lock"
@@ -72,7 +94,31 @@ NOW_EPOCH="$(date +%s)"
 mkdir -p "$(dirname "$STATE_FILE")" "$(dirname "$LOG")" 2>/dev/null
 
 log() { echo "$TS auth_canary: $*" >> "$LOG"; }
-alert() { "$NOTIFY" "$1" || log "WARN: notify failed (alert not delivered)"; }
+
+# Mount-independent last-resort alert path: bot token + chat id from the login
+# Keychain (provisioned out-of-band; see header). No dependency on the mount or
+# the .env, so it delivers even when AI_Workspace is EPERM'd.
+_keychain_telegram() {
+    local msg="$1" token chat
+    token="$(security find-generic-password -a iris-telegram -s iris_telegram_bot_token -w 2>/dev/null)" || return 1
+    chat="$(security find-generic-password -a iris-telegram -s iris_telegram_chat_id  -w 2>/dev/null)" || return 1
+    [ -n "$token" ] && [ -n "$chat" ] || return 1
+    curl -fsS --max-time 20 "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${chat}" \
+        --data-urlencode "text=${msg}" >/dev/null 2>&1
+}
+alert() {
+    # Try the canonical channel first. ANY failure (unreachable script, EPERM on
+    # exec, notify.sh's own .env read denied during a mount outage) → fall back.
+    if "$NOTIFY" "$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    if _keychain_telegram "$1"; then
+        log "alert delivered via Keychain fallback (notify.sh unreachable)"
+    else
+        log "WARN: BOTH notify.sh AND Keychain fallback failed — alert not delivered"
+    fi
+}
 write_state() {
     printf '%s|%s|%s\n' "$1" "$2" "$3" > "$STATE_FILE" \
         || log "WARN: could not write state file $STATE_FILE (a silent re-alert loop is possible)"
@@ -91,10 +137,33 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
+# --- Self-heal deployment drift ---------------------------------------------
+# The EXECUTED copy lives on the internal disk; the repo copy on the mount is the
+# version-controlled source of truth. If the mount is readable and the source has
+# genuinely changed, atomically refresh THIS deployed copy so an "edited the repo,
+# forgot to redeploy" can't leave a STALE canary running (the exact divergence the
+# relocation was meant to retire). `mv` swaps a new inode in, so overwriting never
+# corrupts the currently-running script; the new code is picked up next run.
+# Skipped on a read error (the outage itself) — the last-good deployed copy keeps
+# running, which is precisely what we want.
+REPO_SRC="/Volumes/AI_Workspace/iris_studio/scripts/auth_canary.sh"
+SELF="${BASH_SOURCE[0]}"
+if [ "$SELF" != "$REPO_SRC" ] && [ -r "$REPO_SRC" ]; then
+    cmp -s "$REPO_SRC" "$SELF" 2>/dev/null; _drift=$?   # 0=identical, 1=differ, >1=read error
+    if [ "$_drift" -eq 1 ]; then
+        if cp "$REPO_SRC" "$SELF.tmp.$$" 2>/dev/null && chmod +x "$SELF.tmp.$$" 2>/dev/null && mv -f "$SELF.tmp.$$" "$SELF" 2>/dev/null; then
+            log "self-heal: refreshed deployed copy from repo source (drift detected); next run uses it."
+        else
+            rm -f "$SELF.tmp.$$" 2>/dev/null
+            log "WARN: self-heal copy from repo failed; running the existing deployed copy."
+        fi
+    fi
+fi
+
 # --- State file format: STATUS|LAST_ALERT_EPOCH|REASON ----------------------
 # STATUS = ok|bad. LAST_ALERT_EPOCH = epoch of the last Telegram ping about the
 # current outage (0 if none). REASON = '+'-joined set of currently-broken
-# dimensions (auth / vault), e.g. "auth", "vault", "auth+vault".
+# dimensions (auth / vault / mount), e.g. "auth", "mount", "auth+mount".
 prev_status="ok"; prev_alert_epoch=0; prev_reason=""
 if [ -f "$STATE_FILE" ]; then
     IFS='|' read -r prev_status prev_alert_epoch prev_reason < "$STATE_FILE" || true
@@ -123,12 +192,9 @@ elif printf '%s' "$AUTH_OUT" | grep -q 'CANARY_OK'; then
     auth_state="ok"
 fi
 
-# --- Probe 2: VAULT readability from this job's context ---------------------
+# --- Probe 2: VAULT readability (internal Data volume) ----------------------
 # Read one byte of a known vault file. A denial ("Operation not permitted"/EPERM/
-# "Permission denied") → "bad". A merely-absent probe file (volume unmounted /
-# mid-sync) is a DIFFERENT, separately-visible condition → "inconclusive", not a
-# manufactured failure. (Scope caveat in the header: this tests THIS job's access,
-# a proxy — not claude's exact-binary TCC grant.)
+# "Permission denied") → "bad". A merely-absent probe file → "inconclusive".
 vault_state="ok"
 if [ -e "$VAULT_PROBE" ]; then
     VAULT_OUT="$(head -c1 "$VAULT_PROBE" 2>&1 >/dev/null)"
@@ -139,18 +205,34 @@ else
     vault_state="inconclusive"
 fi
 
+# --- Probe 3: AI_WORKSPACE MOUNT readability (external volume) ---------------
+# READ a byte of a real file on the mount (not just stat the dir) — the 2026-06-23
+# FDA-revocation signature is `ls`/`stat` OK but file OPEN → EPERM. Denial → "bad".
+# A truly-absent probe file (genuine unmount, distinct condition) → "inconclusive",
+# not a manufactured failure.
+mount_state="ok"
+if [ -e "$MOUNT_PROBE" ]; then
+    MOUNT_OUT="$(head -c1 "$MOUNT_PROBE" 2>&1 >/dev/null)"
+    if printf '%s' "$MOUNT_OUT" | grep -qiE 'Operation not permitted|EPERM|Permission denied'; then
+        mount_state="bad"
+    fi
+else
+    mount_state="inconclusive"
+fi
+
 # --- Resolve per-dimension health into an effective-bad set -----------------
 cur_ok=""; cur_bad=""
 [ "$auth_state"  = "ok"  ] && cur_ok="$cur_ok auth"
 [ "$vault_state" = "ok"  ] && cur_ok="$cur_ok vault"
+[ "$mount_state" = "ok"  ] && cur_ok="$cur_ok mount"
 [ "$auth_state"  = "bad" ] && cur_bad="$cur_bad auth"
 [ "$vault_state" = "bad" ] && cur_bad="$cur_bad vault"
+[ "$mount_state" = "bad" ] && cur_bad="$cur_bad mount"
 
 # effective_bad = previously-bad dims NOT yet confirmed-ok again, plus newly-bad
 # dims. A dimension that probed "inconclusive" this run is neither confirmed-ok nor
 # newly-bad, so a prior bad state for it PERSISTS (no false recovery) and a prior ok
-# state stays ok (no false alarm). This decouples recovery per-dimension: an
-# inconclusive vault probe can't block an auth recovery, and vice-versa.
+# state stays ok (no false alarm). This decouples recovery per-dimension.
 effective_bad=""
 for d in $prev_bad; do
     _has "$cur_ok" "$d" || effective_bad="$effective_bad $d"
@@ -166,7 +248,8 @@ if [ -n "$effective_bad" ]; then
     reason="$(printf '%s' "$effective_bad" | tr ' ' '+')"
     body=""
     _has "$effective_bad" "auth"  && body="${body}• AUTH: run \`claude login\` (or \`/login\` in the TUI) in a Terminal on the Mini — a 401 = stale OAuth token (or out of Max credits). Blocks EVERY headless claude job until cleared."$'\n'
-    _has "$effective_bad" "vault" && body="${body}• VAULT: a scheduled job can't read the vault (EPERM/permission denied). Re-grant Full Disk Access to the background job's binary (System Settings ▸ Privacy & Security) — a \`brew upgrade claude-code\` can revoke it by moving to a new version-pinned path."$'\n'
+    _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't read the vault (EPERM). Re-grant Full Disk Access to the background job's binary (System Settings ▸ Privacy & Security)."$'\n'
+    _has "$effective_bad" "mount" && body="${body}• AI_WORKSPACE MOUNT: scheduled jobs can't READ /Volumes/AI_Workspace (EPERM) — the iris_studio repo + every job script live there, so the WHOLE fleet is down. Fix (~2 min): System Settings ▸ Privacy & Security ▸ Full Disk Access ▸ remove + re-add /opt/homebrew/bin/claude. A \`brew upgrade claude-code\` revokes it. Durable fix: relocate iris_studio to the internal disk (DQ-17)."$'\n'
 
     # Escalation = a dimension is broken now that was NOT in the prior outage.
     escalation="no"
@@ -177,16 +260,16 @@ if [ -n "$effective_bad" ]; then
 ${body}Time: ${TS}
 The 30-min auto-retry will run the affected jobs automatically once this clears — no manual re-run needed."
         write_state "bad" "$NOW_EPOCH" "$reason"
-        log "ALERT (${reason}) prev='${prev_reason:-ok}' escalation=$escalation auth=$auth_state vault=$vault_state"
+        log "ALERT (${reason}) prev='${prev_reason:-ok}' escalation=$escalation auth=$auth_state vault=$vault_state mount=$mount_state"
     elif [ $((NOW_EPOCH - prev_alert_epoch)) -ge "$RE_ALERT_THROTTLE_SECS" ]; then
         alert "🔴 STILL FAILING — Claude CLI health canary (${reason}) remains broken since the last alert.
 ${body}Time: ${TS}"
         write_state "bad" "$NOW_EPOCH" "$reason"
-        log "STILL bad (${reason}) — throttled re-alert sent. auth=$auth_state vault=$vault_state"
+        log "STILL bad (${reason}) — throttled re-alert sent. auth=$auth_state vault=$vault_state mount=$mount_state"
     else
         # Preserve the FIRST alert's epoch so the throttle measures from it.
         write_state "bad" "$prev_alert_epoch" "$reason"
-        log "STILL bad (${reason}) — within throttle, silent. auth=$auth_state vault=$vault_state"
+        log "STILL bad (${reason}) — within throttle, silent. auth=$auth_state vault=$vault_state mount=$mount_state"
     fi
     exit 1
 fi
@@ -194,20 +277,20 @@ fi
 # ---- Nothing is effectively bad ----
 if [ "$prev_status" = "bad" ]; then
     # Every previously-broken dimension is now CONFIRMED ok → recovery.
-    alert "✅ RECOVERED — Claude CLI health canary is green again (auth=$auth_state, vault=$vault_state) as of ${TS}. Headless jobs can run; the auto-retry sweep will drain anything that queued during the outage."
+    alert "✅ RECOVERED — Claude CLI health canary is green again (auth=$auth_state, vault=$vault_state, mount=$mount_state) as of ${TS}. Headless jobs can run; the auto-retry sweep will drain anything that queued during the outage."
     write_state "ok" "0" ""
-    log "RECOVERED from '${prev_reason}'. auth=$auth_state vault=$vault_state"
+    log "RECOVERED from '${prev_reason}'. auth=$auth_state vault=$vault_state mount=$mount_state"
     exit 0
 fi
 
 # prev_status was ok and nothing is bad.
-if [ "$auth_state" = "ok" ] && [ "$vault_state" = "ok" ]; then
+if [ "$auth_state" = "ok" ] && [ "$vault_state" = "ok" ] && [ "$mount_state" = "ok" ]; then
     write_state "ok" "0" ""
-    log "healthy (auth=ok vault=ok) — silent."
+    log "healthy (auth=ok vault=ok mount=ok) — silent."
     exit 0
 fi
 # Healthy history, nothing bad, but a probe was inconclusive — a transient blip.
 # Stay healthy + silent (a real failure prints its error → classified "bad").
 write_state "ok" "0" ""
-log "INCONCLUSIVE while healthy — auth=$auth_state vault=$vault_state (no alert). auth_out=$(printf '%s' "$AUTH_OUT" | tr '\n' ' ' | cut -c1-160)"
+log "INCONCLUSIVE while healthy — auth=$auth_state vault=$vault_state mount=$mount_state (no alert). auth_out=$(printf '%s' "$AUTH_OUT" | tr '\n' ' ' | cut -c1-160)"
 exit 2
