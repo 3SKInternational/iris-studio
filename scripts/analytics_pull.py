@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import date, timedelta
@@ -239,7 +240,8 @@ def skeleton(path: Path, status: str, note: str, start: str, end: str) -> None:
 
 
 def build_report_body(channel: dict, start: str, end: str, rows: list[dict],
-                      traffic: list[tuple[str, int]], retention: dict[str, str]) -> str:
+                      traffic: list[tuple[str, int]], retention: dict[str, str],
+                      latest: dict | None = None) -> str:
     lines = [
         "---",
         f"date: {date.today().isoformat()}",
@@ -249,6 +251,21 @@ def build_report_body(channel: dict, start: str, end: str, rows: list[dict],
         "source: youtube-analytics-api",
         f"subscribers: {channel['subscribers'] if channel.get('subscribers') is not None else 'n/a'}",
         f"channel_videos: {channel['video_count'] if channel.get('video_count') is not None else 'n/a'}",
+    ]
+    # True-latest upload (by publish date) so downstream consumers (e.g. the HUD)
+    # can show the actual newest video with a real link, not a views-sorted proxy.
+    # Emitted as frontmatter only — the per-video TABLE below is untouched so the
+    # channel-analyst feed contract and its fixed-column parsers don't move.
+    if latest:
+        lines += [
+            f"latest_video_id: {latest['id']}",
+            f"latest_video_published: {latest['published']}",
+            f"latest_video_title: {json.dumps(latest['title'])}",
+            f"latest_video_views: {latest['views']}",
+            f"latest_video_likes: {latest['likes']}",
+            f"latest_video_comments: {latest['comments']}",
+        ]
+    lines += [
         "tags:",
         "  - brand/3sk-finance",
         "  - analytics/api-pull",
@@ -417,8 +434,27 @@ def main() -> None:
         curve = query_retention(analytics, channel["id"], r["id"], start, end)
         retention[r["title"]] = biggest_dip(curve)
 
+    # True-latest upload by publish date (independent of the views-sorted table).
+    # Its window metrics may be 0 if it published <~48h ago (Analytics data lags) —
+    # that's correct, not fabricated: a fresh video legitimately has ~0 views.
+    def _int(v) -> int:
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return 0
+    latest = None
+    dated = [v for v in videos if v.get("published")]
+    if dated:
+        lm = max(dated, key=lambda v: v["published"])
+        rec = core.get(lm["id"], {})
+        latest = {
+            "id": lm["id"], "published": lm["published"], "title": lm["title"],
+            "views": _int(rec.get("views")), "likes": _int(rec.get("likes")),
+            "comments": _int(rec.get("comments")),
+        }
+
     write_report(out, build_report_body(channel, start, end, rows, traffic,
-                                        retention))
+                                        retention, latest))
     print(f"\n✅ wrote analytics feed ({len(rows)} videos) → {out}")
     print("   Next: dispatch `channel-analyst` with this file's path for the diagnosis.")
 
