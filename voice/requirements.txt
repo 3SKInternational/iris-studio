@@ -1,0 +1,8 @@
+# Local two-way voice (voice_chat.py). Install into the iris_studio .venv:
+#   .venv/bin/pip install -r voice/requirements.txt
+# System deps (not pip): brew install espeak-ng portaudio ollama
+#   then: brew services start ollama && ollama pull llama3.2:3b
+faster-whisper
+kokoro
+soundfile
+sounddevice
