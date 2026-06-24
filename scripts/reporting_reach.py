@@ -251,15 +251,19 @@ def _select_reports(reports: list[dict], start: date | None, end: date | None) -
     return list(by_day.values())
 
 
-def _download_csv(svc, job_id: str, report_id: str) -> str:
+def _download_csv(svc, download_url: str) -> str:
     """Download a report's CSV body as text via the public media-download API.
 
-    Uses ``jobs().reports().get_media`` + ``MediaIoBaseDownload`` (the supported
-    authorized path) rather than poking the service's private transport.
+    A Reporting-API Report carries a ``downloadUrl`` (the report's pre-signed media
+    URL); the bytes are fetched through the ``media()`` resource, NOT ``jobs().reports()``
+    (which only has list/get for metadata — there is no ``get_media`` there). We
+    follow Google's canonical sample: build a ``media().download_media`` request
+    with a placeholder resourceName, then point it at the report's downloadUrl.
     """
     from googleapiclient.http import MediaIoBaseDownload
 
-    request = svc.jobs().reports().get_media(jobId=job_id, reportId=report_id)
+    request = svc.media().download_media(resourceName="")
+    request.uri = download_url
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
@@ -353,10 +357,11 @@ def _fetch_reach_inner(creds, start: date | None, end: date | None,
     acc: dict[str, dict[str, float]] = {}
     for rep in selected:
         rid = rep.get("id")
-        if not rid:
+        url = rep.get("downloadUrl")
+        if not rid or not url:
             continue
         try:
-            text = _download_csv(svc, job["id"], rid)
+            text = _download_csv(svc, url)
         except Exception as exc:  # noqa: BLE001 — skip a bad report, keep the rest.
             print(f"  ⚠ reach: report {rid} download failed "
                   f"({type(exc).__name__}: {str(exc).splitlines()[0][:120]})",
