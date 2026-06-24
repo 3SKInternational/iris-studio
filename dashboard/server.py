@@ -69,6 +69,8 @@ def parse_pull(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
     window = (re.search(r"^window:\s*(.+)$", text, re.M) or [None, "—"])[1].strip()
     pdate = (re.search(r"^date:\s*(.+)$", text, re.M) or [None, ""])[1].strip()
+    subs = (re.search(r"^subscribers:\s*(.+)$", text, re.M) or [None, ""])[1].strip()
+    chvids = (re.search(r"^channel_videos:\s*(.+)$", text, re.M) or [None, ""])[1].strip()
 
     videos, in_video, in_traffic, top_source = [], False, False, None
     for line in text.splitlines():
@@ -101,9 +103,11 @@ def parse_pull(path: Path) -> dict:
         "videos": videos,
         "total_views": sum(v["views"] for v in videos),
         "subs_gained": sum(v["subs"] for v in videos),
+        "subscribers": _int(subs),          # channel total (None if "n/a"/missing)
         "total_likes": sum(v["likes"] for v in videos),
         "total_comments": sum(v["comments"] for v in videos),
-        "video_count": len(videos),
+        # Channel upload count (truth) falls back to parsed-row count if absent.
+        "video_count": _int(chvids) if _int(chvids) is not None else len(videos),
         "top_source": top_source or "—",
     }
 
@@ -127,9 +131,9 @@ def vitals() -> dict:
     p = _latest_pull()
     base = {"source": str(p.relative_to(VAULT.parent.parent)) if p else None}
     base.update(parse_pull(p) if p else {"window": "—", "videos": [],
-                "total_views": 0, "subs_gained": 0, "video_count": 0,
-                "total_likes": 0, "total_comments": 0, "top_source": "—",
-                "pull_date": "", "pull_age_days": None})
+                "total_views": 0, "subs_gained": 0, "subscribers": None,
+                "video_count": 0, "total_likes": 0, "total_comments": 0,
+                "top_source": "—", "pull_date": "", "pull_age_days": None})
     base["claude"] = claude_spend()
     return base
 
@@ -314,7 +318,8 @@ async function vitals(){
  const d=await j('/api/vitals');const c=d.claude||{};
  document.getElementById('tiles').innerHTML=
   tile('Total views',d.total_views)+
-  tile('Subs gained',(d.subs_gained>=0?'+':'')+d.subs_gained,'window')+
+  tile('Subscribers',d.subscribers==null?'n/a':d.subscribers,
+       d.subs_gained!=null?`${d.subs_gained>=0?'+':''}${d.subs_gained} window`:'')+
   tile('Videos',d.video_count)+
   tile('Likes',d.total_likes)+
   tile('Comments',d.total_comments)+

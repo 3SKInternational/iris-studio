@@ -218,7 +218,7 @@ def resolve_channel(data_service) -> dict:
     """
     resp = (
         data_service.channels()
-        .list(part="snippet,contentDetails", mine=True)
+        .list(part="snippet,contentDetails,statistics", mine=True)
         .execute()
     )
     items = resp.get("items", [])
@@ -228,8 +228,12 @@ def resolve_channel(data_service) -> dict:
             "channel-owning account (youtube_authorize.py --force)."
         )
     ch = items[0]
+    stats = ch.get("statistics", {})
     return {
         "id": ch["id"],
         "title": ch.get("snippet", {}).get("title", "(no title)"),
         "uploads_playlist": ch["contentDetails"]["relatedPlaylists"]["uploads"],
+        # Channel totals (str→int; "hiddenSubscriberCount" channels omit the field).
+        "subscribers": int(stats["subscriberCount"]) if stats.get("subscriberCount", "").isdigit() else None,
+        "video_count": int(stats["videoCount"]) if stats.get("videoCount", "").isdigit() else None,
     }
