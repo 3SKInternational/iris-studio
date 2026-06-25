@@ -1,0 +1,33 @@
+{
+  "_note": "Flop-recovery repackage of the 4 LIVE 3SK Finance videos (2026-06-25). Applies new search-shaped title + description + tags + custom thumbnail to each. Descriptions/tags are EXTRACTED from the canonical md by section header (single source of truth) so what ships == what was reviewed. Run via repackage_video.py --dry-run first, then --apply.",
+  "videos": [
+    {
+      "label": "V1",
+      "video_id": "7yumLm31AS4",
+      "title": "How Saving 50% of Your Income Changes Your Timeline",
+      "desc_md": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Video_Descriptions/Video_01_Description_SEARCH_REWRITE.md",
+      "thumbnail": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_01_gen/Video_01_Shot_08a_text.png"
+    },
+    {
+      "label": "V2",
+      "video_id": "Fc1NCIrXVlM",
+      "title": "Your Life at Every Level of Net Worth ($0–$10M)",
+      "desc_md": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Video_Descriptions/Video_02_Description_SEARCH_REWRITE.md",
+      "thumbnail": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_02_gen/Video_02_Thumbnail_A_text.png"
+    },
+    {
+      "label": "V3",
+      "video_id": "5YjQtMt9p80",
+      "title": "POV: How People TREAT You as the First Millionaire in the Family",
+      "desc_md": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Video_Descriptions/Video_03_Description.md",
+      "thumbnail": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_03_gen/Video_03_Shot_01a_text.png"
+    },
+    {
+      "label": "V4",
+      "video_id": "ClJVIUtwsVE",
+      "title": "Every Level Of First-Gen Wealth — $847 to Generational",
+      "desc_md": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Video_Descriptions/Video_04_Description.md",
+      "thumbnail": "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Thumbnails/Video_04_gen/Video_04_Thumbnail_A_text.png"
+    }
+  ]
+}
