@@ -3408,7 +3408,12 @@ async def generate_morning_briefing() -> str:
     the system prompt. No conversation history (briefing is a standalone
     output, not a continuation).
     """
-    return await query_cloud(MORNING_BRIEFING_PROMPT, history=[])
+    # ponytail: same long-output workload as the regen step; the 60s chat
+    # default times out on a substantive 80-120 line brief (failed 2026-06-25).
+    return await query_cloud(
+        MORNING_BRIEFING_PROMPT, history=[],
+        timeout=DAILY_BRIEFING_REGEN_TIMEOUT_SECONDS,
+    )
 
 
 def _preserve_evening_addendum() -> str | None:
