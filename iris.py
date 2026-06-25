@@ -3400,6 +3400,23 @@ DAILY_BRIEFING_REGEN_PROMPT = (
 )
 DAILY_BRIEFING_REGEN_TIMEOUT_SECONDS = 180.0
 
+# The scheduled morning job emits BOTH artifacts in one cloud call (file +
+# Telegram brief), split on this sentinel — halving cost/latency vs. the old
+# two-call design (regen file, then a second call to reword it). Composed from
+# the two canonical prompts so neither format drifts.
+BRIEFING_SENTINEL = "===TELEGRAM_BRIEF==="
+MORNING_BRIEFING_COMBINED_PROMPT = (
+    "Produce TWO outputs in a SINGLE response. Do the Gmail + Calendar checks "
+    "described below ONCE, up front, and let the findings inform both parts.\n\n"
+    "=========== PART 1 — the DAILY_BRIEFING.md file ===========\n"
+    + DAILY_BRIEFING_REGEN_PROMPT
+    + f"\n\n=========== SENTINEL ===========\n"
+    "After the complete PART 1 file content above, output a line containing "
+    f"EXACTLY this and nothing else:\n{BRIEFING_SENTINEL}\n\n"
+    "=========== PART 2 — the Telegram brief ===========\n"
+    + MORNING_BRIEFING_PROMPT
+)
+
 
 async def generate_morning_briefing() -> str:
     """Construct the morning brief using cloud tier with workspace context.
@@ -3478,13 +3495,43 @@ def _prune_daily_briefing_baks() -> None:
         logger.warning(f"Pruning daily-briefing baks failed (non-fatal): {exc}")
 
 
-async def regenerate_daily_briefing_file() -> bool:
-    """Regenerate DAILY_BRIEFING.md from current workspace state.
+def _persist_daily_briefing(new_content: str) -> bool:
+    """Back up the previous DAILY_BRIEFING.md and write `new_content` in its
+    place. Returns False (without writing) if the content is suspiciously short,
+    so a degenerate generation never clobbers a good file. File IO may raise —
+    callers wrap in try/except."""
+    # ponytail: length-only floor — catches a degenerate short generation, not a
+    # well-formed-length file in the wrong format. Watch the logged char-counts
+    # the first few mornings of the combined-prompt path; add a format check if
+    # the model bleeds mobile-prose into the structured file.
+    if not new_content or len(new_content) < 500:
+        logger.warning(
+            f"DAILY_BRIEFING content suspiciously short ({len(new_content)} chars); "
+            "skipping save to preserve the existing file."
+        )
+        return False
+    # Brain-audit fix #9: rescue any evening addendum BEFORE we rename/overwrite.
+    preserved = _preserve_evening_addendum()
+    if preserved:
+        logger.info(preserved)
+    # Back up existing file with timestamp into the archive dir (not root).
+    if DAILY_BRIEFING_FILE.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = _archive_daily_briefing(timestamp)
+        logger.info(
+            f"Previous DAILY_BRIEFING.md backed up to "
+            f"{backup_path.relative_to(WORKSPACE_DIR)}"
+        )
+        _prune_daily_briefing_baks()
+    DAILY_BRIEFING_FILE.write_text(new_content, encoding="utf-8")
+    logger.info(f"DAILY_BRIEFING.md regenerated ({len(new_content)} chars)")
+    return True
 
-    Backs up the previous file as .bak-<timestamp> before overwriting.
-    Returns True on success, False on any error (caller continues with
-    whatever DAILY_BRIEFING content already exists on disk).
-    """
+
+async def regenerate_daily_briefing_file() -> bool:
+    """Regenerate DAILY_BRIEFING.md from current workspace state (on-demand
+    /refresh path). Returns True on success, False on any error (caller
+    continues with whatever DAILY_BRIEFING content already exists on disk)."""
     try:
         logger.info(
             f"Regenerating DAILY_BRIEFING.md from current workspace state "
@@ -3495,32 +3542,41 @@ async def regenerate_daily_briefing_file() -> bool:
             history=[],
             timeout=DAILY_BRIEFING_REGEN_TIMEOUT_SECONDS,
         )
-        if not new_content or len(new_content) < 500:
-            logger.warning(
-                f"DAILY_BRIEFING regen returned suspiciously short content ({len(new_content)} chars); "
-                "skipping save to preserve the existing file."
-            )
-            return False
-        # Brain-audit fix #9: rescue any evening addendum BEFORE we rename/overwrite.
-        preserved = _preserve_evening_addendum()
-        if preserved:
-            logger.info(preserved)
-        # Back up existing file with timestamp into the archive dir (not root).
-        if DAILY_BRIEFING_FILE.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = _archive_daily_briefing(timestamp)
-            logger.info(
-                f"Previous DAILY_BRIEFING.md backed up to "
-                f"{backup_path.relative_to(WORKSPACE_DIR)}"
-            )
-            _prune_daily_briefing_baks()
-        DAILY_BRIEFING_FILE.write_text(new_content, encoding="utf-8")
-        logger.info(f"DAILY_BRIEFING.md regenerated ({len(new_content)} chars)")
-        await record_message_stat("cloud", cost_usd=0.0)
-        return True
+        if _persist_daily_briefing(new_content):
+            await record_message_stat("cloud", cost_usd=0.0)
+            return True
+        return False
     except Exception as exc:
         logger.exception(f"DAILY_BRIEFING regen failed: {exc}")
         return False
+
+
+async def _generate_daily_briefing_combined() -> tuple[str, str]:
+    """One cloud call producing BOTH the DAILY_BRIEFING.md markdown and the
+    short Telegram brief, split on BRIEFING_SENTINEL. Returns (file_md, brief).
+    If the model omits the sentinel, the whole output is treated as the file and
+    a trimmed head is used as the brief so Steve still gets something."""
+    out = await query_cloud(
+        MORNING_BRIEFING_COMBINED_PROMPT,
+        history=[],
+        timeout=DAILY_BRIEFING_REGEN_TIMEOUT_SECONDS,
+    )
+    if BRIEFING_SENTINEL in out:
+        file_md, brief = (s.strip() for s in out.split(BRIEFING_SENTINEL, 1))
+        if not brief:
+            # Trailing/empty PART 2 (model treated the sentinel as a terminator).
+            # Degrade to a head of the file so Steve still gets something; if the
+            # file half is ALSO empty (near-total generation failure), send a
+            # check-logs notice rather than silently sending nothing.
+            logger.warning("Combined briefing PART 2 empty; using file head as brief.")
+            brief = file_md[:1800] or "Morning briefing produced no usable text — check daemon logs."
+        return file_md, brief
+    logger.warning(
+        "Combined briefing missing sentinel; treating whole output as the file "
+        "and deriving the brief from its head."
+    )
+    out = out.strip()
+    return out, out[:1800]
 
 
 # ============================================================
@@ -3639,17 +3695,15 @@ async def send_morning_briefing(bot, chat_id: int) -> None:
     """Daily scheduled job: regenerate DAILY_BRIEFING.md from current state, then generate + send the Telegram brief."""
     logger.info(f"Morning briefing job firing for chat_id={chat_id}")
     try:
-        # Step 1: regenerate DAILY_BRIEFING.md from current workspace state.
-        # If this fails the brief still goes out using the existing (possibly stale)
-        # DAILY_BRIEFING.md, so users always get SOMETHING.
-        regen_ok = await regenerate_daily_briefing_file()
-        if regen_ok:
-            logger.info("DAILY_BRIEFING.md is fresh; generating Telegram brief from it.")
-        else:
-            logger.warning("DAILY_BRIEFING regen failed; brief will use existing file.")
+        # One cloud call yields both the DAILY_BRIEFING.md content and the
+        # Telegram brief. Persisting the file is best-effort — a save failure
+        # must NOT block the brief Steve actually reads.
+        file_md, brief = await _generate_daily_briefing_combined()
+        try:
+            _persist_daily_briefing(file_md)
+        except Exception:
+            logger.exception("DAILY_BRIEFING save failed; sending brief anyway.")
 
-        # Step 2: generate the Telegram brief. query_cloud reads the (now fresh) DAILY_BRIEFING.md.
-        brief = await generate_morning_briefing()
         for i in range(0, len(brief), TELEGRAM_MAX_MSG):
             await bot.send_message(chat_id=chat_id, text=brief[i : i + TELEGRAM_MAX_MSG])
         await record_message_stat("cloud", cost_usd=0.0)
