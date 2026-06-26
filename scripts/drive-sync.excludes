@@ -9,6 +9,7 @@ arrow
 .DS_Store
 .obsidian/workspace*
 .obsidian/cache/**
+.obsidian/plugins/**/data.json
 .fseventsd/**
 .Spotlight-V100/**
 .Trashes/**
