@@ -1,0 +1,48 @@
+You are Claude Code running the DAILY EXPENSE-AUTOCOMMIT routine on the Mac Mini. Your job closes the realtime-spend gap Steve asked for: "all of our spend should be going into the expense tracker in realtime." Until now, receipt charges reached the book only via the expense-categorizer draft + Steve's manual `/approve` paste. THIS routine runs the full unattended path Steve approved — sweep new receipts → an accounting agent reviews each → only an all-SHIP draft is auto-written to the canonical xlsx (with a mandatory backup). Prepaid-credit CONSUMPTION (image/API draw-down) is NOT handled here — it's tracked in cost_ledger.jsonl and reconciled separately, never re-expensed.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+
+HARD RULES (read before doing anything):
+- The ONLY thing that may write the xlsx is `scripts/commit_expense.py`. You never edit `Expense_Tracker.xlsx` yourself, and you never hand-build rows — you commit ONLY the categorizer's `.rows.json` sidecar, and ONLY after the expense-reviewer SHIPs the draft. The committer self-enforces this (it refuses without a `status: ship` verdict and dedups), so do not pass `--force`.
+- BINARY gate. A draft auto-commits ONLY on a clean `status: ship` expense-reviewer verdict. Any `revise` → DO NOT commit; leave the draft for Steve and surface it. There is no "commit with fixes."
+- ANTI-FABRICATION is absolute. Auto-commit only the rows the categorizer put in the sidecar (High-confidence, traceable to a Gmail msg-id). Never invent a row, amount, date, or vendor. An empty sidecar / no new receipts is a SUCCESS (silent no-op), never spam.
+- The committer takes a timestamped backup before any write and runs under an flock — do not run two of these concurrently, and do not bypass the backup.
+
+PASS 1 — REFRESH THE DEDUP MIRROR, THEN SWEEP RECEIPTS:
+  First regenerate the CSV mirror so dedup is current (the categorizer reads it):
+      /usr/bin/python3 /Volumes/AI_Workspace/iris_studio/scripts/export_expense_csv.py
+  If that regen errors (non-zero exit), do NOT abort — note "CSV regen failed, proceeded on stale mirror" for the daily line and continue. (Safe: the committer dedups against the LIVE xlsx, not the CSV, so a stale mirror can only make the categorizer draft a row the committer then skips as a dupe — it can never cause a duplicate write.)
+  Then dispatch the `expense-categorizer` subagent in SCHEDULED mode (no human brief). It sweeps studio@3skinternational.com for new receipt emails since its last run, drafts the markdown to `02_Finance/Expense_Tracker_Drafts/YYYY-MM-DD_<run-id>.md`, AND writes the auto-commit sidecar `…_<run-id>.rows.json` (the High-confidence, unambiguous, non-personal subset; `[]` if none qualify). Capture the draft path and `status:` line it returns.
+    • If the categorizer returns `status: blocked-*` (e.g. Gmail OAuth) → go to PASS 4 and emit ROUTINE_INCOMPLETE with that blocker.
+    • If it drafted but the sidecar is `[]` / absent / contains zero rows → nothing is auto-commit-eligible. Do NOT dispatch the reviewer, do NOT commit, do NOT send a Telegram push. Note "0 auto-commit-eligible rows" for the daily line and go to PASS 4 (any Medium/Low/personal rows in the markdown wait for Steve's /approve — that's by design).
+      EXCEPTION — sidecar-missing mismatch: if the categorizer returned `status: ok` AND its markdown draft DOES contain ≥1 High-confidence, non-personal, clean-amount row, but the `.rows.json` sidecar is missing or unreadable, that is a categorizer bug (eligible rows silently dropped), NOT a clean empty day. Do NOT commit; go to PASS 4 and emit ROUTINE_INCOMPLETE noting "categorizer drafted eligible rows but wrote no sidecar" so Steve gets pinged to file them manually.
+
+PASS 2 — REVIEW GATE (only if the sidecar has ≥1 row):
+  Dispatch the `expense-reviewer` subagent on the draft just produced. Brief it with:
+    - the draft path (the `.md`) and its sidecar path (`…_<run-id>.rows.json`) as the rows under review,
+    - SCOPE: its full contract — catch double-counting (consumption vs top-up), dedup vs `Expense_Tracker.csv`, Schedule C category correctness, amount/date/vendor anti-fabrication (every figure must trace to the Gmail source named in `notes`), card/payer, business-vs-personal, prepaid-credit reconciliation.
+  It writes its verdict to `02_Finance/Expense_Tracker_Drafts/_REVIEW/<draft-stem>_Review.md` with frontmatter `status: ship|revise`. Read that verdict.
+
+PASS 3 — COMMIT ONLY ON A CLEAN SHIP:
+  • If the verdict frontmatter is `status: ship` → run the committer (it re-checks the SHIP verdict, dedups vs the live xlsx, backs up, appends formula-safe, regenerates the CSV, and sends its own Telegram receipt):
+      /usr/bin/python3 /Volumes/AI_Workspace/iris_studio/scripts/commit_expense.py \
+        --rows "<sidecar .rows.json path>" \
+        --review "02_Finance/Expense_Tracker_Drafts/_REVIEW/<draft-stem>_Review.md"
+    (Paths are relative to VAULT or absolute — the committer resolves either; the xlsx default is the live book, do not pass --xlsx.) Capture its stdout (it prints which rows committed + which dupes it skipped). The committer is idempotent (dedup), so a re-run never double-writes.
+  • If the verdict is `status: revise` → DO NOT commit. The draft stays for Steve. Send ONE Telegram push naming the offending rows + the reviewer's required fixes:
+      cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "🧾 Expense auto-commit PARKED — expense-reviewer returned REVISE on <draft-stem>. <N> row(s) NOT filed. Fixes: <one line per offending row>. Verdict: 02_Finance/Expense_Tracker_Drafts/_REVIEW/<draft-stem>_Review.md"
+
+PASS 4 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
+      ## 🧾 Expense auto-commit (daily)
+  ~3-4 lines: how many receipts the categorizer drafted (H/M/L); how many were auto-commit-eligible; the reviewer verdict (ship/revise); how many rows the committer actually wrote vs skipped-as-dupes (or "0 eligible — silent no-op"). If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub). Do not touch any other agent's section.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — the sweep ran AND (0 eligible rows → clean no-op, OR the reviewer gated the draft and any SHIP rows were committed / any REVISE was surfaced). All are complete.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — the categorizer was blocked (auth/credential), the reviewer dispatch could not run, the committer errored (non-zero exit), or the PARKED Telegram push failed when a REVISE needed surfacing.
+
+Output nothing after that line.
