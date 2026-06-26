@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.graphify-refresh</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/graphify_refresh.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/graphify-refresh.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/graphify-refresh.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>

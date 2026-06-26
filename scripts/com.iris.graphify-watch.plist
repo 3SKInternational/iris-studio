@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.graphify-watch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>exec /Users/steve/.local/bin/graphify watch /Users/steve/Documents/3SK/outputs</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/graphify-watch.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/graphify-watch.stdout.log</string>
+</dict>
+</plist>
