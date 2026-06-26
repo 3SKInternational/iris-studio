@@ -10,9 +10,12 @@ this, but an LLM can miss it; a deterministic scan cannot. So this is a script,
 not an agent — it can't hallucinate a pass.
 
 What it flags (high-signal only, to stay quiet enough to actually be a gate):
-  * Currency/integers >= 1,000,000 that are NOT a whole number of millions
-    (e.g. $1,043,000, 2,500,000) — the proven failure mode. Whole millions
-    ($1,000,000) and any thousands ($100,000, $40,000) pass.
+  * Any currency/integer >= 1,000,000 written as comma-grouped digits
+    (e.g. $1,043,000, 2,500,000, $1,000,000) — ElevenLabs drops the millions
+    place on ALL of them: $1,043,000 -> "one thousand forty-three thousand",
+    $1,000,000 -> "one thousand thousand". Round vs non-round makes no
+    difference. Thousands ($100,000, $40,000 — a single comma group) stay below
+    the regex and pass; spell those out in the kit by hand if they misread too.
 
 Each finding prints `path:line: <offending> -> say "<safe rewrite>"`. Exit code is
 1 when any hazard is found, 0 when clean, so it works as a pre-render gate:
@@ -22,8 +25,9 @@ narration-only, so it won't false-flag round millions sitting in titles/chapters
 
   --selftest  run the built-in asserts and exit (no files needed)
 
-# ponytail: one proven hazard class (mixed-magnitude millions). Add a new rule
-# only when a real render misreads a new pattern — don't pre-build a number grammar.
+# ponytail: one proven hazard class (comma-grouped millions, round or not). Add a
+# new rule only when a real render misreads a new pattern — don't pre-build a
+# number grammar. If thousands ($100,000) start misreading too, widen the regex.
 """
 
 from __future__ import annotations
@@ -57,14 +61,15 @@ def _safe_rewrite(raw: str) -> str:
 
 
 def find_hazards(text: str) -> list[tuple[str, str]]:
-    """Return [(offending_substring, safe_rewrite)] for each mixed-magnitude
-    million in the line/text. Whole millions and sub-million numbers are skipped."""
+    """Return [(offending_substring, safe_rewrite)] for each comma-grouped
+    million-scale number in the line/text. ALL millions are flagged: ElevenLabs
+    mis-reads non-round millions ($1,043,000 -> "one thousand forty-three
+    thousand") AND round ones ($1,000,000 -> "one thousand thousand") — it drops
+    the millions place either way. Sub-million numbers (single comma group, e.g.
+    $100,000) are below this regex and not flagged here."""
     out: list[tuple[str, str]] = []
     for m in _GROUPED_MILLIONS.finditer(text):
         raw = m.group(0)
-        value = int(raw.replace("$", "").replace(",", ""))
-        if value % 1_000_000 == 0:
-            continue  # whole millions ($1,000,000) render correctly
         out.append((raw, _safe_rewrite(raw)))
     return out
 
@@ -86,10 +91,11 @@ def selftest() -> int:
     assert find_hazards("the screen says $1,043,000.") == [("$1,043,000", "$1.043 million")]
     assert find_hazards("bare 1,043,000 here") == [("1,043,000", "1.043 million")]
     assert find_hazards("$2,500,000 invested") == [("$2,500,000", "$2.5 million")]
-    # whole millions and thousands must NOT flag:
-    assert find_hazards("$1,000,000 milestone") == []
+    # whole millions now flag too — ElevenLabs drops the millions place either way:
+    assert find_hazards("$1,000,000 milestone") == [("$1,000,000", "$1 million")]
+    assert find_hazards("4 percent of $1,000,000 is $40,000") == [("$1,000,000", "$1 million")]
+    # thousands (single comma group) stay below the regex and do NOT flag:
     assert find_hazards("$100,000 and $40,000") == []
-    assert find_hazards("4 percent of $1,000,000 is $40,000") == []
     # exact-thousands values get a clean, round-tripping rewrite:
     assert find_hazards("$1,100,000")[0][1] == "$1.1 million"
     # sub-thousands precision can't round-trip -> tagged, never a clean wrong amount:
