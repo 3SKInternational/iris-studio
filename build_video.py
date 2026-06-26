@@ -229,6 +229,189 @@ _KIT_BLOCK_RE = re.compile(r"^##\s+Scene\s+(\d+)\s*(?:->|→)\s*`([^`]+\.mp3)`[^
 # Video_05. Absent -> caption is the body text unchanged (backward compatible).
 _DUAL_FORM_RE = re.compile(r"\{\{\s*([^|{}]+?)\s*\|\s*([^{}]+?)\s*\}\}")
 
+# --- caption number normalizer ---------------------------------------------
+# The VO kit is written in TTS orthography (spelled-out money/percent, "four-oh-
+# one-kay", "S and P five hundred", "twenty seventeen") so ElevenLabs reads it
+# right. Captions must read in DIGITS/SYMBOLS ("$10,000", "20%", "401K", "S&P
+# 500", "2017") — Steve's standing rule: a caption never ships a spelled-out
+# figure. This converts the kit's spoken forms to caption forms, but ONLY inside
+# money/percent/account/year ANCHORS, so prose cardinals ("two coworkers", "six
+# levels", "one ladder") are left untouched.
+# ponytail: scoped to the patterns that actually occur on a finance channel; the
+# lookup table + anchor regexes grow if a new spelled form shows up in review.
+_NUM_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
+    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+    "ninety": 90,
+}
+_NUM_SCALES = {"hundred": 100, "thousand": 1000, "million": 1_000_000,
+               "billion": 1_000_000_000}
+# Exact account/ticker fixes (case-insensitive, longest first so "Roth I R A"
+# wins before bare "I R A").
+_CAPTION_LOOKUPS = [
+    (re.compile(r"\bfour-oh-one-?kay\b", re.I), "401K"),
+    (re.compile(r"\bfour-oh-three-?b\b", re.I), "403B"),
+    (re.compile(r"\bS and P five hundred\b", re.I), "S&P 500"),
+    (re.compile(r"\bRoth I[-.\s]?R[-.\s]?A\b\.?", re.I), "Roth IRA"),
+    (re.compile(r"\bI[-.\s]R[-.\s]A\b", re.I), "IRA"),
+]
+_NUM_WORD = (r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+             r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+             r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+             r"hundred|thousand|million|billion|\d[\d,]*)")
+# Leading "a" counts as "one" ONLY in "a hundred/thousand/..." — never the article
+# "a" in "a fifty-two thousand dollar salary" (that "a" must stay an article).
+_A_PREFIX = r"(?:a[\s-]+(?=hundred|thousand|million|billion))?"
+_NUM_PHRASE = rf"{_A_PREFIX}{_NUM_WORD}(?:[\s-]+{_NUM_WORD})*"
+# connectors joining amounts in a range/list where only the tail carries the unit
+_NUM_CONN = r"(\s+(?:to|or|versus|vs\.?)\s+|,\s+)"
+_NUM_EXPR = rf"{_NUM_PHRASE}(?:{_NUM_CONN}{_NUM_PHRASE})*"
+# (?<![\d$,]) so a match can't START inside or right after an already-formatted
+# figure — otherwise "$100,000 dollars" (from a dual-form caption) would re-grab
+# the bare digits ("$" before "1", or the comma boundary before "000") and emit
+# "$$100,000" / "$100,$0". Spelled amounts in a mixed expr still convert
+# ("$5,000 to ten thousand dollars" -> "$5,000 to $10,000").
+_MONEY_RE = re.compile(rf"(?<![\d$,])\b({_NUM_EXPR})\s+dollars?\b", re.I)
+_PCT_RE = re.compile(rf"(?<![\d$,])\b({_NUM_EXPR})\s+percent\b", re.I)
+_CONN_SPLIT_RE = re.compile(_NUM_CONN, re.I)
+# Calendar years that appear spoken ("twenty seventeen", "twenty twenty-two").
+# Matched before the money parser so a year is never read as a dollar amount.
+_ONES = ["", "one", "two", "three", "four", "five", "six", "seven", "eight",
+         "nine"]
+_YEAR_MAP = {"twenty seventeen": 2017, "twenty eighteen": 2018,
+             "twenty nineteen": 2019, "twenty twenty": 2020}
+for _i in range(1, 10):
+    _YEAR_MAP[f"twenty twenty-{_ONES[_i]}"] = 2020 + _i
+_YEAR_RE = re.compile(
+    r"\btwenty (?:twenty(?:-(?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"|nineteen|eighteen|seventeen)\b", re.I)
+
+
+def _words_to_int(phrase: str) -> int | None:
+    """'two hundred fifty thousand' -> 250000; digits pass through; None if any
+    token is not a number word (caller leaves the text unchanged)."""
+    p = phrase.strip().lower()
+    if re.fullmatch(r"[\d,]+", p):
+        return int(p.replace(",", ""))
+    total = current = 0
+    seen = False
+    for tok in (t for t in re.split(r"[\s-]+", p) if t and t != "and"):
+        if tok == "a":
+            current += 1; seen = True
+        elif re.fullmatch(r"[\d,]+", tok):
+            current += int(tok.replace(",", "")); seen = True
+        elif tok in _NUM_UNITS:
+            current += _NUM_UNITS[tok]; seen = True
+        elif tok == "hundred":
+            current = (current or 1) * 100; seen = True
+        elif tok in _NUM_SCALES:
+            total += (current or 1) * _NUM_SCALES[tok]; current = 0; seen = True
+        else:
+            return None
+    return total + current if seen else None
+
+
+def _convert_expr(expr: str, fmt) -> str:
+    """Convert each amount in a connector-joined range/list, keep the connectors.
+    All-or-nothing: if ANY amount fails to parse, leave the whole expression
+    unchanged so a malformed expr stays visibly spelled out (easy to catch in
+    review) rather than half-digitized into a mixed spelled/digit caption."""
+    parts = _CONN_SPLIT_RE.split(expr)
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:            # connector capture group
+            out.append(part)
+        else:
+            n = _words_to_int(part)
+            if n is None:
+                return expr       # don't half-convert
+            out.append(fmt(n))
+    return "".join(out)
+
+
+def normalize_caption(text: str) -> str:
+    """Spoken finance orthography -> caption digits/symbols, anchors only.
+    Skips any match that already carries a $/% symbol — `parse_kit` runs this
+    AFTER the dual-form substitution has injected `$`-formatted figures, so a
+    re-grab would emit `$$100,000`; the guard keeps already-formatted money/percent
+    intact."""
+    for pat, repl in _CAPTION_LOOKUPS:
+        text = pat.sub(repl, text)
+    text = _YEAR_RE.sub(lambda m: str(_YEAR_MAP[m.group(0).lower()]), text)
+    text = _MONEY_RE.sub(
+        lambda m: m.group(0) if "$" in m.group(0)
+        else _convert_expr(m.group(1), lambda n: f"${n:,}"), text)
+    text = _PCT_RE.sub(
+        lambda m: m.group(0) if "%" in m.group(0)
+        else _convert_expr(m.group(1), lambda n: f"{n}%"), text)
+    return text
+
+
+def _selftest_normalize_caption() -> None:
+    cases = [
+        ("a Roth I.R.A. if you have earned income", "a Roth IRA if you have earned income"),
+        ("a Roth I R A if you have earned income", "a Roth IRA if you have earned income"),
+        ("a Roth I-R-A if you have earned income", "a Roth IRA if you have earned income"),
+        ("Match first, then Roth I-R-A, then back", "Match first, then Roth IRA, then back"),
+        ("a four-oh-one-kay match", "a 401K match"),
+        ("Match first, then Roth I.R.A., then back to the four-oh-one-kay.",
+         "Match first, then Roth IRA, then back to the 401K."),
+        ("total market versus S and P five hundred versus international",
+         "total market versus S&P 500 versus international"),
+        ("Ten thousand to a hundred thousand dollars invested",
+         "$10,000 to $100,000 invested"),
+        ("One hundred thousand to two hundred fifty thousand dollars invested",
+         "$100,000 to $250,000 invested"),
+        ("Two hundred fifty thousand to one million dollars invested",
+         "$250,000 to $1,000,000 invested"),
+        ("one million dollars and above", "$1,000,000 and above"),
+        ("Fifty dollars, seventy-five dollars, one hundred dollars.",
+         "$50, $75, $100."),
+        ("owning seventy-five dollars of the market", "owning $75 of the market"),
+        ("On a fifty-two thousand dollar salary with a four percent match",
+         "On a $52,000 salary with a 4% match"),
+        ("hand you two thousand eighty dollars a year", "hand you $2,080 a year"),
+        ("an instant fifty to one hundred percent return",
+         "an instant 50% to 100% return"),
+        ("toward fifteen percent of take-home pay", "toward 15% of take-home pay"),
+        ("the market only contributed twenty percent", "the market only contributed 20%"),
+        ("contributing seventy-seven percent of the growth",
+         "contributing 77% of the growth"),
+        ("eight thousand, twelve thousand, eighteen thousand dollars",
+         "$8,000, $12,000, $18,000"),
+        ("at the start of twenty seventeen", "at the start of 2017"),
+        ("through the twenty twenty crash and the twenty twenty-two drawdown",
+         "through the 2020 crash and the 2022 drawdown"),
+        ("By mid twenty twenty-six: one hundred forty-eight thousand dollars versus sixty-one thousand dollars.",
+         "By mid 2026: $148,000 versus $61,000."),
+        ("heading into twenty nineteen because she was nervous",
+         "heading into 2019 because she was nervous"),
+        ("four percent of one million dollars is forty thousand dollars a year",
+         "4% of $1,000,000 is $40,000 a year"),
+        ("market adds maybe one thousand to five thousand dollars",
+         "market adds maybe $1,000 to $5,000"),
+        # prose cardinals must be LEFT ALONE (no money/percent anchor)
+        ("Take two people. Both contribute five hundred dollars a month.",
+         "Take two people. Both contribute $500 a month."),
+        ("two coworkers started Level three together", "two coworkers started Level three together"),
+        ("Six levels. One ladder.", "Six levels. One ladder."),
+        ("until you cross six figures", "until you cross six figures"),
+        ("First $100 to first $1,000,000.", "First $100 to first $1,000,000."),
+        # already-formatted $/% figures (post dual-form sub) must NOT be re-grabbed
+        ("$10,000 to $100,000 dollars", "$10,000 to $100,000 dollars"),
+        ("$5,000 to ten thousand dollars", "$5,000 to $10,000"),
+        ("crossed $1.1 million at forty-eight", "crossed $1.1 million at forty-eight"),
+        ("a 4% match", "a 4% match"),
+    ]
+    bad = [(i, o, normalize_caption(i)) for i, o in cases if normalize_caption(i) != o]
+    for i, want, got in bad:
+        print(f"  FAIL  in : {i!r}\n        want: {want!r}\n        got : {got!r}")
+    assert not bad, f"{len(bad)} caption-normalizer case(s) failed"
+    print(f"normalize_caption self-test: {len(cases)} cases OK")
+
 
 def parse_kit(path: Path) -> dict[int, dict]:
     """scene_number -> {caption, filename} from the VO kit (break tags stripped)."""
@@ -244,6 +427,7 @@ def parse_kit(path: Path) -> dict[int, dict]:
         end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
         chunk = re.split(r"^---\s*$", body[start:end], maxsplit=1, flags=re.MULTILINE)[0]
         chunk = _DUAL_FORM_RE.sub(r"\2", chunk)                 # dual-form token: caption keeps the digits form
+        chunk = normalize_caption(chunk)                        # spoken finance orthography -> caption digits/symbols
         chunk = re.sub(r"<break[^>]*/>", " ", chunk)            # drop SSML
         chunk = re.sub(r"\*\*([^*]+)\*\*", r"\1", chunk)        # bold
         chunk = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", chunk)  # italic
@@ -472,10 +656,11 @@ _MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left", "pan_up", "pan_down"
 # A missing asset is skipped with a warning, so a CTA that hasn't been generated
 # yet degrades to the pre-CTA output instead of breaking a build.
 CTA_DIR = "Shared_Assets/CTA"
-# The mid-roll bump is inserted right after this scene. The locked Universal Intro
-# runs scenes 1-3 (cold open → promise → tease, ending ~0:35), so injecting after
-# scene 3 drops the bump at the body's start — clear of the 0:15–0:30 high-attrition
-# window and without breaking the intro. The outro CTA is always appended last.
+# The mid-roll bump is normally placed at the true runtime midpoint of the video
+# (Steve: it must read as a MID-video CTA, not a near-intro one). This constant is
+# only the FALLBACK floor used when per-scene VO durations are unknown (no VO
+# rendered yet) — placing the bump after the Universal Intro (scenes 1-3) so it
+# still clears the high-attrition window. The outro CTA is always appended last.
 CTA_MIDROLL_AFTER_SCENE = 3
 CTA_SEGMENTS = {
     "midroll": {
@@ -490,7 +675,7 @@ CTA_SEGMENTS = {
         "image": f"{CTA_DIR}/CTA_outro.png",
         "vo_clip": f"{CTA_DIR}/CTA_outro.mp3",
         "motion": "zoom_in",
-        "caption_text": ("And before you go: like this video, leave a comment, and "
+        "caption_text": ("And before you go — if this helped, like it and "
                          "subscribe so the next one finds you."),
     },
 }
@@ -589,11 +774,13 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     undetermined: list[int] = []
     align_notes: list[str] = []
     mi = 0  # global motion index, for visual variety across the whole video
-    # Where the mid-roll CTA goes, captured as a real out_shots index (after the
-    # CTA_MIDROLL_AFTER_SCENE scene + its pause). Counting out_shots directly — not
-    # by_scene shot counts — keeps the insertion point correct once inter-scene
-    # pause shots are interleaved below.
-    midroll_after_idx: int | None = None
+    # Mid-roll CTA placement: record every scene boundary as (scene, out_shots
+    # index, cumulative spoken seconds) so we can drop the bump at the true runtime
+    # midpoint after the loop. Counting out_shots directly — not by_scene shot
+    # counts — keeps the insertion index correct once inter-scene pause shots are
+    # interleaved below.
+    scene_boundaries: list[tuple[int, int, float]] = []
+    cum_dur = 0.0
     for scene in sorted(by_scene):
         scene_shots = by_scene[scene]
         k = len(scene_shots)
@@ -605,6 +792,8 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         if dur is None:
             all_vo = False
             dur = cadence.get(scene)  # fallback: shot-list cadence table
+        if dur is not None:
+            cum_dur += dur
         caption = kit.get(scene, {}).get("caption", "")
         cap_parts = split_scene(caption, k)
         # Cut timing, in order of preference (only when --align is on and k > 1):
@@ -674,10 +863,11 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
                 "motion": "hold",
                 "caption_text": "",
             })
-        # Capture the mid-roll insertion point as a real out_shots index, after
-        # this scene's pause, so interleaved pauses don't shift it.
-        if scene == CTA_MIDROLL_AFTER_SCENE:
-            midroll_after_idx = len(out_shots)
+        # Record this scene boundary (after its pause) as a candidate mid-roll slot.
+        # cum_dur tracks SPOKEN time only (pauses excluded) so that when no scene
+        # has a real/cadence duration, total stays 0 and we fall back to the
+        # documented after-scene floor instead of midpointing on pause time alone.
+        scene_boundaries.append((scene, len(out_shots), cum_dur))
 
     # Inject the shared reusable CTA segments (built once, never regenerated): a
     # mid-roll subscribe bump just after the Universal Intro, then the full
@@ -685,6 +875,22 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     # they add nothing to the billed image/VO stages. Insert the mid-roll first so
     # its index (counted from the pre-CTA scene shots) is unaffected by the outro
     # append.
+    # Choose the mid-roll insertion index: the scene boundary closest to 50% of the
+    # video's total spoken time (excluding the final boundary, which is the outro
+    # slot). Falls back to the after-scene-N floor when durations are unknown.
+    midroll_after_idx: int | None = None
+    if scene_boundaries:
+        total_dur = scene_boundaries[-1][2]
+        candidates = scene_boundaries[:-1]  # exclude end-of-video boundary
+        if total_dur > 0 and candidates:
+            target = total_dur / 2
+            _, midroll_after_idx, _ = min(candidates, key=lambda b: abs(b[2] - target))
+        else:  # no VO timing yet — use the documented after-scene floor
+            for sc, idx, _ in scene_boundaries:
+                if sc == CTA_MIDROLL_AFTER_SCENE:
+                    midroll_after_idx = idx
+                    break
+
     if include_cta:
         midroll = _cta_shot(asset_dir, "midroll", still=still)
         if midroll is not None:
@@ -692,8 +898,8 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             if idx is not None and 0 < idx < len(out_shots):
                 out_shots.insert(idx, midroll)
             else:
-                print(f"  ⚠ CTA midroll skipped — no scene boundary after scene "
-                      f"{CTA_MIDROLL_AFTER_SCENE} to place it (video too short?).")
+                print("  ⚠ CTA midroll skipped — no interior scene boundary to "
+                      "place it (video too short?).")
         outro = _cta_shot(asset_dir, "outro", still=still)
         if outro is not None:
             out_shots.append(outro)
