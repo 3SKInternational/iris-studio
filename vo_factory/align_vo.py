@@ -87,6 +87,56 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(_clean_text(text).encode("utf-8")).hexdigest()[:16]
 
 
+def _resolve_align_python() -> str | None:
+    """Path to an interpreter that has faster-whisper, or None.
+
+    Build_video.py runs under whatever interpreter launched it (often Homebrew
+    python, which lacks faster-whisper), but the heavy whisper step needs the
+    package. Rather than depend on every caller picking the right python — the
+    bug that made alignment silently fall back to proportional timing on EVERY
+    scene — we delegate transcription to a known-good interpreter. Resolution:
+    ALIGN_PYTHON env override, then the repo's .venv, then system python; the
+    first that exists and is NOT the (whisper-less) interpreter we're running as.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    cands = [os.environ.get("ALIGN_PYTHON"),
+             str(repo / ".venv" / "bin" / "python3"),
+             "/usr/bin/python3"]
+    self_exe = Path(sys.executable).resolve()
+    for c in cands:
+        if c and Path(c).exists() and Path(c).resolve() != self_exe:
+            return c
+    return None
+
+
+def _transcribe_via_subprocess(audio_path: Path, model_size: str):
+    """Delegate transcription to a whisper-capable interpreter; return its result.
+
+    Reuses align_vo's own --emit-hyp mode under that interpreter (where the
+    faster-whisper import succeeds, so no recursion), then parses the JSON back.
+    """
+    import subprocess
+    py = _resolve_align_python()
+    if not py:
+        die("faster-whisper not importable here and no whisper-capable interpreter "
+            "found. Set ALIGN_PYTHON, or install into the repo .venv: "
+            ".venv/bin/python3 -m pip install faster-whisper")
+    cmd = [py, str(Path(__file__).resolve()), str(audio_path),
+           "--emit-hyp", "--model", model_size]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        die(f"delegated transcription via {py} failed: {e}")
+    if proc.returncode != 0:
+        die(f"delegated transcription exited {proc.returncode}: {(proc.stderr or '')[-300:]}")
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        die(f"delegated transcription returned non-JSON ({e}): {(proc.stdout or '')[-200:]}")
+    hyp = [(w[0], float(w[1]), float(w[2])) for w in data.get("hyp", [])]
+    return hyp, float(data.get("duration", 0.0))
+
+
 def _transcribe(audio_path: Path, model_size: str):
     """Run faster-whisper; return (hyp_words, audio_duration).
 
@@ -96,8 +146,9 @@ def _transcribe(audio_path: Path, model_size: str):
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        die("faster-whisper not installed. Run: "
-            "/usr/bin/python3 -m pip install --user faster-whisper")
+        # Not installed in THIS interpreter — delegate to one that has it, so
+        # alignment engages for every run regardless of the launching python.
+        return _transcribe_via_subprocess(audio_path, model_size)
     try:
         # int8 on CPU keeps memory + time low; deterministic greedy-ish decode.
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
@@ -250,7 +301,7 @@ def load_or_align(audio_path: Path, text: str, *, model_size: str = DEFAULT_MODE
 def main() -> None:
     ap = argparse.ArgumentParser(description="Local forced alignment for a VO clip.")
     ap.add_argument("audio", help="path to the VO clip (mp3/wav/...)")
-    src = ap.add_mutually_exclusive_group(required=True)
+    src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--text", help="transcript string to align")
     src.add_argument("--text-file", help="file containing the transcript")
     ap.add_argument("--model", default=DEFAULT_MODEL,
@@ -258,11 +309,24 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="ignore cache, re-align")
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="print word timings; do not write the cache")
+    ap.add_argument("--emit-hyp", dest="emit_hyp", action="store_true",
+                    help="transcribe only; print {hyp, duration} JSON (used by "
+                         "the subprocess delegation when this interpreter lacks "
+                         "faster-whisper). No transcript needed.")
     args = ap.parse_args()
 
     audio = Path(os.path.expanduser(args.audio)).resolve()
     if not audio.is_file():
         die(f"audio not found: {audio}")
+
+    if args.emit_hyp:
+        # Raw transcription pass for a whisper-capable interpreter to hand back.
+        hyp, duration = _transcribe(audio, args.model)
+        print(json.dumps({"hyp": hyp, "duration": duration}))
+        return
+
+    if args.text is None and args.text_file is None:
+        ap.error("one of --text/--text-file is required (unless --emit-hyp)")
     text = args.text if args.text is not None else \
         Path(os.path.expanduser(args.text_file)).read_text(encoding="utf-8")
 
