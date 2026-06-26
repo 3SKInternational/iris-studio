@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -544,6 +545,7 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
                          fit: str | None = None,
                          still: bool = False,
                          include_cta: bool = True,
+                         scene_pause: float = 0.5,
                          edit_anchors: dict[int, list[str]] | None = None) -> tuple[dict, bool, list[str], list[int], list[str]]:
     """Author the video_factory edit manifest.
 
@@ -581,6 +583,11 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     undetermined: list[int] = []
     align_notes: list[str] = []
     mi = 0  # global motion index, for visual variety across the whole video
+    # Where the mid-roll CTA goes, captured as a real out_shots index (after the
+    # CTA_MIDROLL_AFTER_SCENE scene + its pause). Counting out_shots directly — not
+    # by_scene shot counts — keeps the insertion point correct once inter-scene
+    # pause shots are interleaved below.
+    midroll_after_idx: int | None = None
     for scene in sorted(by_scene):
         scene_shots = by_scene[scene]
         k = len(scene_shots)
@@ -650,6 +657,21 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             out_shots.append(shot)
         if dur is None and k > 1:
             undetermined.append(scene)
+        # Inter-scene breathing room: hold the scene's last frame, silent, so the
+        # next scene doesn't start the instant this one's VO ends. A silent shot
+        # (image + duration, no vo_clip) rides the assembler's existing anullsrc
+        # path — no shared render-math change, no cache bump.
+        if scene_pause > 0 and out_shots:
+            out_shots.append({
+                "image": out_shots[-1]["image"],
+                "duration": round(scene_pause, 3),
+                "motion": "hold",
+                "caption_text": "",
+            })
+        # Capture the mid-roll insertion point as a real out_shots index, after
+        # this scene's pause, so interleaved pauses don't shift it.
+        if scene == CTA_MIDROLL_AFTER_SCENE:
+            midroll_after_idx = len(out_shots)
 
     # Inject the shared reusable CTA segments (built once, never regenerated): a
     # mid-roll subscribe bump just after the Universal Intro, then the full
@@ -660,11 +682,8 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     if include_cta:
         midroll = _cta_shot(asset_dir, "midroll", still=still)
         if midroll is not None:
-            # Index of the first shot belonging to a scene past the threshold ==
-            # count of shots in scenes <= the threshold.
-            idx = sum(len(by_scene[s]) for s in by_scene
-                      if s <= CTA_MIDROLL_AFTER_SCENE)
-            if 0 < idx < len(out_shots):
+            idx = midroll_after_idx
+            if idx is not None and 0 < idx < len(out_shots):
                 out_shots.insert(idx, midroll)
             else:
                 print(f"  ⚠ CTA midroll skipped — no scene boundary after scene "
@@ -729,6 +748,9 @@ def parse_args() -> argparse.Namespace:
                         "reuse fixed assets and are never re-billed. STANDARD: pass "
                         "--no-cta when re-assembling an ALREADY-PUBLISHED video, so a "
                         "re-render doesn't retroactively change its cut/length.")
+    p.add_argument("--scene-pause", type=float, default=0.5,
+                   help="Seconds of silent held-frame breathing room between scenes "
+                        "(default 0.5). Pass 0 to butt scenes together with no gap.")
     return p.parse_args()
 
 
@@ -745,6 +767,9 @@ def main() -> None:
     if do_images and args.image_set:
         die("--images writes to <video>_gen but --image-set points assembly at an existing set; "
             "pick one (generate fresh, OR assemble from an existing set).")
+
+    if not math.isfinite(args.scene_pause) or not 0 <= args.scene_pause <= 10:
+        die(f"--scene-pause must be a finite value in [0, 10] (0 to disable); got {args.scene_pause}.")
 
     vid, nn = normalize_id(args.video)
     vlt = vault()
@@ -811,7 +836,7 @@ def main() -> None:
         vlt / "Footage_and_Edits", f"{vid}_v2",
         allow_image_fallback=bool(args.image_set),
         fit=args.fit, still=args.still, include_cta=not args.no_cta,
-        edit_anchors=edit_anchors,
+        scene_pause=args.scene_pause, edit_anchors=edit_anchors,
     )
     # Key the edit manifest by BOTH its image set and its VO source so distinct
     # asset combinations (e.g. `_gen`+`_gen` vs `Video_01_HD`+hand-VO) never
@@ -892,7 +917,8 @@ def main() -> None:
             vlt / "Footage_and_Edits", f"{vid}_v2",
             allow_image_fallback=bool(args.image_set),
             align=args.align, fit=args.fit, still=args.still,
-            include_cta=not args.no_cta, edit_anchors=edit_anchors,
+            include_cta=not args.no_cta, scene_pause=args.scene_pause,
+            edit_anchors=edit_anchors,
         )
         for fb in fallbacks:
             print(f"  ⚠ image fallback — {fb}")
