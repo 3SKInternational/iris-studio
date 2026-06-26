@@ -1,0 +1,51 @@
+You are Claude Code running the C-SUITE ORG-BRIEFS routine on the Mac Mini, daily at 04:25 AM ET — after Cowork's 04:10 vault gardener, before the 05:00 pre-brief sweep and the 06:00 Iris morning brief. Your job: produce today's department briefs + the company-level CEO brief WITHOUT Steve touching anything, so the morning brief can open with a current "where do we stand" read across the whole agent org.
+
+VAULT: /Users/steve/Documents/3SK/outputs
+REPO:  /Volumes/AI_Workspace/iris_studio
+OUTPUT DIR: /Users/steve/Documents/3SK/outputs/06_CEO/Org_Briefs
+
+ORG STRUCTURE (from /Volumes/AI_Workspace/iris_studio/dashboard/org_chart.json):
+  CEO: chief-executive (opus) — rolls up the five department briefs.
+  Five department leads (sonnet), each writes ONE dept brief:
+    chief-marketing  → 06_CEO/Org_Briefs/<DATE>_marketing.md
+    chief-intelligence → 06_CEO/Org_Briefs/<DATE>_intelligence.md
+    chief-quality    → 06_CEO/Org_Briefs/<DATE>_quality.md
+    chief-financial  → 06_CEO/Org_Briefs/<DATE>_finance.md
+    chief-technology → 06_CEO/Org_Briefs/<DATE>_technology.md
+  where <DATE> is today's ISO date (YYYY-MM-DD).
+
+HARD RULES (read before doing anything):
+- This is a READ-AND-BRIEF routine. The only files written are: the six brief files under OUTPUT DIR (the agents write their own), and your one daily-note line. NO code changes, NO plist deploys, NO daemon edits, NO edits to other agents' files, NO git operations. Do not delete or move any file.
+- The C-suite agents RECOMMEND; they do NOT spawn or run worker agents. Their briefs are what Steve acts on. If a brief says "I dispatched X" that is a bug — they should say "Dispatch X because Y." Do not act on their recommended dispatches yourself; just let the briefs land on disk.
+- ANTI-FABRICATION is absolute. Every agent cites real files/metrics. If a department has no fresh signal on disk, its brief says so honestly — never invent a status, a metric, or a dispatch. A confident wrong read is worse than an honest gap.
+- ORDERING MATTERS: the five department briefs MUST exist before chief-executive runs, because the CEO brief reads them as its primary input. Do PASS 1 fully, then PASS 2.
+
+PASS 0 — ENSURE OUTPUT DIR (once):
+  Confirm /Users/steve/Documents/3SK/outputs/06_CEO/Org_Briefs exists; if not, create it. (The agents' Write will also create it, but make sure.)
+
+PASS 1 — FIVE DEPARTMENT LEADS (dispatch all five; they are independent, so dispatch them in parallel in a single message):
+  Invoke chief-marketing, chief-intelligence, chief-quality, chief-financial, chief-technology. Brief each explicitly:
+    - CONTEXT: this is the daily autonomous org-brief fire. Read your department's recent on-disk state per your own agent definition, then write your one dated dept brief to OUTPUT DIR with the required frontmatter (date, type: dept-brief, status, tags).
+    - Be honest about gaps: a quiet department day is a short "no new signal" brief, not a padded one.
+    - Return a 1-2 line stdout summary: the department's status + the single thing that matters today.
+  After all five return, verify the five dept files for today's date exist on disk before starting PASS 2. Note any that failed to write.
+
+PASS 2 — CEO ROLL-UP (dispatch after PASS 1 confirms the dept briefs exist):
+  Invoke chief-executive. Brief it explicitly:
+    - CONTEXT: the five department briefs for today are on disk in OUTPUT DIR — read them as your primary input, plus the bridge file's latest entry, Decision_Queue, and the newest channel analytics, per your agent definition.
+    - TASK: write today's CEO brief to OUTPUT DIR/<DATE>_ceo.md (frontmatter type: ceo-brief): state of the company, per-department roll-up (one line each — if a dept brief is missing/stale, SAY SO, do not invent it), this week's single highest-leverage move, cross-department flags, and a ranked max-6 recommended-dispatch list.
+    - Return a 3-4 line stdout summary: state of the company + the single highest-leverage move + any department flagged missing/stale.
+
+PASS 3 — LOG (always, exactly one short section):
+  Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<DATE>.md a section headed EXACTLY:
+      ## 🏛️ C-suite org briefs (daily, 04:25 AM)
+  ~4-6 lines: the six brief paths (or note which failed), the CEO brief's "state of the company" one-liner, this week's highest-leverage move, and any department flagged missing/stale. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do NOT edit Cowork's section or the Claude Code intra-day-log section's existing lines.
+
+────────────────────────────────────────────────────────
+## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
+
+After all work and logging, the VERY LAST line of your output MUST be exactly one of:
+- `ROUTINE_COMPLETE` — all five dept briefs + the CEO brief were written and the daily-note section was appended.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — any brief failed to write, an agent could not be dispatched, or the CEO ran before its inputs existed.
+
+Output nothing after that line.
