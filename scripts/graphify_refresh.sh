@@ -25,4 +25,17 @@ if ! "$GRAPHIFY" update "$VAULT" >/dev/null 2>>/Users/steve/iris_studio/logs/gra
     exit 1
 fi
 
+# --- prune dated graph snapshots: keep the newest 7, drop older ---
+# ponytail: these are regenerable graph output, not source. The glob is anchored to
+# strict YYYY-MM-DD dir names so it can ONLY ever match dated snapshot folders — never
+# graph.json, the rolling GRAPH_REPORT.md, cache/, or transcripts/. The subshell `|| true`
+# makes a no-match (or missing dir) a clean no-op under `set -euo pipefail`.
+( cd "$VAULT/graphify-out" 2>/dev/null \
+  && ls -1d [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ 2>/dev/null | sort -r | tail -n +8 \
+  | while IFS= read -r d; do
+      d="${d%/}"                       # drop trailing slash so a matched symlink is unlinked, not followed
+      if [ -L "$d" ]; then continue; fi # never rm -rf through a date-named symlink (escape guard)
+      rm -rf "./$d" && echo "$(date '+%Y-%m-%d %H:%M') pruned old graph snapshot: $d"
+    done ) || true
+
 echo "$(date '+%Y-%m-%d %H:%M') graphify structural refresh OK ($VAULT)"
