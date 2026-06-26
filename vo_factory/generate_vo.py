@@ -243,6 +243,33 @@ def budget_lock(lock_path: Path):
 LOW_CREDIT_SAFETY = 2000  # chars of headroom we want left AFTER a run
 
 
+def preflight_numbers(kit_path: Path, *, notify: bool) -> None:
+    """Warn (don't block) if the kit holds numbers ElevenLabs is known to
+    mis-speak — non-round millions like $1,043,000, which it reads aloud as
+    'one thousand forty-three thousand'. Runs the deterministic scripts/
+    vo_number_lint.py gate; a hit prints the offenders + safe rewrites and pings
+    Steve to fix the kit and re-render. Never aborts (matches preflight_credits'
+    warn-not-block contract). Best-effort: a missing/failing linter must not break
+    a VO run."""
+    linter = Path(__file__).resolve().parent.parent / "scripts" / "vo_number_lint.py"
+    if not linter.exists():
+        return
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(linter), str(kit_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:  # noqa: BLE001 -- a flaky preflight must never stop a run
+        return
+    if proc.returncode == 1 and proc.stdout.strip():  # 1 = hazards (0 clean, 2 read error)
+        msg = proc.stdout.strip()
+        print("  preflight: ⚠️ TTS number hazard(s) — fix the kit before billing a render:\n"
+              + msg, file=sys.stderr)
+        if notify:
+            notify_steve(f"🔴 VO number hazard in {kit_path.name} — ElevenLabs may "
+                         f"mis-speak; fix the kit & re-render:\n{msg}")
+
+
 def notify_steve(text: str) -> None:
     """Best-effort Telegram alert via the repo's scripts/notify.sh. Never raises."""
     notify = Path(__file__).resolve().parent.parent / "scripts" / "notify.sh"
@@ -337,6 +364,11 @@ def main() -> None:
     # "nothing to do" exit 0 below and silently produce no mp3s. Treat it as fatal.
     if not blocks:
         die(f"{kit_path.name} has scene headers but no narration text under any of them.")
+
+    # Warn (never block) on numbers ElevenLabs mis-speaks (e.g. non-round millions).
+    # Runs for dry-run too so a hazard surfaces before any spend; Telegram ping only
+    # on a real run so dry-run experiments don't page Steve.
+    preflight_numbers(kit_path, notify=not args.dry_run)
 
     voice_id = args.voice_id or load_dotenv_value(script_dir, "ELEVENLABS_VOICE_ID") or DEFAULT_VOICE_ID
     # Model: explicit --model wins; else the allocator auto-picks premium v2 vs
