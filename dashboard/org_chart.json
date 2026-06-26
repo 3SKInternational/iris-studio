@@ -1,0 +1,62 @@
+{
+  "_comment": "3SK / Iris org structure. Single source of truth for the V.A.U.L.T. Agents view. Every 'agent'/'members' value is a real agent def stem in ~/.claude/agents/<stem>.md — no fabricated nodes. Re-slot members freely; the server renders whatever this file says and flags any stem with no def on disk. Generic dev/tooling agents (Explore, Plan, general-purpose, echo, statusline-setup, claude, claude-code-guide, pr-review-toolkit:*) are intentionally omitted — this maps the 3SK business fleet.",
+  "ceo": {
+    "agent": "chief-executive",
+    "title": "CEO",
+    "scope": "Oversees every department. Reads the department briefs + top signals, sets cross-department priorities, gives the company-level strategic read.",
+    "staff": ["decision-feeder", "project-manager", "venture-scout"]
+  },
+  "departments": [
+    {
+      "key": "marketing",
+      "lead": "chief-marketing",
+      "title": "CMO",
+      "domain": "Content & Growth",
+      "members": [
+        "scriptwriter", "scene-image-prompt-generator", "thumbnail-coordinator",
+        "video-description-writer", "packaging-strategist", "newsletter-writer",
+        "build-logger", "shorts-cutter", "community-manager", "topic-scout",
+        "asset-librarian", "sponsor-outreach-drafter", "book-writer"
+      ]
+    },
+    {
+      "key": "intelligence",
+      "lead": "chief-intelligence",
+      "title": "CIO",
+      "domain": "Research, Analytics & Adaptation",
+      "members": [
+        "channel-analyst", "youtube-researcher", "market-researcher", "researcher",
+        "figures-watcher", "adaptation-proposer", "adaptation-outcome-evaluator",
+        "canon-reviewer"
+      ]
+    },
+    {
+      "key": "quality",
+      "lead": "chief-quality",
+      "title": "CQO",
+      "domain": "Review Gates",
+      "members": [
+        "script-reviewer", "image-reviewer", "vo-reviewer", "packaging-reviewer",
+        "description-reviewer", "analyze-reviewer", "book-editor",
+        "skeptical-code-reviewer"
+      ]
+    },
+    {
+      "key": "finance",
+      "lead": "chief-financial",
+      "title": "CFO",
+      "domain": "Books & Spend",
+      "members": ["expense-categorizer", "expense-reviewer"]
+    },
+    {
+      "key": "technology",
+      "lead": "chief-technology",
+      "title": "CTO",
+      "domain": "Engineering & Platform",
+      "members": [
+        "senior-engineer", "senior-systems-architect", "performance-optimizer",
+        "security-auditor"
+      ]
+    }
+  ]
+}
