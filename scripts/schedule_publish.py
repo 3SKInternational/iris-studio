@@ -14,7 +14,9 @@ Usage (dry-run by default — prints the plan, calls nothing):
       Video_07=2026-06-30T18:00:00Z --commit
 
 Each arg is LABEL=ISO8601-UTC. Add --commit to actually call the API and write the
-publish_at back into the receipt. Reuses youtube_client.py for auth (youtube scope).
+publish_at back into the receipt. Add --synthetic to also set the "altered or
+synthetic media" disclosure (status.containsSyntheticMedia=True) in the same update
+— correct for the AI-animated + TTS 3SK videos. Reuses youtube_client.py for auth.
 
 # ponytail: GET-then-update merges publishAt into the LIVE status part so we don't
 # clobber selfDeclaredMadeForKids / license / embeddable. Send only the writable
@@ -48,6 +50,7 @@ _WRITABLE_STATUS = (
     "license",
     "embeddable",
     "publicStatsViewable",
+    "containsSyntheticMedia",
 )
 
 
@@ -60,14 +63,17 @@ def vault() -> Path:
     return Path(os.path.expanduser(os.environ.get("SK_VAULT", DEFAULT_VAULT))).resolve()
 
 
-def parse_arg(raw: str) -> tuple[str, str]:
-    """'Video_05=2026-06-26T18:00:00Z' -> ('Video_05', RFC3339 publishAt)."""
-    if "=" not in raw:
-        die(f"bad arg {raw!r}; expected LABEL=ISO8601 (e.g. Video_05=2026-06-26T18:00:00Z)")
+def parse_arg(raw: str) -> tuple[str, str | None]:
+    """'Video_05=2026-06-26T18:00:00Z' -> ('Video_05', RFC3339 publishAt).
+    A bare 'Video_05' (no '=time') -> ('Video_05', None) = preserve-mode: touch
+    only the flags requested (e.g. --synthetic), leaving privacy + any existing
+    schedule untouched."""
     label, _, when = raw.partition("=")
     label, when = label.strip(), when.strip()
     if not label.startswith("Video_"):
         die(f"bad label {label!r}; expected 'Video_NN'")
+    if "=" not in raw or not when:
+        return label, None  # preserve-mode: no schedule change
     try:
         dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
     except ValueError:
@@ -107,12 +113,16 @@ def get_status(youtube, video_id: str) -> dict:
 
 
 def main() -> int:
-    args = [a for a in sys.argv[1:] if a != "--commit"]
+    flags = {"--commit", "--synthetic"}
+    args = [a for a in sys.argv[1:] if a not in flags]
     commit = "--commit" in sys.argv[1:]
+    synthetic = "--synthetic" in sys.argv[1:]  # declare "altered or synthetic media"
     if not args:
-        die("no videos given. Usage: schedule_publish.py Video_05=2026-06-26T18:00:00Z [...] [--commit]")
+        die("no videos given. Usage: schedule_publish.py Video_05=2026-06-26T18:00:00Z [...] [--commit] [--synthetic]")
 
     plan = [parse_arg(a) for a in args]
+    if any(pa is None for _, pa in plan) and not synthetic:
+        die("a bare 'Video_NN' (preserve-mode) needs --synthetic — otherwise there's nothing to change.")
     receipts = {label: load_receipt(label) for label, _ in plan}
 
     try:
@@ -121,7 +131,13 @@ def main() -> int:
         die(str(exc))
     youtube = build_data_service(creds)
 
-    print(f"{'COMMIT' if commit else 'DRY-RUN'} — scheduling {len(plan)} video(s) to flip public:\n")
+    def publish_matches(after_pa, want_pa) -> bool:
+        # want_pa None = "no schedule" (after must also be unscheduled); else to-the-second.
+        if want_pa is None:
+            return not after_pa
+        return (after_pa or "")[:19] == want_pa[:19]
+
+    print(f"{'COMMIT' if commit else 'DRY-RUN'} — updating {len(plan)} video(s):\n")
     failures = 0
     for label, publish_at in plan:
         path, data = receipts[label]
@@ -138,23 +154,44 @@ def main() -> int:
         new_status = {k: live[k] for k in _WRITABLE_STATUS if k in live}
         # Floor matching upload_video.py: never let the COPPA flag go unset on update.
         new_status.setdefault("selfDeclaredMadeForKids", False)
-        new_status["privacyStatus"] = "private"  # required pairing for a scheduled publish
-        new_status["publishAt"] = publish_at
+        if publish_at is not None:  # schedule-mode: flip to a scheduled public release
+            want_privacy, want_publish = "private", publish_at
+            new_status["privacyStatus"] = "private"  # required pairing for a scheduled publish
+            new_status["publishAt"] = publish_at
+        else:  # preserve-mode: leave privacy + any existing schedule exactly as-is
+            want_privacy, want_publish = live.get("privacyStatus"), live.get("publishAt")
+            if want_publish:  # re-send so an omission can't clear an existing schedule
+                new_status["publishAt"] = want_publish
+        if synthetic:
+            new_status["containsSyntheticMedia"] = True
         print(f"  {label} ({vid}): {data.get('title','(untitled)')[:60]}")
-        print(f"      was: privacyStatus={live.get('privacyStatus')} publishAt={live.get('publishAt')}")
-        print(f"      ->   privacyStatus=private publishAt={publish_at}")
+        print(f"      was: privacyStatus={live.get('privacyStatus')} publishAt={live.get('publishAt')}"
+              f" syntheticMedia={live.get('containsSyntheticMedia')}")
+        print(f"      ->   privacyStatus={want_privacy} publishAt={want_publish}"
+              + ("  syntheticMedia=True" if synthetic else ""))
 
         if not commit:
             continue
         try:
-            youtube.videos().update(part="status", body={"id": vid, "status": new_status}).execute()
+            resp = youtube.videos().update(part="status", body={"id": vid, "status": new_status}).execute()
         except Exception as exc:
             print(f"  ✗ {label} ({vid}): update FAILED — {type(exc).__name__}: {exc}")
             failures += 1
             continue
-        # Confirm the schedule actually took before trusting it / writing the receipt.
-        # videos().update is read-after-write eventually-consistent: an immediate GET
-        # can still show the OLD status for a few seconds, so poll with backoff.
+        rst = resp.get("status", {})
+
+        # containsSyntheticMedia is confirmable ONLY via the update RESPONSE: videos.list
+        # does NOT return it to the owner (verified — it reads back null even right after a
+        # response that echoes True), so a list-based check false-negatives. The update
+        # response is the server's post-write resource, so an echoed True is the persist proof.
+        if synthetic and rst.get("containsSyntheticMedia") is not True:
+            print(f"  ✗ {label} ({vid}): synthetic-media flag NOT accepted — update response "
+                  f"status.containsSyntheticMedia={rst.get('containsSyntheticMedia')!r}")
+            failures += 1
+            continue
+
+        # privacy + schedule DO read back via list (eventually — it's read-after-write lagged),
+        # so poll-confirm those externally: this is the high-stakes public-flip guard.
         after, verify_err = {}, None
         for attempt in range(VERIFY_TRIES):
             if attempt:
@@ -167,22 +204,27 @@ def main() -> int:
                 verify_err = exc
                 continue
             verify_err = None
-            if after.get("publishAt", "")[:19] == publish_at[:19] and after.get("privacyStatus") == "private":
+            if (publish_matches(after.get("publishAt"), want_publish)
+                    and after.get("privacyStatus") == want_privacy):
                 break
         if verify_err is not None:
             print(f"  ✗ {label} ({vid}): update sent but verify GET failed — {type(verify_err).__name__}: {verify_err}")
             failures += 1
             continue
-        if after.get("publishAt", "")[:19] != publish_at[:19] or after.get("privacyStatus") != "private":
-            print(f"  ✗ {label} ({vid}): schedule did NOT take after {VERIFY_TRIES} checks — live status now "
+        if (not publish_matches(after.get("publishAt"), want_publish)
+                or after.get("privacyStatus") != want_privacy):
+            print(f"  ✗ {label} ({vid}): privacy/schedule did NOT take after {VERIFY_TRIES} checks — live status now "
                   f"privacyStatus={after.get('privacyStatus')} publishAt={after.get('publishAt')}")
             failures += 1
             continue
 
-        data["privacy"] = "private"
-        data["publish_at"] = publish_at
+        if publish_at is not None:
+            data["privacy"] = "private"
+            data["publish_at"] = publish_at
+        if synthetic:
+            data["contains_synthetic_media"] = True
         write_receipt(path, data)
-        print(f"  ✅ {label}: scheduled & verified; receipt updated.")
+        print(f"  ✅ {label}: verified; receipt updated.")
 
     if not commit:
         print("\n(dry-run) re-run with --commit to apply.")

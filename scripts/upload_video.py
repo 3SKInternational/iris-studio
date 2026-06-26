@@ -755,6 +755,11 @@ def main() -> None:
     status_part: dict = {
         "privacyStatus": "private" if publish_at else args.privacy,
         "selfDeclaredMadeForKids": False,
+        # ponytail: every 3SK video is AI-animated + TTS, so the "altered or synthetic
+        # media" disclosure is always required. Set at INSERT — videos.update accepts it
+        # (response echoes True) but videos.list never reads it back, so insert-time is
+        # the clean place. Add a CLI flag only if a non-synthetic upload ever ships here.
+        "containsSyntheticMedia": True,
     }
     if publish_at:
         # Scheduled publish: status must be private + publishAt; it flips public
@@ -777,6 +782,13 @@ def main() -> None:
     video_id = response["id"]
     url = f"https://youtu.be/{video_id}"
     print(f"  videoId: {video_id}  →  {url}")
+    # The insert response is the ONLY surface that reflects containsSyntheticMedia
+    # (videos.list never returns it), so confirm the disclosure stuck here and warn loudly
+    # if it didn't — a missing A/S disclosure is a policy risk on an AI-generated channel.
+    synthetic_ok = response.get("status", {}).get("containsSyntheticMedia") is True
+    if not synthetic_ok:
+        print("  ⚠ altered/synthetic-media disclosure NOT confirmed in the insert response — "
+              "set it manually in Studio (Editing → 'Altered or synthetic content').", file=sys.stderr)
 
     # Persist the receipt NOW — the video is live and its id is the only thing a
     # re-run needs to avoid a duplicate upload. The caption/thumbnail steps below
@@ -789,6 +801,7 @@ def main() -> None:
         "title": title,
         "privacy": status_part["privacyStatus"],
         "publish_at": status_part.get("publishAt"),
+        "contains_synthetic_media": synthetic_ok,
         "category_id": str(args.category),
         "tags": tags,
         "captions_set": False,
