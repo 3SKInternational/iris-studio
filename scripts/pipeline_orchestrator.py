@@ -577,6 +577,40 @@ def gates_awaiting_steve(stages: dict) -> list[str]:
 AGENTS_DIR = Path(os.path.expanduser("~/.claude/agents"))
 
 
+def _agent_uses_mcp(agent: str) -> bool:
+    """True if dispatching this agent might load an MCP server — i.e. its def's
+    frontmatter `tools:` grants any mcp__* tool, grants ALL tools (`*` / 'All
+    tools'), or declares no `tools:` allowlist at all (no allowlist ⇒ inherits
+    everything, MCP included). Fails SAFE (True) on any read error. We strip MCP
+    only when we can POSITIVELY confirm an explicit allowlist with no mcp__* entry,
+    so a reviewer/fixer that legitimately uses an MCP server never silently loses
+    it."""
+    try:
+        text = (AGENTS_DIR / f"{agent}.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    m = re.search(r"^tools:[ \t]*(\S.*)$", text, re.MULTILINE)
+    if not m:
+        return True
+    tools = m.group(1).strip()
+    return "mcp__" in tools or tools == "*" or "all tools" in tools.lower()
+
+
+def _build_agent_cmd(agent: str, prompt: str) -> list[str]:
+    """Single source of truth for every `claude --print --agent` dispatch cmd.
+    Adds --strict-mcp-config (loads ZERO MCP servers, since we pass no --mcp-config)
+    ONLY when the agent declares an explicit allowlist with no mcp__* tool — that
+    skips MCP cold-start init + hang risk (e.g. a google-workspace OAuth refresh
+    stalling startup), the latency source behind the 654a219 vo-reviewer timeout —
+    while never stripping MCP from an agent that needs it."""
+    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", agent]
+    if not _agent_uses_mcp(agent):
+        cmd.append("--strict-mcp-config")
+    cmd += ["--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
+            "--", prompt]
+    return cmd
+
+
 def run_agent_stage(key: str, video: int, stages: dict) -> tuple[bool, str]:
     """Route an agent stage to its executor under the BINARY quality-control policy
     (Steve, 2026-06-20: every step has a review + feedback-loop gate).
@@ -622,9 +656,7 @@ def _dispatch_stage_agent(key: str, video: int) -> tuple[bool, str]:
         notify(msg)
         return False, msg
     prompt = _stage_prompt(key, video)
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", agent,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(agent, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=cfg["timeout"])
@@ -970,9 +1002,7 @@ def run_image_review(mode: str, video: int,
         f"fix under {block_tok}). There is no 'ship with fixes': if it is not all "
         f"good to go, none of it goes."
     )
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", IMAGE_REVIEWER_AGENT,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(IMAGE_REVIEWER_AGENT, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=IMAGE_REVIEW_TIMEOUT)
@@ -1014,9 +1044,7 @@ def run_prompt_fixer(video: int, verdict_rel: str,
         f"every image `name`, and every already-passing shot UNCHANGED. Do not add or "
         f"remove shots. Write the corrected manifest back to {manifest_rel}."
     )
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", PROMPT_FIXER_AGENT,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(PROMPT_FIXER_AGENT, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=IMAGE_REVIEW_TIMEOUT)
@@ -1083,9 +1111,7 @@ def run_script_review(video: int) -> tuple[str, str, str]:
         f"REVISE (anything less — list every fix under REVISE). There is no 'ship with "
         f"fixes': if it is not all good to go, none of it goes."
     )
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", SCRIPT_REVIEWER_AGENT,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(SCRIPT_REVIEWER_AGENT, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=timeout)
@@ -1124,9 +1150,7 @@ def run_script_fixer(video: int, verdict_rel: str) -> tuple[bool, str]:
         f"every already-passing section UNCHANGED. Write the corrected script back to the "
         f"same path."
     )
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", SCRIPT_FIXER_AGENT,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(SCRIPT_FIXER_AGENT, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=timeout)
@@ -1215,15 +1239,7 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
         f"offending substring → TTS-safe rewrite under REVISE). There is no 'ship with "
         f"fixes': if it is not all good to go, none of it goes to the billed render."
     )
-    # --strict-mcp-config with no --mcp-config loads ZERO MCP servers. vo-reviewer
-    # only uses Read/Grep/Glob/Write (no MCP), so skipping MCP init removes the
-    # biggest cold-start cost and the hang risk (e.g. a google-workspace OAuth
-    # refresh stalling startup until the timeout). This is what made a cold
-    # dispatch crawl past 600s under load.
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", VO_REVIEWER_AGENT,
-           "--strict-mcp-config",
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(VO_REVIEWER_AGENT, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=VO_REVIEW_TIMEOUT)
@@ -1450,9 +1466,7 @@ def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
     v = f"Video_{nn(video)}"
     timeout = RUN_TABLE[key]["timeout"]
     prompt = cfg["review_prompt"].format(v=v, verdict_rel=verdict_rel)
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", reviewer,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(reviewer, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=timeout)
@@ -1486,9 +1500,7 @@ def run_stage_fixer(key: str, video: int, verdict_rel: str) -> tuple[bool, str]:
     v = f"Video_{nn(video)}"
     timeout = RUN_TABLE[key]["timeout"]
     prompt = cfg["fix_prompt"].format(v=v, verdict_rel=verdict_rel)
-    cmd = [CLAUDE_CLI_PATH, "--print", "--agent", fixer,
-           "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
-           "--", prompt]
+    cmd = _build_agent_cmd(fixer, prompt)
     try:
         proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
                               text=True, timeout=timeout)
