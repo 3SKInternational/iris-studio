@@ -829,7 +829,11 @@ SCRIPT_FIXER_AGENT = "scriptwriter"
 # renders only on SHIP. vo-reviewer is read-only ($0) so re-review is free, but the
 # kit mtime is cached so it is dispatched at most once per kit revision.
 VO_REVIEWER_AGENT = "vo-reviewer"
-VO_REVIEW_TIMEOUT = 600
+# 900s (was 600): a cold `claude --print` dispatch can blow past 600s when the
+# hourly pipeline-sweep fires DURING a concurrent billed render/assemble that is
+# saturating CPU. The reviewer fails CLOSED on timeout (parks for human), so a
+# too-tight window only causes spurious park+notify churn, never a bad ship.
+VO_REVIEW_TIMEOUT = 900
 IMAGE_REVIEW_TIMEOUT = 900
 # Closed review→fix→re-review loop budget at the PROMPTS gate. Fixing prompts is
 # free, so we iterate, but bounded: after this many fix dispatches still HOLD-
@@ -1211,7 +1215,13 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
         f"offending substring → TTS-safe rewrite under REVISE). There is no 'ship with "
         f"fixes': if it is not all good to go, none of it goes to the billed render."
     )
+    # --strict-mcp-config with no --mcp-config loads ZERO MCP servers. vo-reviewer
+    # only uses Read/Grep/Glob/Write (no MCP), so skipping MCP init removes the
+    # biggest cold-start cost and the hang risk (e.g. a google-workspace OAuth
+    # refresh stalling startup until the timeout). This is what made a cold
+    # dispatch crawl past 600s under load.
     cmd = [CLAUDE_CLI_PATH, "--print", "--agent", VO_REVIEWER_AGENT,
+           "--strict-mcp-config",
            "--add-dir", str(WORKSPACE_DIR), "--dangerously-skip-permissions",
            "--", prompt]
     try:
