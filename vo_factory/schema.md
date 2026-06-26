@@ -34,6 +34,20 @@ verbatim — ElevenLabs honors them on `eleven_multilingual_v2` — and strip on
 markdown emphasis and the header's `(label, timestamp)` so nothing decorative is
 read aloud.
 
+## Dual-form caption token `{{spoken|caption}}`
+
+Numbers are a split requirement: ElevenLabs misreads comma-grouped figures, so
+the VO must SPEAK words ("one hundred thousand dollars"), but the on-screen SRT
+caption reads better as DIGITS ("$100,000"). Write both forms co-located in the
+ONE kit with a dual-form token: `{{one hundred thousand dollars|$100,000}}`.
+`generate_vo.py` keeps the **left** (spoken) form; `build_video.py`'s caption
+parser keeps the **right** (digits). Tokens with no `{{...}}` behave exactly as
+before. This replaces the old workaround of maintaining two separate kit files,
+which silently drifted and shipped wrong captions on Video_05 (caption said
+"Marcus"/"rung" while the audio said "Tyler"/"level"). Constraints: the spoken
+(left) form cannot contain a literal `|`, and tokens must not be nested. The two
+parsers' regexes are kept identical by `test_dual_form.py`.
+
 ## Running
 
 ```bash
