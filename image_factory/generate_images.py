@@ -34,7 +34,12 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+
+# Append-only spend ledger (realtime, one JSON line per billed render). Lives
+# next to this script and is gitignored — it is local spend data, not code.
+LEDGER_DEFAULT = Path(__file__).resolve().parent / "cost_ledger.jsonl"
 
 # --- Config values (deliberately swappable) ---------------------------------
 
@@ -243,12 +248,100 @@ def generate_flux(*_args, **_kwargs):
 PROVIDERS = {"openai": generate_openai, "flux": generate_flux}
 
 
+# --- Cost ledger (realtime spend + re-render tracking) ----------------------
+
+
+def video_label(manifest_name: str) -> str:
+    """Stable per-video key for the ledger ('Video_05' from any V5 manifest)."""
+    m = re.search(r"(Video_\d+)", manifest_name)
+    return m.group(1) if m else Path(manifest_name).stem
+
+
+def load_render_counts(ledger_path: Path, video: str) -> dict:
+    """shot -> times already billed for THIS video, so a repeat render is flagged."""
+    counts: dict = {}
+    if not ledger_path.exists():
+        return counts
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # ponytail: tolerate a torn last line, never crash the batch on it
+        if rec.get("video") == video and rec.get("shot"):
+            counts[rec["shot"]] = counts.get(rec["shot"], 0) + 1
+    return counts
+
+
+def ledger_append(ledger_path: Path, record: dict) -> None:
+    """Append one render record NOW. fsync so a mid-batch crash still leaves the row."""
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(ledger_path, "a") as fh:
+        fh.write(json.dumps(record) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def print_report(ledger_path: Path) -> None:
+    """Per-video + grand-total spend and re-render counts from the ledger."""
+    if not ledger_path.exists():
+        print(f"no ledger yet at {ledger_path} — it fills as live renders run.")
+        return
+    agg: dict = {}
+    grand = {"renders": 0, "rerenders": 0, "cost": 0.0, "dup_cost": 0.0, "unknown": 0, "unsaved": 0}
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        v = rec.get("video", "?")
+        a = agg.setdefault(v, {"renders": 0, "rerenders": 0, "cost": 0.0, "dup_cost": 0.0, "unknown": 0, "unsaved": 0})
+        cost = rec.get("cost_usd")
+        rr = bool(rec.get("rerender"))
+        # `saved` is absent on pre-fix rows → treat missing as saved (no false alarm).
+        unsaved = rec.get("saved") is False
+        for tgt in (a, grand):
+            tgt["renders"] += 1
+            if rr:
+                tgt["rerenders"] += 1
+            if unsaved:
+                tgt["unsaved"] += 1
+            if cost is None:
+                tgt["unknown"] += 1
+            else:
+                tgt["cost"] += cost
+                if rr:
+                    tgt["dup_cost"] += cost
+    hdr = f"{'video':<14}{'renders':>9}{'re-renders':>12}{'spend':>11}{'dup spend':>11}"
+    print(f"cost ledger: {ledger_path}\n")
+    print(hdr)
+    print("-" * len(hdr))
+    for v in sorted(agg):
+        a = agg[v]
+        print(f"{v:<14}{a['renders']:>9}{a['rerenders']:>12}"
+              f"{'$' + format(a['cost'], '.2f'):>11}{'$' + format(a['dup_cost'], '.2f'):>11}")
+    print("-" * len(hdr))
+    print(f"{'TOTAL':<14}{grand['renders']:>9}{grand['rerenders']:>12}"
+          f"{'$' + format(grand['cost'], '.2f'):>11}{'$' + format(grand['dup_cost'], '.2f'):>11}")
+    if grand["unknown"]:
+        print(f"\nnote: {grand['unknown']} render(s) returned no API usage — billed but "
+              f"cost unknown, excluded from the $ totals.")
+    if grand["unsaved"]:
+        print(f"note: {grand['unsaved']} render(s) billed but the PNG did not save "
+              f"(re-render needed, not duplicate spend).")
+
+
 # --- Driver -----------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Batch scene-image generator (3SK video factory).")
-    p.add_argument("manifest", help="Path to the image manifest JSON.")
+    p.add_argument("manifest", nargs="?", help="Path to the image manifest JSON (omit with --report).")
     p.add_argument("--provider", choices=VALID_PROVIDERS, help="Override manifest/default provider.")
     p.add_argument("--model", help="Override the model id (config value).")
     p.add_argument("--quality", choices=VALID_QUALITIES, help="Override quality for the whole batch.")
@@ -269,12 +362,22 @@ def parse_args() -> argparse.Namespace:
                    help="Refuse to bill more than N images in one run (spend guard; default 150).")
     p.add_argument("--max-cost", type=float, default=30.0,
                    help="Refuse to run if the estimated batch cost exceeds $N (spend guard; default 30).")
+    p.add_argument("--ledger", help="Cost-ledger JSONL path (default: image_factory/cost_ledger.jsonl).")
+    p.add_argument("--report", action="store_true",
+                   help="Print spend + re-render summary from the ledger and exit (no manifest needed).")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
+    ledger_path = Path(os.path.expanduser(args.ledger)) if args.ledger else LEDGER_DEFAULT
+
+    if args.report:
+        print_report(ledger_path)
+        return
+    if not args.manifest:
+        die("manifest is required (or pass --report to summarize the ledger)")
 
     manifest_path = Path(args.manifest)
     if not manifest_path.exists():
@@ -398,6 +501,11 @@ def main() -> None:
     actual_total = 0.0
     saw_usage = False
     made = skipped = failed = 0
+    reran = 0          # images billed this run whose shot was already in the ledger
+    dup_cost = 0.0     # $ spent re-rendering those shots this run
+    video = video_label(manifest_path.name)
+    # Prior render counts for THIS video — so a shot rendered again is flagged a re-render.
+    render_counts = load_render_counts(ledger_path, video) if not args.dry_run else {}
 
     for img in images:
         # Coerce to safe types before any membership/format check: a hand-authored
@@ -449,26 +557,61 @@ def main() -> None:
                 input_fidelity=b_fidelity,
                 background=background,
             )
-            fd, tmp = tempfile.mkstemp(suffix=".png", dir=out_dir)
-            try:
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(png)
-                os.replace(tmp, dest)
-            except BaseException:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-                raise
+            # The money is spent the instant gen() returns. Record the ledger row
+            # NOW — before the file save, which can still fail (disk full, perms)
+            # or be cut short by a crash. Recording first means a billed image is
+            # never lost from the spend log even if its PNG never lands; the
+            # `saved` flag distinguishes "paid + on disk" from "paid, save failed".
             real = actual_cost(model, usage)
             if real is not None:
                 actual_total += real
                 saw_usage = True
+            prior = render_counts.get(name, 0)
+            render_counts[name] = prior + 1
+            is_rerender = prior > 0
+            if is_rerender:
+                reran += 1
+                if real is not None:
+                    dup_cost += real
+            saved = False
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".png", dir=out_dir)
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(png)
+                    os.replace(tmp, dest)
+                    saved = True
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+            finally:
+                # Append in the finally so the spend is logged whether the save
+                # succeeded or threw — the bill already happened either way.
+                ledger_append(ledger_path, {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "video": video,
+                    "manifest": manifest_path.name,
+                    "shot": name,
+                    "model": model,
+                    "quality": quality,
+                    "size": size,
+                    "cost_usd": round(real, 4) if real is not None else None,
+                    "render_count": prior + 1,
+                    "rerender": is_rerender,
+                    "saved": saved,
+                })
             cost_str = f"${real:.3f}" if real is not None else f"~${est:.3f}"
-            print(f"  + {name}  [{tag}]  {cost_str}  -> {dest.name}")
+            rr_tag = f"  [RE-RENDER #{prior + 1}]" if is_rerender else ""
+            print(f"  + {name}  [{tag}]  {cost_str}  -> {dest.name}{rr_tag}")
             made += 1
         except NotImplementedError as e:
             die(str(e))
         except Exception as e:  # one bad image must not kill the batch
-            print(f"  ! {name}  FAILED: {e}", file=sys.stderr)
+            # If gen() already returned, the bill happened and the finally above
+            # logged it (saved=false); this path also covers a pre-bill API error.
+            print(f"  ! {name}  FAILED (if it billed, it's logged in the ledger): {e}",
+                  file=sys.stderr)
             failed += 1
 
     print()
@@ -478,7 +621,11 @@ def main() -> None:
         line = f"done: {made} generated, {skipped} skipped, {failed} failed"
         if saw_usage:
             line += f"  |  billed ~${actual_total:.2f}"
+        if reran:
+            line += f"  |  {reran} re-render(s) (~${dup_cost:.2f} duplicate spend)"
         print(line)
+        if made:
+            print(f"ledger   : {ledger_path}  (run with --report for the running total)")
         if failed:
             sys.exit(1)
 

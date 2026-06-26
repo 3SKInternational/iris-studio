@@ -41,3 +41,6 @@ backups/
 # Per-machine Claude Code local config — carries a personal permission
 # allowlist + machine-specific hooks. Stays local, never versioned.
 .claude/settings.local.json
+
+# local image-render spend ledger (data, not code)
+image_factory/cost_ledger.jsonl
