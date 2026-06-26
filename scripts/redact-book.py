@@ -6,6 +6,11 @@
 # Hardened 2026-06-17 (skeptical-code-reviewer C1/C2/H2): added credential redaction
 # (API keys, bot tokens, AWS keys, generic KEY=value, any email) shared between the
 # substitution pass AND the fail-closed residual check so they cannot drift; guarded I/O.
+# Hardened 2026-06-26 (book-update pipeline hit a fail-closed-on-clean-input bug): the
+# replace set drifted from the IGNORECASE residual check for compound tokens — `\biris\b`
+# missed `_Iris_Memory` and the case-sensitive STEVE_CONTEXT entry missed `steve_context`,
+# both of which the residual check flagged. Added IGNORECASE subs mirroring the checks.
+# Regression test: scripts/test_redact_book.py.
 import re, sys
 
 # Target book path: first CLI arg if given, else the flagship (backward compatible with
@@ -52,10 +57,19 @@ s = re.sub(r"\bmainfolder\b", "[USER]", s, flags=re.IGNORECASE)
 s = re.sub(r"studio@[A-Za-z0-9._%+-]+\.[A-Za-z]{2,}", "[EMAIL]", s, flags=re.IGNORECASE)
 s = re.sub(r"\b5582798766\b", "[USER_ID]", s)
 s = re.sub(r"3SK", "[COMPANY]", s, flags=re.IGNORECASE)
+# STEVE_CONTEXT only appears in the case-SENSITIVE `ordered` set, but the residual check
+# `steve_context` is IGNORECASE — so a lowercase/mixed `steve_context` would survive replace
+# yet fail the check (same drift class as the iris fix above). Mirror the check.
+s = re.sub(r"steve_context", "[AUTHOR]_CONTEXT", s, flags=re.IGNORECASE)
 # Identity words: lowercase standalone "steve" = the macOS username -> [USER]; every other
 # case form of Steve/Steven = the person -> [AUTHOR]. Lowercase first to keep the distinction.
 s = re.sub(r"\bsteve\b", "[USER]", s)
 s = re.sub(r"\bste(?:ven?s?|phens?)\b", "[AUTHOR]", s, flags=re.IGNORECASE)
+# "iris" as a compound-token prefix (iris_X / iris.X) has NO leading word boundary when it
+# follows a word char (e.g. "_Iris_Memory"), so \biris\b below would miss it while the
+# residual check `iris[_.]\w` flags it -> the redaction would fail-closed on a path the
+# scrub never rewrote. Mirror the check exactly so replace-set and check-set can't drift.
+s = re.sub(r"iris(?=[_.]\w)", "[ASSISTANT]", s, flags=re.IGNORECASE)
 s = re.sub(r"\biris\b", "[ASSISTANT]", s, flags=re.IGNORECASE)
 
 # 2b) CREDENTIAL redaction. These are high-precision secret shapes that don't match prose.
