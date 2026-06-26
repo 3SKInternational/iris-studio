@@ -62,6 +62,7 @@ FALLBACK_MODEL = "eleven_flash_v2_5"
 DEFAULT_STABILITY = 0.5
 DEFAULT_SIMILARITY = 0.75
 DEFAULT_STYLE = 0.0
+DEFAULT_SPEED = 1.0  # ElevenLabs voice_settings.speed; valid 0.7-1.2, 1.0 = native pace.
 
 # ElevenLabs bills ~1 credit per character of the submitted text (break tags
 # included). Used only for the offline --dry-run estimate.
@@ -311,7 +312,8 @@ def preflight_credits(key: str, need_chars: int) -> None:
 
 
 def synthesize(text: str, *, key: str, voice_id: str, model: str,
-               stability: float, similarity: float, style: float) -> bytes:
+               stability: float, similarity: float, style: float,
+               speed: float) -> bytes:
     url = f"{API_BASE}/text-to-speech/{voice_id}"
     payload = {
         "text": text,
@@ -320,6 +322,7 @@ def synthesize(text: str, *, key: str, voice_id: str, model: str,
             "stability": stability,
             "similarity_boost": similarity,
             "style": style,
+            "speed": speed,
             "use_speaker_boost": True,
         },
     }
@@ -337,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stability", type=float, help="Voice stability 0-1.")
     p.add_argument("--similarity", type=float, help="Similarity boost 0-1.")
     p.add_argument("--style", type=float, help="Style exaggeration 0-1.")
+    p.add_argument("--speed", type=float, help="Speaking speed 0.7-1.2 (1.0 = native; ElevenLabs rejects outside this range).")
     p.add_argument("--limit", type=int, help="Generate at most N clips (smoke test).")
     p.add_argument("--force", action="store_true", help="Re-render mp3s that already exist.")
     p.add_argument("--dry-run", action="store_true", help="Plan + credit estimate; no API calls, no writes.")
@@ -392,6 +396,9 @@ def main() -> None:
     stability = args.stability if args.stability is not None else DEFAULT_STABILITY
     similarity = args.similarity if args.similarity is not None else DEFAULT_SIMILARITY
     style = args.style if args.style is not None else DEFAULT_STYLE
+    speed = args.speed if args.speed is not None else DEFAULT_SPEED
+    if not 0.7 <= speed <= 1.2:
+        die(f"--speed {speed} out of range; ElevenLabs accepts 0.7-1.2.")
     # Default to a '<kit-folder>_gen' sibling rather than the kit's own folder:
     # the kit lives beside the hand-recorded set (e.g. Voice_Files/Video_01/),
     # and a bare run must never overwrite those. An explicit --output overrides.
@@ -406,7 +413,7 @@ def main() -> None:
         blocks = blocks[: args.limit]
 
     print(f"kit      : {kit_path.name}   scenes: {len(blocks)}")
-    print(f"voice    : {voice_id}   model: {model}   stab/sim/style: {stability}/{similarity}/{style}")
+    print(f"voice    : {voice_id}   model: {model}   stab/sim/style/speed: {stability}/{similarity}/{style}/{speed}")
     print(f"output   : {out_dir}")
     if dec is not None:
         print(f"allocator: {dec.model_key} ({dec.model_id})  score={dec.score:.2f}  "
@@ -454,7 +461,7 @@ def main() -> None:
         try:
             audio = synthesize(
                 b["text"], key=key, voice_id=voice_id, model=model,
-                stability=stability, similarity=similarity, style=style,
+                stability=stability, similarity=similarity, style=style, speed=speed,
             )
             if not audio:
                 raise RuntimeError("empty audio response")
