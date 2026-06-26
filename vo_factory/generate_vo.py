@@ -341,6 +341,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--similarity", type=float, help="Similarity boost 0-1.")
     p.add_argument("--style", type=float, help="Style exaggeration 0-1.")
     p.add_argument("--speed", type=float, help="Speaking speed 0.7-1.2 (1.0 = native; ElevenLabs rejects outside this range).")
+    p.add_argument("--only", help="Render only these scene numbers (comma-separated, e.g. 22,24). Add --force to overwrite existing mp3s. Model is still chosen from the WHOLE kit, so a single-scene redo keeps the same voice as the rest of the video.")
     p.add_argument("--limit", type=int, help="Generate at most N clips (smoke test).")
     p.add_argument("--force", action="store_true", help="Re-render mp3s that already exist.")
     p.add_argument("--dry-run", action="store_true", help="Plan + credit estimate; no API calls, no writes.")
@@ -409,6 +410,19 @@ def main() -> None:
     # whole run, not just the previewed slice.
     full_chars = sum(len(b["text"]) for b in blocks)
     full_count = len(blocks)
+    # --only narrows WHICH scenes render (model already chosen from the full kit
+    # above, so a one-scene redo keeps the same voice). Applied before --limit.
+    if args.only:
+        try:
+            wanted = {int(s) for s in args.only.replace(",", " ").split()}
+        except ValueError:
+            die(f"--only must be scene numbers (e.g. 22,24); got {args.only!r}.")
+        if not wanted:
+            die(f"--only parsed to no scene numbers; got {args.only!r}.")
+        missing = wanted - {b["scene"] for b in blocks}
+        if missing:
+            die(f"--only scene(s) not in {kit_path.name}: {sorted(missing)}")
+        blocks = [b for b in blocks if b["scene"] in wanted]
     if args.limit is not None:
         blocks = blocks[: args.limit]
 
@@ -512,12 +526,14 @@ def main() -> None:
                 # video supersedes its prior cycle entry (no double-book, no extra
                 # v2 slot) rather than stacking on top of it.
                 state = ma.load_state(bcfg)
-                # --force re-renders EVERY scene, so this booking represents the
-                # whole kit -> REPLACE the prior same-note entry (no double-book).
-                # A non-force run rendered ONLY the missing scenes (a partial top-up),
-                # so its booking must ADD to the prior credits (which paid for the
-                # scenes that already existed) -- replacing would under-count spend.
-                replace = bool(args.force)
+                # REPLACE the prior same-note entry only when THIS run covers the
+                # whole kit -- i.e. a bare --force re-render. Any partial run is an
+                # additive top-up that must ADD to the prior credits (which paid for
+                # the scenes already on disk); replacing would erase that spend and
+                # under-count. Two partial cases: a non-force run (rendered only the
+                # missing scenes) and a --only run (rendered just the picked scenes,
+                # even WITH --force) -- both add, never supersede.
+                replace = bool(args.force) and not args.only
                 if dec is not None:
                     # When there's no real delta (`actual is None`), fall back to
                     # an estimate for THIS run's scenes only -- `dec.credits_est`
