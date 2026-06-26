@@ -223,6 +223,11 @@ def lint_cut_anchors(shots: list[dict], edit_anchors: dict[int, list[str]]) -> l
 # --- VO kit parsing (captions) --------------------------------------------
 
 _KIT_BLOCK_RE = re.compile(r"^##\s+Scene\s+(\d+)\s*(?:->|→)\s*`([^`]+\.mp3)`[^\n]*\n", re.MULTILINE)
+# Dual-form caption token {{spoken|caption}} — MUST stay identical to
+# generate_vo._DUAL_RE. The VO speaks the left form; the caption keeps the right
+# (digits), so one kit drives both without the two-divergent-kits drift that bit
+# Video_05. Absent -> caption is the body text unchanged (backward compatible).
+_DUAL_FORM_RE = re.compile(r"\{\{\s*([^|{}]+?)\s*\|\s*([^{}]+?)\s*\}\}")
 
 
 def parse_kit(path: Path) -> dict[int, dict]:
@@ -238,6 +243,7 @@ def parse_kit(path: Path) -> dict[int, dict]:
         start = m.end()
         end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
         chunk = re.split(r"^---\s*$", body[start:end], maxsplit=1, flags=re.MULTILINE)[0]
+        chunk = _DUAL_FORM_RE.sub(r"\2", chunk)                 # dual-form token: caption keeps the digits form
         chunk = re.sub(r"<break[^>]*/>", " ", chunk)            # drop SSML
         chunk = re.sub(r"\*\*([^*]+)\*\*", r"\1", chunk)        # bold
         chunk = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", chunk)  # italic

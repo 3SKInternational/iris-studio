@@ -115,10 +115,20 @@ _BLOCK_RE = re.compile(
     re.MULTILINE,
 )
 
+# Dual-form caption token {{spoken|caption}}: lets ONE kit carry the words the VO
+# must SPEAK (left) and the digits the SRT should SHOW (right) for the same beat —
+# e.g. {{one hundred thousand dollars|$100,000}}. The VO keeps the left form; the
+# caption parser in build_video.py (build_video._DUAL_FORM_RE, identical pattern)
+# keeps the right. Co-locating both forms makes the digits-vs-words split
+# drift-proof; the two used to live in separate kit files that silently diverged.
+# Absent -> both sides see the text unchanged (backward compatible).
+_DUAL_RE = re.compile(r"\{\{\s*([^|{}]+?)\s*\|\s*([^{}]+?)\s*\}\}")
+
 
 def clean_vo_text(raw: str) -> str:
     """Strip markdown emphasis + collapse whitespace; keep SSML <break/> tags."""
     text = raw.strip()
+    text = _DUAL_RE.sub(r"\1", text)  # dual-form token: VO speaks the left form
     # Drop markdown bold/italic markers (decorative; would not be spoken anyway,
     # but a stray '*' can confuse the engine). Leave punctuation and quotes.
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
