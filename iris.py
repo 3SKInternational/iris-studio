@@ -212,6 +212,9 @@ DAILY_BRIEFING_BAK_DIR = WORKSPACE_DIR / "07_Archive" / "daily_briefing_baks"
 DAILY_BRIEFING_BAK_RETENTION = 30
 TODO_FILE = WORKSPACE_DIR / "TODO.md"
 DECISIONS_DIR = WORKSPACE_DIR / "06_CEO" / "Decisions_Log"
+# C-suite org briefs (written daily 04:25 ET by the org-briefs Claude Code job).
+# The morning brief opens with today's <DATE>_ceo.md when present.
+ORG_BRIEFS_DIR = WORKSPACE_DIR / "06_CEO" / "Org_Briefs"
 SESSIONS_DIR = WORKSPACE_DIR / "_Iris_Memory" / "Sessions"
 RECENT_DECISIONS_LIMIT = 3
 RECENT_SESSIONS_LIMIT = 3
@@ -1278,6 +1281,21 @@ def _format_history_for_cloud(history: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _read_todays_ceo_brief() -> str:
+    """Today's CEO brief (06_CEO/Org_Briefs/<today-ET>_ceo.md), written by the
+    04:25 ET org-briefs job. Returns "" if absent (job hasn't run yet / failed)
+    so the morning brief degrades gracefully instead of fabricating a status.
+    ET date matches the org-briefs file-naming (today's ISO date, local ET)."""
+    today = datetime.now(TIMEZONE).date().isoformat()
+    path = ORG_BRIEFS_DIR / f"{today}_ceo.md"
+    # Expected-absent before the 04:25 job runs — degrade silently (no WARNING
+    # log noise that would trip the pre-brief error scan). Other read errors
+    # still surface via _read_file.
+    if not path.exists():
+        return ""
+    return _read_file(path)
+
+
 def load_system_prompt_cloud(history: list[dict]) -> str:
     """Compose the cloud-tier system prompt with full workspace awareness.
 
@@ -1287,17 +1305,19 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
       3. Operator Blueprint (canonical identity + business map)
       4. STEVE_CONTEXT.md (technical addendum)
       5. Vault_MOC.md (AI-agent contract + navigation index)
-      6. INBOX.md (active items this week)
-      7. DAILY_BRIEFING.md (today's status snapshot)
-      8. Build Queue (current Phase 4/5 work state)
-      9. CLAUDE_CODE_HANDOFF.md — LATEST entry only (what other agents did most recently)
-     10. Last 3 Decisions_Log entries (by mtime — most recent first)
-     11. Last 3 Session digests (by mtime — most recent first)
-     12. Recent conversation history (last 20 messages)
+      6. CEO brief (today's executive top layer — when present)
+      7. INBOX.md (active items this week)
+      8. DAILY_BRIEFING.md (today's status snapshot)
+      9. Build Queue (current Phase 4/5 work state)
+     10. CLAUDE_CODE_HANDOFF.md — LATEST entry only (what other agents did most recently)
+     11. Last 3 Decisions_Log entries (by mtime — most recent first)
+     12. Last 3 Session digests (by mtime — most recent first)
+     13. Recent conversation history (last 20 messages)
     """
     blueprint = _read_file(BLUEPRINT_FILE)
     addendum = _read_file(CONTEXT_FILE)
     vault_moc = _read_file(VAULT_MOC_FILE)
+    ceo_brief = _read_todays_ceo_brief()
     inbox = _read_file(INBOX_FILE)
     briefing = _read_file(DAILY_BRIEFING_FILE)
     build_queue = _read_file(BUILD_QUEUE_FILE)
@@ -1321,6 +1341,12 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
         sections.append(
             "# === VAULT MAP OF CONTENT (AI-agent boot sequence + registry + coordination conventions) ===\n\n"
             + vault_moc
+        )
+    if ceo_brief:
+        sections.append(
+            "# === CEO BRIEF (today's executive top layer — state of the company, "
+            "per-department roll-up, this week's single highest-leverage move, "
+            "ranked recommended dispatches) ===\n\n" + ceo_brief
         )
     if inbox:
         sections.append(
@@ -3345,7 +3371,21 @@ MORNING_BRIEFING_PROMPT = (
     "  a deadline). If today's calendar is empty, omit the calendar mention.\n\n"
     "Use these tools sparingly — one call each, both read-only. Drafts and sends "
     "are out of scope for the brief.\n\n"
-    "Format the briefing as concise mobile-friendly plain prose:\n"
+    "STRATEGIC LAYER (lead with this). Draw it from the '# === CEO BRIEF' "
+    "section in your system prompt and emit these four blocks IN ORDER:\n"
+    "🏛️ STATE OF THE COMPANY — 2-3 sentences from the CEO brief's state-of-the-company.\n"
+    "🎯 HIGHEST-LEVERAGE MOVE — this week's single highest-leverage move, verbatim intent.\n"
+    "📊 DEPT ROLL-UP — the five department one-liners (Marketing / Intelligence / "
+    "Quality / Finance / Technology). If the CEO brief marks a department "
+    "missing or stale, show it as '⚠ <dept>: no current brief' — never invent a status.\n"
+    "🤖 RECOMMENDED DISPATCHES — the CEO brief's ranked dispatches (max 6). These are "
+    "SUGGESTIONS Steve one-taps to fire — recommend, never imply they already ran.\n"
+    "If there is NO '# === CEO BRIEF' section in your context (the org-briefs job "
+    "did not run today), SKIP the four blocks and emit a single line '⚠ no CEO brief "
+    "today' instead — then continue to the operational layer. NEVER fabricate the "
+    "strategic blocks from other context.\n\n"
+    "— — —\n\n"
+    "OPERATIONAL LAYER (after the strategic layer). Concise mobile-friendly plain prose:\n"
     "1. One opening sentence on overall situation (use the current date)\n"
     "2. Inbox highlight (one line, only if something materially changed; "
     "   otherwise omit this section entirely)\n"
@@ -3355,9 +3395,9 @@ MORNING_BRIEFING_PROMPT = (
     "6. One sentence on yesterday's tier usage if relevant (cite Iris usage stats)\n"
     "7. One recommended next move\n"
     "8. Sign off naturally with: — Iris\n\n"
-    "Keep total length under 1800 chars (slightly higher cap to accommodate the "
-    "inbox/calendar additions, but stay tight). No headers, no bullet lists unless "
-    "essential. Lead with the situation, do not preamble.\n\n"
+    "Keep total length under 3200 chars (the strategic layer adds the four lead "
+    "blocks; stay tight within each). No headers beyond the emoji block labels, no "
+    "bullet lists unless essential. Lead with the strategic layer, do not preamble.\n\n"
     "IMPORTANT formatting rules:\n"
     "- Do NOT auto-link filenames as markdown URLs (do not produce things like "
     "[iris.py](https://iris.py/) — just write the filename as code-fenced text "
