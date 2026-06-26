@@ -98,7 +98,7 @@ ok "skills linked · vault mounted"
 ok "to bring the stack online:"
 cat <<'EOF'
    voice      .venv/bin/python voice/voice_chat.py        # local two-way voice
-   dashboard  .venv/bin/python dashboard/server.py        # V.A.U.L.T. cockpit → http://127.0.0.1:8765
+   cockpit    always-on via launchd (com.jarvis.hud)      # jarvis-hud cockpit → http://127.0.0.1:3107  (V.A.U.L.T. :8765 retired 2026-06-26)
    daemon     ./run_iris.sh                               # Telegram operator daemon
    → reskin per client: see 06_CEO/Designs/<dated>_Per_Client_Reskin.md in the vault
 EOF

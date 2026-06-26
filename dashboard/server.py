@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""V.A.U.L.T. — local command-center dashboard for Iris. Mini-only.
+"""V.A.U.L.T. — RETIRED 2026-06-26. Superseded by the always-on jarvis-hud
+cockpit at http://127.0.0.1:3107 (launchd com.jarvis.hud), which absorbed this
+dashboard's tabs (Fleet / Reports / Schedules / Approvals / Connectors) plus the
+C-Suite org console. This port-8765 Starlette server is no longer launched by
+launch.json or setup.sh and is kept only as reference for the merge. See
+06_CEO/Designs/2026-06-26_Merge_VAULT_into_jarvis-hud.md.
+
+V.A.U.L.T. — local command-center dashboard for Iris. Mini-only.
 
 Live vitals (parsed from the freshest YouTube analytics api-pull + iris.db
 spend) + a one-tap command deck that fires the SAME agents/scripts the daemon
