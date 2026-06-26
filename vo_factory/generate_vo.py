@@ -128,6 +128,10 @@ _DUAL_RE = re.compile(r"\{\{\s*([^|{}]+?)\s*\|\s*([^{}]+?)\s*\}\}")
 def clean_vo_text(raw: str) -> str:
     """Strip markdown emphasis + collapse whitespace; keep SSML <break/> tags."""
     text = raw.strip()
+    # Drop markdown blockquote lines: in these kits a `>` line is always an author
+    # note/aside (e.g. a "Slimmed by Steve" production note), never spoken VO. Run
+    # this while newlines still exist, before the whitespace collapse below.
+    text = re.sub(r"(?m)^[ \t]*>.*$", "", text)
     text = _DUAL_RE.sub(r"\1", text)  # dual-form token: VO speaks the left form
     # Drop markdown bold/italic markers (decorative; would not be spoken anyway,
     # but a stray '*' can confuse the engine). Leave punctuation and quotes.
