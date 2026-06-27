@@ -166,6 +166,9 @@ cd "$VAULT"
 RUN_OUT="$(mktemp -t "claude-job-${JOB}.XXXXXX")"
 trap 'rm -f "$RUN_OUT"; rq_release_lock' EXIT
 
+# Wall-clock start for the duration-watch below (the on-demand performance-optimizer's trigger).
+JOB_START=$(date +%s)
+
 "$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG" | tee "$RUN_OUT" >/dev/null
 rc=${PIPESTATUS[0]}
 
@@ -194,6 +197,22 @@ if [ "$rc" -ne 0 ]; then
             ;;
     esac
     fail "$rc" "exit code $rc (process died / non-zero)"
+fi
+
+# Duration watch (exit 0 only — a slow FAILURE is a hang, already alerted above).
+# performance-optimizer is an on-demand specialist with no cron; this is its trigger:
+# ping Steve when a routine's wall-clock blows past a threshold so he can summon a
+# perf pass at the offending job. Threshold overridable via SLOW_JOB_THRESHOLD_SEC
+# (default 1200s = 20 min) — a known-heavy job can raise its own bar by setting that
+# in its plist's EnvironmentVariables. Best-effort + non-fatal: never touches the
+# job's exit code, and silent on retries (IRIS_RETRY=1) so it can't spam every 30 min.
+JOB_ELAPSED=$(( $(date +%s) - JOB_START ))
+SLOW_THRESHOLD="${SLOW_JOB_THRESHOLD_SEC:-1200}"
+if [ "${IRIS_RETRY:-0}" != "1" ] && [ "$JOB_ELAPSED" -gt "$SLOW_THRESHOLD" ]; then
+    alert "⏱️ launchd job '${JOB}' ran LONG — ${JOB_ELAPSED}s (> ${SLOW_THRESHOLD}s threshold).
+Time: $(date '+%Y-%m-%d %H:%M %Z')
+If this persists, summon a performance pass: dispatch performance-optimizer at what '${JOB}' runs."
+    echo "run_claude_job: '${JOB}' SLOW — ${JOB_ELAPSED}s (> ${SLOW_THRESHOLD}s) at $(date '+%Y-%m-%d %H:%M %Z')" >> "$LOG"
 fi
 
 # 2) Exit 0 — classify how it finished from the sentinel on the last non-empty line.
