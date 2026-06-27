@@ -1,29 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  SHORTS CUTTER — installed 2026-06-21.
-
-  Weekly autonomous fire of the `shorts-cutter` agent (via the shorts-cutter Claude
-  routine): finds the NEWEST published video (a Production_Kits/Video_NN_youtube_
-  upload.json with a video_id) that has no Shorts pack yet, and mines its script +
-  already-generated PNGs into 3–4 vertical Short packs that REUSE existing assets.
-  Draft-only; never generates art or renders video. Quiet-idle when every published
-  video already has a pack (emits ROUTINE_COMPLETE, no noise).
-
-  Runs via run_claude_job.sh (it's a `claude --print` routine) so the same wrapper
-  handles logging, the ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and
-  the retry queue.
-
-  Schedule: Friday 6:45 AM ET — after the Thu production push, clear of
-  efficiency-steward (Fri 03:30), pre-brief (05:00), the DAILY competitor-tripwire
-  at 06:00, and a 10-min stagger off the 06:35 figures-watcher on a 1st-falls-on-Friday.
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-shorts-cutter 2>/dev/null
-    cp scripts/com.iris.claude-code-shorts-cutter.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-shorts-cutter.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-shorts-cutter   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -44,9 +20,9 @@
 	<array>
 		<dict>
 			<key>Hour</key>
-			<integer>6</integer>
+			<integer>2</integer>
 			<key>Minute</key>
-			<integer>45</integer>
+			<integer>0</integer>
 			<key>Weekday</key>
 			<integer>5</integer>
 		</dict>

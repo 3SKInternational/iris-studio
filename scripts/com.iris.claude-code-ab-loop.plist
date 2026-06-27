@@ -1,27 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  A/B-LOOP — installed 2026-06-21.
-
-  Weekly title/thumbnail experiment closer. Runs the `ab-loop` Claude routine:
-  reads the AB_Experiments.md ledger, pulls each running experiment's CTR/views
-  from the analytics feed, and for any experiment past its decision window routes
-  the winning pattern to packaging-strategist + marks it concluded, or flags the
-  ones that need Steve's Studio Test&Compare read. Silent when no experiments are
-  running. Honest about its limits: YouTube's native thumbnail-test splits are
-  NOT API-exposed, so the loop never fabricates per-variant numbers.
-
-  Runs via run_claude_job.sh (shared wrapper: logging, sentinel→alert, retry).
-
-  Schedule: Thu 06:20 ET — after the week's analytics has settled, ahead of the
-  Thu–Sun production push; staggered off the daily competitor-tripwire (06:00).
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-ab-loop 2>/dev/null
-    cp scripts/com.iris.claude-code-ab-loop.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-ab-loop.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-ab-loop   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -40,12 +18,12 @@
 	<string>/Users/steve/iris_studio/logs/ab-loop.stdout.log</string>
 	<key>StartCalendarInterval</key>
 	<dict>
+		<key>Hour</key>
+		<integer>1</integer>
+		<key>Minute</key>
+		<integer>45</integer>
 		<key>Weekday</key>
 		<integer>4</integer>
-		<key>Hour</key>
-		<integer>6</integer>
-		<key>Minute</key>
-		<integer>20</integer>
 	</dict>
 </dict>
 </plist>

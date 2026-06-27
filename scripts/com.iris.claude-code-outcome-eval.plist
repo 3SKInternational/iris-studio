@@ -1,40 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  OUTCOME-EVAL — weekly adaptation outcome measurement — installed 2026-06-22.
-
-  Closes the one open weld in the ADAPTS self-improvement loop. Every APPLIED
-  adaptation is a HYPOTHESIS ("this edit will move metric X"), but until its
-  effect is MEASURED the outcome scoreboard the canon-reviewer trusts stays
-  hollow. The daily adaptation-scan only REMINDS Steve a review is due; this
-  routine does the actual measurement.
-
-  Runs the `outcome-eval` Claude routine, which dispatches the
-  `adaptation-outcome-evaluator` agent: for each matured-but-untagged adaptation
-  (`adaptation.py --review-due --json`) it pulls the REAL before/after evidence
-  for that adaptation's declared metric from the analytics feed / reviewer
-  verdicts on disk, and RECOMMENDS exactly one verdict (improved / no-change /
-  regressed / inconclusive) WITH the cited numbers. It surfaces those as one-tap
-  `/adapt outcome <id> <verdict>` commands to Steve's Telegram. Recommend-only:
-  the verdict itself stays Steve's call (it is the scoreboard's integrity anchor)
-  — the routine NEVER tags. Anti-fabrication is absolute: a verdict with no
-  on-disk number is `inconclusive`, never a guessed win/loss. A no-data week is a
-  SUCCESS, not a failure — empty due-list = clean no-op, no Telegram spam.
-
-  Runs via run_claude_job.sh (shared wrapper: logging, ROUTINE_COMPLETE/INCOMPLETE
-  sentinel → Telegram alert, retry queue).
-
-  Schedule: Thu 06:40 ET — after the week's analytics-pull and the ab-loop (06:20)
-  have settled, ahead of the Thu–Sun production push. Outcomes mature on a ~14-day
-  horizon, so a weekly cadence is the right altitude; the routine is idempotent and
-  silent when nothing is due.
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-outcome-eval 2>/dev/null
-    cp scripts/com.iris.claude-code-outcome-eval.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-outcome-eval.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-outcome-eval   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -53,12 +18,12 @@
 	<string>/Users/steve/iris_studio/logs/outcome-eval.stdout.log</string>
 	<key>StartCalendarInterval</key>
 	<dict>
+		<key>Hour</key>
+		<integer>2</integer>
+		<key>Minute</key>
+		<integer>15</integer>
 		<key>Weekday</key>
 		<integer>4</integer>
-		<key>Hour</key>
-		<integer>6</integer>
-		<key>Minute</key>
-		<integer>40</integer>
 	</dict>
 </dict>
 </plist>

@@ -1,47 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  EXPENSE-AUTOCOMMIT — daily unattended receipt → review → file pipeline — installed 2026-06-25.
-
-  Delivers Steve's "all of our spend should be going into the expense tracker in
-  realtime" with the charges-vs-consumption split + agent-reviewed auto-write he
-  approved. Until now receipt charges reached the book only via the
-  expense-categorizer draft + a manual /approve paste. This routine runs the full
-  unattended path:
-
-    PASS 1  regenerate the CSV dedup mirror (export_expense_csv.py), then dispatch
-            the `expense-categorizer` subagent (scheduled mode) — it sweeps
-            studio@ Gmail for new receipts, drafts the markdown AND a structured
-            `…_<run-id>.rows.json` sidecar of ONLY the High-confidence, unambiguous,
-            non-personal rows (everything else stays markdown-only for Steve).
-    PASS 2  dispatch the `expense-reviewer` subagent (the accounting controller) on
-            the draft — BINARY SHIP/REVISE, anti-fabrication + double-count + dedup +
-            Schedule-C checks.
-    PASS 3  ONLY on a clean `status: ship` verdict, run scripts/commit_expense.py:
-            it re-checks the SHIP verdict, dedups vs the live xlsx, takes a mandatory
-            timestamped backup, appends formula-safe (never past row 200), atomic
-            save under an flock, regenerates the CSV, and Telegram-receipts. A REVISE
-            is PARKED (not filed) and surfaced to Steve. Prepaid-credit CONSUMPTION
-            (image/API draw-down) is never expensed here — it's reconciled separately
-            (credit_reconciliation.py).
-    PASS 4  one line to the daily note.
-
-  Conservative by design: only High-confidence traceable rows auto-flow; anything
-  ambiguous waits for Steve's /approve. The committer is the only writer and it
-  self-gates + dedups, so a no-receipts / empty-sidecar / REVISE day writes nothing.
-
-  Runs via run_claude_job.sh (shared wrapper: logging, ROUTINE_COMPLETE/INCOMPLETE
-  sentinel → Telegram alert, retry queue).
-
-  Schedule: daily 09:15 ET — after the morning analytics/comment window, before the
-  production day. Idempotent (dedup); silent when there's nothing to file.
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-expense-autocommit 2>/dev/null
-    cp scripts/com.iris.claude-code-expense-autocommit.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-expense-autocommit.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-expense-autocommit   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -61,9 +19,9 @@
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
-		<integer>9</integer>
+		<integer>0</integer>
 		<key>Minute</key>
-		<integer>15</integer>
+		<integer>0</integer>
 	</dict>
 </dict>
 </plist>

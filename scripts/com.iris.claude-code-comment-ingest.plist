@@ -1,42 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  COMMENT-INGEST — daily incoming-comment ingestion — installed 2026-06-22.
-
-  Closes the LEARNS-side comment gap. Until now incoming viewer comments reached
-  the `community-manager` agent only by manual paste, so the audience's own words
-  — the richest new-video-topic and sentiment signal — never flowed into the loop
-  automatically. This routine pulls them live, triages them, and surfaces what
-  needs Steve.
-
-  PASS 1 runs scripts/fetch_comments.py: a READ-ONLY pull (reusing the existing
-  youtube.force-ssl token — `commentThreads.list` needs no new OAuth) of every
-  PUBLIC published video's incoming comments. Our own pinned comment AND our own
-  replies are filtered out; comment text is sanitized so a viewer can't inject
-  fake rows into the export. It writes one honest export per video to
-  BRANDS/3SK_Finance/Channel_Intelligence/Engagement/<label>_comments_latest.md
-  (a zero-comment day = honest empty export, never fabricated rows).
-
-  PASS 2 dispatches the `community-manager` agent ONLY for videos with ≥1 real
-  comment — DRAFT-ONLY (it triages + drafts Brand-Bible replies + an escalation
-  list; it NEVER posts). PASS 3 sends ONE consolidated Telegram push only when
-  something needs Steve (escalation or reply-worthy draft). PASS 4 logs one line
-  to the daily note. A quiet pre-launch day is a silent no-op, never spam.
-
-  Runs via run_claude_job.sh (shared wrapper: logging, ROUTINE_COMPLETE/INCOMPLETE
-  sentinel → Telegram alert, retry queue). A fetch auth/credential failure (exit 2)
-  routes to the same retry path as the comment-sweep + analytics jobs.
-
-  Schedule: daily 06:50 ET — just after the outcome-eval/analytics window and
-  ahead of the production day, so the day's fresh audience signal is triaged
-  before any content work starts. Idempotent; silent when there's nothing to act on.
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-comment-ingest 2>/dev/null
-    cp scripts/com.iris.claude-code-comment-ingest.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-comment-ingest.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-comment-ingest   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -56,9 +19,9 @@
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
-		<integer>6</integer>
+		<integer>1</integer>
 		<key>Minute</key>
-		<integer>50</integer>
+		<integer>0</integer>
 	</dict>
 </dict>
 </plist>

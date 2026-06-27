@@ -1,29 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  COMPETITOR TRIPWIRE — installed 2026-06-21.
-
-  Daily defensive early-warning scan. Runs the `competitor-tripwire` Claude
-  routine: reuses (or refreshes) the niche feed, compares the niche's recent
-  movers against our unpublished slate + locked formulas, and fires a Telegram
-  alert ONLY when a recent, performing competitor video specifically threatens
-  our slate or shows a new pattern. Silent on a normal day. Distinct from the
-  weekly youtube-research sweep (that refreshes the whole intel layer).
-
-  Runs via run_claude_job.sh: a `claude --print` routine, so the shared wrapper
-  handles logging, the ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert,
-  and the retry queue.
-
-  Schedule: daily 06:00 ET (after pre-brief 05:00; the threat alert lands in
-  Steve's morning). Reuses today's/yesterday's niche feed if present so it does
-  not double-spend Data API quota on youtube-research days.
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-competitor-tripwire 2>/dev/null
-    cp scripts/com.iris.claude-code-competitor-tripwire.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-competitor-tripwire.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-competitor-tripwire   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -43,9 +19,9 @@
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
-		<integer>6</integer>
-		<key>Minute</key>
 		<integer>0</integer>
+		<key>Minute</key>
+		<integer>30</integer>
 	</dict>
 </dict>
 </plist>

@@ -1,28 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  NEWSLETTER WRITER — installed 2026-06-21.
-
-  Weekly autonomous fire of the `newsletter-writer` agent (via the newsletter-writer
-  Claude routine): finds the NEWEST published video (a Production_Kits/Video_NN_
-  youtube_upload.json with a video_id) that has no drafted issue yet, and turns it
-  into a Beehiiv newsletter issue (subject variants + body + single CTA + link-gated
-  FTC disclosure) in Brand Bible voice. DRAFT-ONLY; never sends. Quiet-idle when
-  every published video already has an issue (emits ROUTINE_COMPLETE, no noise).
-
-  Runs via run_claude_job.sh (it's a `claude --print` routine) so the same wrapper
-  handles logging, the ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and
-  the retry queue.
-
-  Schedule: Saturday 6:50 AM ET — clean day, lets the Friday Shorts pass land first;
-  clears the DAILY competitor-tripwire at 06:00 and the 06:20 slots.
-
-  Manage:
-    launchctl bootout gui/$(id -u)/com.iris.claude-code-newsletter-writer 2>/dev/null
-    cp scripts/com.iris.claude-code-newsletter-writer.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-newsletter-writer.plist
-    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-newsletter-writer   # test fire
--->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -43,9 +20,9 @@
 	<array>
 		<dict>
 			<key>Hour</key>
-			<integer>6</integer>
+			<integer>2</integer>
 			<key>Minute</key>
-			<integer>50</integer>
+			<integer>0</integer>
 			<key>Weekday</key>
 			<integer>6</integer>
 		</dict>
