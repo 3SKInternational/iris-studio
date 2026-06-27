@@ -7,7 +7,7 @@ file mtimes). Prints `OK` when every expected fire is accounted for; prints
 a numbered anomaly report otherwise.
 
 Catches the silent-skip class — the 2026-06-01 App Nap miss where the morning
-brief + project-manager-weekly + market-researcher-monthly all skipped with
+brief + chief-of-staff-weekly + market-researcher-monthly all skipped with
 zero error signal because APScheduler logged "missed by 7:54:35" and moved
 on. Pairs with A-21 (rotation refill) for full cadence-observability.
 
@@ -154,8 +154,8 @@ def collect_expected(now: datetime) -> list[Expected]:
         ))
     if (t := _last_fire_weekly(now, {MON}, 5, 30)):
         expected.append(Expected(
-            "project-manager-weekly", t, "dispatch",
-            agent_name="project-manager",
+            "chief-of-staff-weekly", t, "dispatch",
+            agent_name="chief-of-staff",
         ))
     if (t := _last_fire_weekly(now, {WED}, 2, 0)):
         expected.append(Expected(

@@ -438,8 +438,8 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 1800,  # 30 min — general technical/factual web research
         "deliverable_dir": "05_Research_and_Intelligence/Research_Reports",
     },
-    "project-manager": {
-        "timeout_seconds": 600,  # 10 min — reads vault state + writes status report
+    "chief-of-staff": {
+        "timeout_seconds": 600,  # 10 min — probes live state + writes verification snapshot
         "deliverable_dir": "06_CEO/Status_Reports",
     },
     # --- Added 2026-05-31 (Session 17): YouTube channel intelligence ---
@@ -623,26 +623,30 @@ DISPATCH_ALLOWED_AGENTS = tuple(DISPATCH_AGENTS.keys())
 # ("if no new X since last run, return 'no work, skipping' and exit").
 AUTONOMOUS_DISPATCHES: list[dict] = [
     {
-        "name": "project-manager-weekly",
-        "agent_name": "project-manager",
-        # weekly Mondays 05:30 ET — lands a week-over-week status report 30 min
+        "name": "chief-of-staff-weekly",
+        "agent_name": "chief-of-staff",
+        # weekly Mondays 05:30 ET — lands a week-over-week verification snapshot 30 min
         # before Monday's morning brief. (Was daily 05:30 from 5/30→5/31; flipped
         # to weekly 5/31 because daily was overkill given the operation's actual
         # change rate. Mid-week pulse can be added later if the signal density warrants.)
         "trigger_kwargs": {"day_of_week": "mon", "hour": 5, "minute": 30},
         "prompt": (
-            "Daily autonomous status sweep. Read the canonical operation state — "
-            "the Build Queue, bridge file (latest 3 sessions), INBOX, today's daily "
-            "note, plus live `launchctl list | grep -E iris\\|claude` and "
-            "`git -C /Volumes/AI_Workspace/iris_studio log --since='24 hours ago'` — "
-            "and write a status report to "
-            "06_CEO/Status_Reports/[YYYY-MM-DD]_status.md. Cover: what shipped "
-            "since the last status report (verify against disk + git, do NOT trust "
-            "the queue markers blindly), what's in flight (owner + last movement), "
-            "what's blocked (categorize: Steve / dependency / stalled-no-excuse), "
-            "where contract and reality have drifted, and the ranked 3-5 actions "
-            "only Steve can do. Be honest — distinguish confirmed from unverified. "
-            "Return the headline 🧍 needs-Steve list on stdout (4-6 ranked lines)."
+            "Weekly autonomous verification sweep. Probe the canonical operation "
+            "state — the Build Queue, bridge file (latest 3 sessions), INBOX, "
+            "today's daily note, plus live `launchctl list | grep -E iris\\|claude` "
+            "(check last exit status), the retry backlog in ~/iris_studio/retry/, and "
+            "`git -C /Volumes/AI_Workspace/iris_studio log --since='7 days ago'` — "
+            "and write a verification snapshot to "
+            "06_CEO/Status_Reports/[YYYY-MM-DD]_status.md. Cover: drift (where queue "
+            "markers / bridge claims disagree with disk + git — lead with this), job "
+            "health (dead/stale launchd jobs + retry backlog, for chief-technology to "
+            "consume), what actually shipped (verified against disk + git, do NOT "
+            "trust queue markers blindly), what's in flight (owner + last real "
+            "movement), what's blocked (categorize: Steve / dependency / "
+            "stalled-no-excuse), and the ranked 3-5 actions only Steve can do. Verify, "
+            "do NOT strategize — surface checked facts for the CEO/chiefs, do not set "
+            "priorities. Distinguish confirmed from unverified. Return the headline "
+            "🧍 needs-Steve list on stdout (4-6 ranked lines)."
         ),
     },
     # NOTE: youtube-researcher is NOT dispatched here. It moved to a launchd
@@ -753,8 +757,9 @@ Available subagents (agent_name -> what it does):
   title/hook/thumb-text WORDS (thumbnail-coordinator owns the image). Dispatch
   when a script/topic is set, before or alongside thumbnail-coordinator. ~8 min.
 - `sponsor-outreach-drafter` — drafts a personalized cold sponsor email. ~15 min.
-- `project-manager` — honest status read on the whole operation (what shipped,
-  what's blocked, what needs Steve, where contract & reality drift). ~10 min.
+- `chief-of-staff` — ground-truth verification of the whole operation: probes
+  live state (launchctl/git/disk) for drift, dead jobs, what actually shipped,
+  and what needs Steve. Verifies, doesn't strategize. ~10 min.
 - `expense-categorizer` — scans studio@ Gmail for receipt-shaped emails, drafts
   Expense_Tracker rows with Schedule C categorization (draft only — Steve approves
   via `/approve <run-id>`). Runs daily 09:00 ET automatically; dispatch on demand
@@ -3788,7 +3793,7 @@ async def _post_init(application) -> None:
     # missed runs into one. Without these, the default misfire_grace_time=1s
     # silently SKIPS jobs the instant the scheduler resumes — which is what
     # cost us the 2026-06-01 03:00 market-researcher-monthly + 05:30
-    # project-manager-weekly + 06:00 morning-brief fires (APScheduler logged
+    # chief-of-staff-weekly + 06:00 morning-brief fires (APScheduler logged
     # "missed by 7:54:35" warnings then advanced next_run, never executing).
     _scheduler = AsyncIOScheduler(
         timezone=TIMEZONE,
@@ -3825,7 +3830,7 @@ async def _post_init(application) -> None:
         id="expense_categorizer_sweep",
         replace_existing=True,
     )
-    # Phase 5 autonomous-dispatch cadences (project-manager daily, market-researcher
+    # Phase 5 autonomous-dispatch cadences (chief-of-staff weekly, market-researcher
     # monthly, ...). Each AUTONOMOUS_DISPATCHES entry becomes one APScheduler job.
     for entry in AUTONOMOUS_DISPATCHES:
         _scheduler.add_job(

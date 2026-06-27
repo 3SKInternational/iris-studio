@@ -4,7 +4,7 @@
     "agent": "chief-executive",
     "title": "CEO",
     "scope": "Oversees every department. Reads the department briefs + top signals, sets cross-department priorities, gives the company-level strategic read.",
-    "staff": ["decision-feeder", "project-manager", "venture-scout"]
+    "staff": ["chief-of-staff", "decision-feeder", "venture-scout"]
   },
   "departments": [
     {

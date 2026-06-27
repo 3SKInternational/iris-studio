@@ -46,9 +46,10 @@ DECK = [
                "Analytics and give the diagnosis plus routable fixes."},
     {"key": "topics",   "label": "Topic scout",     "kind": "agent",
      "target": "topic-scout", "prompt": "Refresh the ranked topic backlog."},
-    {"key": "status",   "label": "Project status",  "kind": "agent",
-     "target": "project-manager",
-     "prompt": "Give an honest status read: shipped, in-progress, blocked, next."},
+    {"key": "status",   "label": "Ops status",      "kind": "agent",
+     "target": "chief-of-staff",
+     "prompt": "Verify operation ground-truth: drift, job health, what actually "
+               "shipped, what's blocked, what needs Steve."},
     {"key": "research", "label": "YT research",      "kind": "agent",
      "target": "youtube-researcher",
      "prompt": "Refresh the finance-creator intel: hooks, titles, what's "

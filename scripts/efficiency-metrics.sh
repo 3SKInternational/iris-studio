@@ -89,7 +89,7 @@ fence_end
 
 # ----------------------------------------------------------------------
 section "4 · Dispatch activity (last 7 days)"
-write "_Per-agent dispatch counts by status — proxy for Tier-3 agent load. A status-skew (lots of \`timed_out\`/\`failed\`) is a tier-misfit signal; a quiet autonomous-cadence agent that should be firing weekly is a cadence-health signal (A-22 catches missed fires — this is the spend-side view). Autonomous vs manual is not stored as a column; agent_name pattern (\`project-manager\`, \`youtube-researcher\`, \`market-researcher\`, \`expense-categorizer\`) implies autonomous._"
+write "_Per-agent dispatch counts by status — proxy for Tier-3 agent load. A status-skew (lots of \`timed_out\`/\`failed\`) is a tier-misfit signal; a quiet autonomous-cadence agent that should be firing weekly is a cadence-health signal (A-22 catches missed fires — this is the spend-side view). Autonomous vs manual is not stored as a column; agent_name pattern (\`chief-of-staff\`, \`youtube-researcher\`, \`market-researcher\`, \`expense-categorizer\`) implies autonomous._"
 fence_begin
 if [ -f "$DB" ]; then
   /usr/bin/sqlite3 -cmd ".timeout 5000" "$DB" \
