@@ -62,7 +62,7 @@ FALLBACK_MODEL = "eleven_flash_v2_5"
 DEFAULT_STABILITY = 0.43   # voice-optimal range 0.42-0.45 (set 2026-06-27)
 DEFAULT_SIMILARITY = 0.28  # voice-optimal range 0.27-0.29 (set 2026-06-27)
 DEFAULT_STYLE = 0.0
-DEFAULT_SPEED = 1.0  # ElevenLabs voice_settings.speed; valid 0.7-1.2, 1.0 = native pace.
+DEFAULT_SPEED = 1.15  # ElevenLabs voice_settings.speed; valid 0.7-1.2, 1.0 = native pace.
 
 # ElevenLabs bills ~1 credit per character of the submitted text (break tags
 # included). Used only for the offline --dry-run estimate.
