@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -327,7 +328,8 @@ def preflight_credits(key: str, need_chars: int) -> None:
 
 def synthesize(text: str, *, key: str, voice_id: str, model: str,
                stability: float, similarity: float, style: float,
-               speed: float) -> bytes:
+               speed: float, previous_text: str | None = None,
+               next_text: str | None = None) -> bytes:
     url = f"{API_BASE}/text-to-speech/{voice_id}"
     payload = {
         "text": text,
@@ -340,7 +342,107 @@ def synthesize(text: str, *, key: str, voice_id: str, model: str,
             "use_speaker_boost": True,
         },
     }
+    # previous_text/next_text condition prosody so a sub-chunked scene flows as one
+    # continuous read across the seams. They are context-only -- ElevenLabs does NOT
+    # bill them -- so the credit estimate (len(text)) stays accurate.
+    if previous_text:
+        payload["previous_text"] = previous_text
+    if next_text:
+        payload["next_text"] = next_text
     return _request(url, key=key, method="POST", payload=payload, accept="audio/mpeg")
+
+
+# --- long-scene sub-chunking ----------------------------------------------
+# ElevenLabs rushes the end of very long paragraphs, so a scene whose narration
+# exceeds MAX_TTS_CHARS is split into sentence-bounded pieces, each synthesized
+# with previous_text/next_text continuity, then the mp3s are joined. Short scenes
+# take the original single-call path unchanged (zero behavior change for them).
+# Guidance: ElevenLabs recommends ~250-800 chars per request.
+MAX_TTS_CHARS = 800
+MIN_TTS_CHARS = 250  # don't emit a tail fragment shorter than this -- merge it back.
+
+# Split on whitespace that follows sentence-ending punctuation. A `<break time=
+# "0.8s"/>` tag's dot is followed by a digit, never whitespace, so break tags are
+# never split mid-tag.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_for_tts(text: str, max_chars: int = MAX_TTS_CHARS) -> list[str]:
+    """Greedily pack sentences into <=max_chars chunks at sentence boundaries.
+
+    A single sentence longer than max_chars is kept whole (an acceptable rare
+    over-ceiling chunk -- better than a hard cut mid-sentence). A too-short final
+    tail is merged back into the previous chunk so we never bill a stray fragment
+    as its own rushed clip. Concatenating the returned chunks reproduces the input
+    (modulo the single spaces inserted at sentence joins)."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for sent in _SENT_SPLIT_RE.split(text):
+        if not sent:
+            continue
+        if not cur:
+            cur = sent
+        elif len(cur) + 1 + len(sent) <= max_chars:
+            cur = f"{cur} {sent}"
+        else:
+            chunks.append(cur)
+            cur = sent
+    if cur:
+        chunks.append(cur)
+    if len(chunks) >= 2 and len(chunks[-1]) < MIN_TTS_CHARS:
+        tail = chunks.pop()
+        chunks[-1] = f"{chunks[-1]} {tail}"
+    return chunks
+
+
+def _concat_mp3(parts: list[bytes], work_dir: Path) -> bytes:
+    """Join same-format mp3 blobs into one. Prefers ffmpeg stream-copy (clean, no
+    re-encode); falls back to raw byte concatenation (ElevenLabs returns header-less
+    mp3 frame streams that players + ffmpeg tolerate concatenated)."""
+    if len(parts) == 1:
+        return parts[0]
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            with tempfile.TemporaryDirectory(dir=str(work_dir)) as td:
+                tdp = Path(td)
+                files = []
+                for i, blob in enumerate(parts):
+                    fp = tdp / f"part_{i:03d}.mp3"
+                    fp.write_bytes(blob)
+                    files.append(fp)
+                listf = tdp / "concat.txt"
+                listf.write_text("".join(f"file '{f.name}'\n" for f in files))
+                outp = tdp / "joined.mp3"
+                proc = subprocess.run(
+                    [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(listf),
+                     "-c", "copy", str(outp)],
+                    cwd=str(tdp), capture_output=True, timeout=120,
+                )
+                if proc.returncode == 0 and outp.exists() and outp.stat().st_size > 0:
+                    return outp.read_bytes()
+        except Exception:  # noqa: BLE001 -- fall back to byte concat, never fail a render
+            pass
+    return b"".join(parts)
+
+
+def synthesize_scene(text: str, *, key: str, work_dir: Path, **kw) -> bytes:
+    """Synthesize one scene's narration, sub-chunking if it exceeds MAX_TTS_CHARS.
+    kw are the synthesize() voice/model args."""
+    chunks = split_for_tts(text)
+    if len(chunks) == 1:
+        return synthesize(text, key=key, **kw)
+    parts: list[bytes] = []
+    for i, chunk in enumerate(chunks):
+        prev = chunks[i - 1] if i > 0 else None
+        nxt = chunks[i + 1] if i < len(chunks) - 1 else None
+        audio = synthesize(chunk, key=key, previous_text=prev, next_text=nxt, **kw)
+        if not audio:
+            raise RuntimeError(f"empty audio for sub-chunk {i + 1}/{len(chunks)}")
+        parts.append(audio)
+    return _concat_mp3(parts, work_dir)
 
 
 # --- CLI -------------------------------------------------------------------
@@ -458,7 +560,9 @@ def main() -> None:
         flag = "skip" if exists else "gen "
         if not exists:
             to_make.append(b)
-        print(f"  [{flag}] scene {b['scene']:>2}  {b['filename']:<32} {chars:>5} chars")
+        nparts = len(split_for_tts(b["text"]))
+        parts_note = f"  ({nparts} parts)" if nparts > 1 else ""
+        print(f"  [{flag}] scene {b['scene']:>2}  {b['filename']:<32} {chars:>5} chars{parts_note}")
 
     est_credits = int(round(full_chars * CREDITS_PER_CHAR))
     print("-" * 64)
@@ -487,8 +591,8 @@ def main() -> None:
     for b in to_make:
         dest = out_dir / b["filename"]
         try:
-            audio = synthesize(
-                b["text"], key=key, voice_id=voice_id, model=model,
+            audio = synthesize_scene(
+                b["text"], key=key, work_dir=out_dir, voice_id=voice_id, model=model,
                 stability=stability, similarity=similarity, style=style, speed=speed,
             )
             if not audio:
