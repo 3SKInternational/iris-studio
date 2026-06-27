@@ -1349,15 +1349,15 @@ def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None,
         changed = dispatched or s.get("note") != note
         s["note"] = note
         return "changed" if changed else "parked"
-    # UNAVAILABLE — reviewer down / unparseable. Do NOT cache it (so recovery re-
-    # dispatches next sweep) and do NOT fail open (a money-adjacent manual gate must
-    # never green-light an unreviewed kit). Notify at most ONCE per kit revision while
-    # the reviewer is down, then retry silently so we don't spam Telegram hourly.
+    # UNAVAILABLE — reviewer down / timed out / unparseable. Do NOT cache it (so
+    # recovery re-dispatches next sweep) and do NOT fail open (a money-adjacent manual
+    # gate must never green-light an unreviewed kit). NO Telegram push: the gate still
+    # fails CLOSED below (parks; the render is manual and never auto-spends on an
+    # unreviewed kit), and the condition is surfaced via the parked note + /pipeline
+    # status. Steve asked to stop the per-run "vo-reviewer timed out" pings
+    # (2026-06-27) — the timeout is a transient infra hiccup that self-heals when the
+    # reviewer recovers next sweep, not an actionable alert.
     first_outage = s.get("vo_unavail_mtime") != kit_mtime
-    if first_outage:
-        notify(f"⚠️ Video {video}: vo-reviewer could not review the VO kit ({detail}) "
-               f"— review it by hand before rendering (auto-retries when it recovers).",
-               force=True)
     s["vo_unavail_mtime"] = kit_mtime
     note = ("still needs Steve/Cowork: vo-reviewer could not run on the VO kit "
             "— review it by hand before rendering")

@@ -89,6 +89,21 @@ rc=$?
 
 TS="$(date '+%Y-%m-%d %H:%M %Z')"
 
+# Known infra condition, NOT a job bug: launchd cannot exec a venv interpreter that
+# lives on the external AI_Workspace volume — a claude-code cask auto-upgrade silently
+# revokes Full Disk Access from the launchd context, so Python aborts at startup with
+# EPERM reading pyvenv.cfg (the interpreter never even ran the script). Stay fully
+# silent: no red alert, no retry marker (so no escalating "still failing" pings). The
+# job self-heals on its next scheduled fire once FDA is restored. Durable fix is
+# relocating the repo to an internal disk. See memory: FDA breaks on claude cask upgrade.
+# Match ONLY the unambiguous FDA signature (EPERM reading pyvenv.cfg) — a genuinely
+# broken/corrupted venv fails differently and still surfaces its red alert.
+if [ "$rc" -ne 0 ] && tail -n 12 "$LOG" 2>/dev/null \
+        | grep -qE 'Operation not permitted.*pyvenv\.cfg'; then
+    echo "run_job: '${JOB}' SKIPPED — venv interpreter not execable under launchd (FDA/EPERM at Python startup); silent, retries on next schedule at ${TS}" >> "$LOG"
+    exit 0
+fi
+
 if [ "$rc" -ne 0 ]; then
     # Red alert only on the original fire; retries are throttled by rq_record_failure.
     if [ "${IRIS_RETRY:-0}" != "1" ]; then
