@@ -98,6 +98,20 @@ class TestSplitForTTS(unittest.TestCase):
         self.assertEqual(chunks[0], sentence)
 
 
+class TestSpokenWordCount(unittest.TestCase):
+    def test_break_tags_not_counted_as_words(self):
+        # break tags must not inflate the word count used to derive the rate.
+        with_tags = 'Save first. <break time="0.8s"/> Then invest the rest.'
+        without = "Save first. Then invest the rest."
+        self.assertEqual(gv.spoken_word_count(with_tags), gv.spoken_word_count(without))
+        self.assertEqual(gv.spoken_word_count(without), 6)
+
+    def test_plain_text(self):
+        self.assertEqual(gv.spoken_word_count("one two three"), 3)
+        self.assertEqual(gv.spoken_word_count(""), 0)
+        self.assertEqual(gv.spoken_word_count("   "), 0)
+
+
 class TestConcatMp3(unittest.TestCase):
     def test_single_part_returned_asis(self):
         blob = b"\xff\xfb\x90fake-mp3-frame"

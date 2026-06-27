@@ -428,6 +428,58 @@ def _concat_mp3(parts: list[bytes], work_dir: Path) -> bytes:
     return b"".join(parts)
 
 
+# --- effective-rate measurement (voice/speed recalibration) ---------------
+# The script-sizing rate (words-per-minute) is voice- and speed-specific. After a
+# voice swap or speed change the planning figure is only an estimate until a real
+# render is measured. measure_effective_wpm derives the TRUE rate from a rendered
+# video: spoken words (break tags stripped -- they aren't words) over total audio
+# seconds (ffprobe). This is the same words->seconds basis the 167 figure used.
+_BREAK_TAG_RE = re.compile(r"<break[^>]*>", re.IGNORECASE)
+
+
+def spoken_word_count(text: str) -> int:
+    """Words ElevenLabs actually voices: drop <break/> tags, count whitespace tokens."""
+    return len(_BREAK_TAG_RE.sub(" ", text).split())
+
+
+def _mp3_seconds(path: Path) -> float | None:
+    """Duration of one mp3 via ffprobe, or None if unavailable."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return float(out.stdout.strip())
+    except Exception:  # noqa: BLE001 -- measurement is best-effort, never fatal
+        pass
+    return None
+
+
+def measure_effective_wpm(out_dir: Path, blocks: list[dict]) -> tuple[float, int, float] | None:
+    """Return (wpm, total_words, total_seconds) for a fully-rendered video, or None
+    if any scene mp3 is missing or ffprobe is unavailable. Per-video narration only
+    (the kit's own scenes), matching how the planning rate is derived."""
+    total_words = 0
+    total_seconds = 0.0
+    for b in blocks:
+        dest = out_dir / b["filename"]
+        if not dest.is_file():
+            return None
+        secs = _mp3_seconds(dest)
+        if secs is None or secs <= 0:
+            return None
+        total_words += spoken_word_count(b["text"])
+        total_seconds += secs
+    if total_seconds <= 0 or total_words <= 0:
+        return None
+    return (total_words / (total_seconds / 60.0), total_words, total_seconds)
+
+
 def synthesize_scene(text: str, *, key: str, work_dir: Path, **kw) -> bytes:
     """Synthesize one scene's narration, sub-chunking if it exceeds MAX_TTS_CHARS.
     kw are the synthesize() voice/model args."""
@@ -462,6 +514,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--force", action="store_true", help="Re-render mp3s that already exist.")
     p.add_argument("--dry-run", action="store_true", help="Plan + credit estimate; no API calls, no writes.")
     p.add_argument("--check", action="store_true", help="Verify the API key + print credits, then exit.")
+    p.add_argument("--measure-rate", action="store_true", help="Measure the effective words-per-minute of this kit's already-rendered mp3s (in the _gen dir) and exit. No API calls. Use to recalibrate the script-sizing rate after a voice/speed change.")
     return p.parse_args()
 
 
@@ -526,6 +579,19 @@ def main() -> None:
     # whole run, not just the previewed slice.
     full_chars = sum(len(b["text"]) for b in blocks)
     full_count = len(blocks)
+    full_blocks = list(blocks)  # all scenes, before --only/--limit narrows below
+
+    if args.measure_rate:
+        result = measure_effective_wpm(out_dir, full_blocks)
+        if result is None:
+            die(f"can't measure: not all scene mp3s exist in {out_dir} (render the full "
+                f"kit first), or ffprobe is unavailable.")
+        wpm, words, seconds = result
+        print(f"measured effective rate: {wpm:.1f} wpm  ({words} spoken words / "
+              f"{seconds / 60:.2f} min) from {out_dir}")
+        print(f"  -> size new scripts at target_minutes x {wpm:.0f} = word count")
+        return
+
     # --only narrows WHICH scenes render (model already chosen from the full kit
     # above, so a one-scene redo keeps the same voice). Applied before --limit.
     if args.only:
@@ -682,8 +748,55 @@ def main() -> None:
             print(f"  budget: booking skipped ({e}); mp3s are intact, ledger "
                   f"NOT updated -- reconcile manually", file=sys.stderr)
 
+    # One-shot rate recalibration: the script-sizing wpm is voice/speed-specific
+    # and only an estimate until a real render is measured. On the first FULL render
+    # at the current default voice, measure the true effective wpm and ping Steve to
+    # update the planning figure. Marker-guarded so it fires once per voice; partial
+    # runs (--only/--limit) and a missing-scene set are skipped (fires on a later
+    # complete run). Best-effort -- never fails a good render.
+    if made > 0 and args.only is None and args.limit is None and voice_id == DEFAULT_VOICE_ID:
+        try:
+            maybe_recalibrate_rate(script_dir, out_dir, full_blocks, voice_id, speed)
+        except Exception as e:  # noqa: BLE001 -- measurement must never break a render
+            print(f"  rate-check: skipped ({e})", file=sys.stderr)
+
     if failed:
         raise SystemExit(1)
+
+
+def maybe_recalibrate_rate(script_dir: Path, out_dir: Path, full_blocks: list[dict],
+                           voice_id: str, speed: float) -> None:
+    """Fire once per voice: measure the real effective wpm off the rendered video and
+    notify Steve to update the planning rate. The marker file makes it idempotent."""
+    # Keyed on voice AND speed -- the rate is specific to both, so a later speed
+    # change at the same voice must re-fire the measurement (not reuse a stale rate).
+    marker = script_dir / f".vo_rate_calibrated_{voice_id}_{speed}"
+    if marker.exists():
+        return
+    result = measure_effective_wpm(out_dir, full_blocks)
+    if result is None:
+        return  # scenes not all rendered yet, or ffprobe unavailable -- try next run
+    wpm, words, seconds = result
+    PLANNING_WPM = 192  # the current provisional figure in the script-sizing docs
+    delta_pct = (wpm - PLANNING_WPM) / PLANNING_WPM * 100
+    msg = (
+        f"\nRATE CALIBRATION (first render at voice {voice_id}, speed {speed}):\n"
+        f"  measured {wpm:.1f} wpm  ({words} spoken words / {seconds / 60:.2f} min)\n"
+        f"  planning figure is {PLANNING_WPM} wpm  (delta {delta_pct:+.1f}%)\n"
+        f"  -> update the rate in _Iris_Memory/Patterns/Script_VO_expansion_standard.md,\n"
+        f"     scriptwriter.md, and vo-reviewer.md from {PLANNING_WPM} to {wpm:.0f} (now MEASURED)."
+    )
+    print(msg)
+    notify_steve(
+        f"📏 VO rate measured off the first new-voice render: {wpm:.0f} wpm "
+        f"(planning was {PLANNING_WPM}, delta {delta_pct:+.1f}%). Update the 3 "
+        f"script-sizing docs from {PLANNING_WPM}→{wpm:.0f} (now measured, not "
+        f"estimated). Scripts size at target_minutes×{wpm:.0f}=words."
+    )
+    try:
+        marker.write_text(f"{wpm:.1f} wpm measured; speed {speed}; {words} words / {seconds:.1f}s\n")
+    except Exception:  # noqa: BLE001 -- if the marker can't be written it'll re-ping next run; harmless
+        pass
 
 
 if __name__ == "__main__":

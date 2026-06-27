@@ -7,5 +7,7 @@
 vo_budget_state.json
 # Lock guarding the budget-state commit against concurrent runs.
 .vo_budget.lock
+# One-shot rate-calibration markers (fire-once-per-voice/speed; local runtime state).
+.vo_rate_calibrated_*
 __pycache__/
 *.pyc
