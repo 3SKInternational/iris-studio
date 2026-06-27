@@ -47,5 +47,5 @@
   },
 
   "default_voice_id": "UgBBYS2sOqTuMpoF3BR0",
-  "_voice_note": "Set one voice id to keep brand consistency across both models. The model only changes quality/cost, not which voice speaks."
+  "_voice_note": "NOT read at render -- the speaking voice comes from generate_vo.py:392 (CLI/env ELEVENLABS_VOICE_ID/DEFAULT_VOICE_ID). Kept in sync for documentation only; to swap the voice you MUST also update .env + generate_vo.py DEFAULT_VOICE_ID. The model only changes quality/cost, not which voice speaks."
 }

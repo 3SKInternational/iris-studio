@@ -11,7 +11,7 @@ tags verbatim (ElevenLabs honors them on eleven_multilingual_v2) and strip only
 markdown emphasis so nothing decorative gets read aloud.
 
 Design mirrors image_factory deliberately: voice id / model / settings / output
-dir are config values (env + kit-header + CLI), so a future voice swap is a flag
+dir are config values (env + CLI), so a future voice swap is a flag
 change, not a rewrite. Stdlib-only (urllib) to match video_factory -- no deps.
 
   python3 generate_vo.py <kit.md> --check            # verify key (free GET)
@@ -51,8 +51,8 @@ except Exception:  # noqa: BLE001 -- allocator is an optimization, not a hard de
 
 API_BASE = "https://api.elevenlabs.io/v1"
 
-# Locked production defaults (Voice swapped 2026-06-27). All overridable
-# by the kit header, env, or CLI -- a voice swap stays a config change.
+# Locked production defaults (Voice swapped 2026-06-27). Voice/settings
+# overridable by env or CLI -- a voice swap stays a config change.
 DEFAULT_VOICE_ID = "UgBBYS2sOqTuMpoF3BR0"  # set 2026-06-27
 DEFAULT_MODEL = "eleven_multilingual_v2"
 # When the budget allocator is unavailable we must NOT silently default to the
