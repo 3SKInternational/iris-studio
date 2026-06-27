@@ -54,6 +54,10 @@ _WRITABLE_STATUS = (
 )
 
 
+# Sentinel for "drop the scheduled publish" (distinct from None = preserve-mode).
+CLEAR = object()
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(code)
@@ -67,11 +71,15 @@ def parse_arg(raw: str) -> tuple[str, str | None]:
     """'Video_05=2026-06-26T18:00:00Z' -> ('Video_05', RFC3339 publishAt).
     A bare 'Video_05' (no '=time') -> ('Video_05', None) = preserve-mode: touch
     only the flags requested (e.g. --synthetic), leaving privacy + any existing
-    schedule untouched."""
+    schedule untouched.
+    'Video_05=none' (or =clear/=unschedule) -> ('Video_05', CLEAR) = drop any
+    scheduled publish, leaving the video private (won't auto-flip public)."""
     label, _, when = raw.partition("=")
     label, when = label.strip(), when.strip()
     if not label.startswith("Video_"):
         die(f"bad label {label!r}; expected 'Video_NN'")
+    if when.lower() in ("none", "clear", "unschedule"):
+        return label, CLEAR  # unschedule-mode: stay private, no publishAt
     if "=" not in raw or not when:
         return label, None  # preserve-mode: no schedule change
     try:
@@ -154,7 +162,11 @@ def main() -> int:
         new_status = {k: live[k] for k in _WRITABLE_STATUS if k in live}
         # Floor matching upload_video.py: never let the COPPA flag go unset on update.
         new_status.setdefault("selfDeclaredMadeForKids", False)
-        if publish_at is not None:  # schedule-mode: flip to a scheduled public release
+        if publish_at is CLEAR:  # unschedule-mode: stay private, drop any scheduled publish
+            want_privacy, want_publish = "private", None
+            new_status["privacyStatus"] = "private"
+            new_status.pop("publishAt", None)  # omitting publishAt on a status update clears it
+        elif publish_at is not None:  # schedule-mode: flip to a scheduled public release
             want_privacy, want_publish = "private", publish_at
             new_status["privacyStatus"] = "private"  # required pairing for a scheduled publish
             new_status["publishAt"] = publish_at
@@ -218,7 +230,10 @@ def main() -> int:
             failures += 1
             continue
 
-        if publish_at is not None:
+        if publish_at is CLEAR:
+            data["privacy"] = "private"
+            data["publish_at"] = None
+        elif publish_at is not None:
             data["privacy"] = "private"
             data["publish_at"] = publish_at
         if synthetic:
