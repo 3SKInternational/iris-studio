@@ -51,16 +51,16 @@ except Exception:  # noqa: BLE001 -- allocator is an optimization, not a hard de
 
 API_BASE = "https://api.elevenlabs.io/v1"
 
-# Locked production defaults (Voice locked: Brian, 2026-06-11). All overridable
+# Locked production defaults (Voice swapped 2026-06-27). All overridable
 # by the kit header, env, or CLI -- a voice swap stays a config change.
-DEFAULT_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian
+DEFAULT_VOICE_ID = "UgBBYS2sOqTuMpoF3BR0"  # set 2026-06-27
 DEFAULT_MODEL = "eleven_multilingual_v2"
 # When the budget allocator is unavailable we must NOT silently default to the
 # premium (expensive) v2 model -- a blind run falls back to cheap flash. An
 # explicit --model still wins, so deliberate v2 use is unaffected.
 FALLBACK_MODEL = "eleven_flash_v2_5"
-DEFAULT_STABILITY = 0.5
-DEFAULT_SIMILARITY = 0.75
+DEFAULT_STABILITY = 0.43   # voice-optimal range 0.42-0.45 (set 2026-06-27)
+DEFAULT_SIMILARITY = 0.28  # voice-optimal range 0.27-0.29 (set 2026-06-27)
 DEFAULT_STYLE = 0.0
 DEFAULT_SPEED = 1.0  # ElevenLabs voice_settings.speed; valid 0.7-1.2, 1.0 = native pace.
 

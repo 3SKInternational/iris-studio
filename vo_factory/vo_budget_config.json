@@ -46,6 +46,6 @@
     "instruction_cues": ["step 1","step one","first,","next,","then,","finally,","how to","tutorial","click","tap","install","setup","configure","enable","select","open the","go to","in this video","subscribe","like and"]
   },
 
-  "default_voice_id": "nPczCjzI2devNBz1zQrb",
+  "default_voice_id": "UgBBYS2sOqTuMpoF3BR0",
   "_voice_note": "Set one voice id to keep brand consistency across both models. The model only changes quality/cost, not which voice speaks."
 }
