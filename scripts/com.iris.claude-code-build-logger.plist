@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  BUILD LOGGER — installed 2026-06-27.
+
+  Weekly autonomous fire of the `build-logger` agent (via the build-logger Claude
+  routine): turns the last 7 days of shipped engineering work (bridge file + git
+  commits + daily-note intra-day logs) into build-in-public post drafts (X thread +
+  newsletter blurb) for the Building Iris brand. The agent self-selects the 1-3 most
+  post-worthy items (prioritizing instructive failure+fix scars) and runs a
+  mandatory fail-closed redaction scrub on every draft. DRAFT-ONLY; never posts
+  (publishing target intentionally undecided, brand-split pending). Quiet-idle when
+  the week is pure housekeeping (emits ROUTINE_COMPLETE, no noise).
+
+  Runs via run_claude_job.sh (it's a `claude --print` routine) so the same wrapper
+  handles logging, the ROUTINE_COMPLETE/INCOMPLETE sentinel -> Telegram alert, and
+  the retry queue.
+
+  Schedule: Saturday 1:30 AM ET — fires ahead of the 02:30-05:30 overnight cluster,
+  no job shares the 01:30 slot, and it captures the full Mon-Fri week. Distinct from
+  the Sat 06:50 newsletter-writer fire.
+
+  Manage:
+    launchctl bootout gui/$(id -u)/com.iris.claude-code-build-logger 2>/dev/null
+    cp scripts/com.iris.claude-code-build-logger.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iris.claude-code-build-logger.plist
+    launchctl kickstart -k gui/$(id -u)/com.iris.claude-code-build-logger   # test fire
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-build-logger</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh build-logger /Volumes/AI_Workspace/iris_studio/routines/build-logger.prompt</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/build-logger.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/build-logger.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>1</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+			<key>Weekday</key>
+			<integer>6</integer>
+		</dict>
+	</array>
+</dict>
+</plist>
