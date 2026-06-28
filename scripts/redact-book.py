@@ -10,6 +10,12 @@
 # replace set drifted from the IGNORECASE residual check for compound tokens — `\biris\b`
 # missed `_Iris_Memory` and the case-sensitive STEVE_CONTEXT entry missed `steve_context`,
 # both of which the residual check flagged. Added IGNORECASE subs mirroring the checks.
+# Hardened 2026-06-28 (autonomous redact-set symmetry sweep): closed the last
+# check-without-symmetric-replace asymmetry — `ai_workspace` (IGNORECASE residual check)
+# was only replaced by the case-SENSITIVE `AI_Workspace` entry, so a lowercased/mixed form
+# fail-closed a clean book. Added an IGNORECASE mirror sub (test case 4c). Same pass also
+# made the CRED_PATTERNS substitution loop IGNORECASE (its residual check was already
+# IGNORECASE), closing the last instance of the drift class for credentials too (case 4d).
 # Regression test: scripts/test_redact_book.py.
 import re, sys
 
@@ -57,6 +63,11 @@ s = re.sub(r"\bmainfolder\b", "[USER]", s, flags=re.IGNORECASE)
 s = re.sub(r"studio@[A-Za-z0-9._%+-]+\.[A-Za-z]{2,}", "[EMAIL]", s, flags=re.IGNORECASE)
 s = re.sub(r"\b5582798766\b", "[USER_ID]", s)
 s = re.sub(r"3SK", "[COMPANY]", s, flags=re.IGNORECASE)
+# AI_Workspace is replaced case-SENSITIVELY in `ordered`, but the residual check
+# `ai_workspace` is IGNORECASE -> a lowercased/mixed form (e.g. /volumes/ai_workspace/)
+# survives the replace yet fails the check (same drift class as steve_context/iris below).
+# Mirror the check so replace-set and check-set can't drift.
+s = re.sub(r"ai_workspace", "[SSD]", s, flags=re.IGNORECASE)
 # STEVE_CONTEXT only appears in the case-SENSITIVE `ordered` set, but the residual check
 # `steve_context` is IGNORECASE — so a lowercase/mixed `steve_context` would survive replace
 # yet fail the check (same drift class as the iris fix above). Mirror the check.
@@ -95,7 +106,13 @@ CRED_PATTERNS = [
     (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED]"),
 ]
 for pat, repl in CRED_PATTERNS:
-    s = re.sub(pat, repl, s)
+    # IGNORECASE so the substitution scope EXACTLY matches the residual check below
+    # (line scans CRED_PATTERNS with re.IGNORECASE). Without it, a case-flipped secret
+    # (SK-ANT-…, GHP_…, akia…) survived the sub yet tripped the check -> fail-closed.
+    # Same single-source-of-truth invariant as the identity tokens. The fix matters for
+    # the prefix LITERALS (sk-ant-, ghp_, AKIA) which are case-specific; patterns with an
+    # inline (?i) are unaffected, and the alpha char-classes were already both-case.
+    s = re.sub(pat, repl, s, flags=re.IGNORECASE)
 
 try:
     with open(P, "w", encoding="utf-8") as fh:

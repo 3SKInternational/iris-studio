@@ -48,6 +48,18 @@ def main():
         assert code == 0 and "steve" not in out.lower(), \
             f"{variant} should redact clean: {code} {out!r}"
 
+    # 4c) Same asymmetry class for AI_Workspace: lowercase/mixed must redact clean too.
+    for variant in ("ai_workspace", "AI_Workspace", "Ai_Workspace"):
+        code, out, msg = run(f"repo at /volumes/{variant}/build on disk")
+        assert code == 0 and "ai_workspace" not in out.lower(), \
+            f"{variant} should redact clean: {code} {out!r}"
+
+    # 4d) Cred-pattern case symmetry: a case-flipped secret must redact clean, not fail-close.
+    for secret in ("SK-ANT-" + "A" * 30, "GHP_" + "a" * 36, "akia" + "0" * 16):
+        code, out, msg = run(f"leaked {secret} here")
+        assert code == 0 and "[REDACTED]" in out, \
+            f"case-flipped secret {secret!r} should redact clean: {code} {out!r}"
+
     # 5) Clean text passes.
     code, _, msg = run("This text has nothing to redact.")
     assert code == 0 and "REDACTION OK" in msg, f"clean text should pass: {msg!r}"
