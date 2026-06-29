@@ -519,6 +519,18 @@ def _is_transient_api_error(exc: Exception) -> bool:
     return isinstance(exc, OSError)
 
 
+def _caption_error_bucket(exc: Exception) -> str:
+    """Bucket a caption API failure: 'gone' (HTTP 404 — the video no longer exists,
+    e.g. deleted or a stale receipt id; captioning is impossible and NEVER becomes
+    possible, so it must not page every run), 'transient' (network/5xx/429 — heals on
+    the next sweep), or 'errors' (a real hard error that needs Steve). Only 'errors'
+    drives the non-zero exit / Telegram alert."""
+    from googleapiclient.errors import HttpError
+    if isinstance(exc, HttpError) and getattr(exc.resp, "status", None) == 404:
+        return "gone"
+    return "transient" if _is_transient_api_error(exc) else "errors"
+
+
 def iter_upload_receipts(vlt: Path):
     """Yield (video_label, video_id, receipt_path, receipt_dict) for every upload
     receipt that carries a YouTube video_id. These receipts are the canonical map
@@ -553,7 +565,7 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
     Returns a summary dict.
     """
     summary = {"checked": 0, "added": 0, "updated": 0, "skipped": 0,
-               "no_srt": 0, "transient": 0, "errors": 0}
+               "no_srt": 0, "gone": 0, "transient": 0, "errors": 0}
     only_label = normalize_id(only)[0] if only else None
     for label, video_id, rp, data in iter_upload_receipts(vlt):
         if only_label and label != only_label:
@@ -563,11 +575,10 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
         try:
             existing = find_managed_caption_track(youtube, video_id)
         except Exception as exc:  # API/network failure — skip this one, keep sweeping.
-            transient = _is_transient_api_error(exc)
-            kind = "transient" if transient else "errors"
+            kind = _caption_error_bucket(exc)
+            tag = {"transient": "transient ", "gone": "gone-404 "}.get(kind, "")
             print(f"  ⚠ {label} ({video_id}): caption check failed "
-                  f"({'transient ' if transient else ''}{type(exc).__name__}: {exc})",
-                  file=sys.stderr)
+                  f"({tag}{type(exc).__name__}: {exc})", file=sys.stderr)
             summary[kind] += 1
             continue
         if existing and not force:
@@ -587,11 +598,10 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
         try:
             action = upsert_captions(youtube, video_id, srt)
         except Exception as exc:
-            transient = _is_transient_api_error(exc)
-            kind = "transient" if transient else "errors"
+            kind = _caption_error_bucket(exc)
+            tag = {"transient": "transient ", "gone": "gone-404 "}.get(kind, "")
             print(f"  ⚠ {label} ({video_id}): caption upload failed "
-                  f"({'transient ' if transient else ''}{type(exc).__name__}: {exc})",
-                  file=sys.stderr)
+                  f"({tag}{type(exc).__name__}: {exc})", file=sys.stderr)
             summary[kind] += 1
             continue
         verb = "updated" if action == "update" else "added"
@@ -839,8 +849,8 @@ def main() -> None:
             s = sweep_captions(youtube, vlt)
             print(f"  caption sweep: {s['checked']} checked · {s['added']} added · "
                   f"{s['updated']} updated · {s['skipped']} present · "
-                  f"{s['no_srt']} missing-srt · {s['transient']} transient · "
-                  f"{s['errors']} errors")
+                  f"{s['no_srt']} missing-srt · {s['gone']} gone-404 · "
+                  f"{s['transient']} transient · {s['errors']} errors")
         except Exception as exc:  # never let the sweep sink a good upload.
             print(f"  ⚠ caption sweep skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
