@@ -177,6 +177,21 @@ Time: $(_rq_now_et)"
     return 0
 }
 
+# ---- silently retire a marker (a run we deliberately SKIPPED, not a recovery) ----
+# Use on an exit-0 path that did NOT actually run the job because of a known,
+# self-healing infra condition (e.g. FDA/EPERM can't exec the venv interpreter).
+# Removes any pending retry marker WITHOUT a RECOVERED ping — the job didn't
+# recover, we just don't want the 30-min sweep replaying a guaranteed-skip forever
+# (which never bumps attempts, so it would never hit the give-up ceiling either).
+# Matches the EPERM-path contract: "no retry marker — self-heal on next schedule."
+# Silent no-op when no marker exists.
+rq_drop_marker() {
+    local job="$1" file
+    file="$(_rq_marker "$job")"
+    rm -f "$file" 2>/dev/null || true
+    return 0
+}
+
 # ---- clear on a run that actually happened --------------------------------
 # Call on ANY exit-0 / "it ran" path. If a retry marker existed (the job had been
 # failing) this emits a one-time RECOVERED ping and removes the marker. On a

@@ -84,6 +84,14 @@ The 30-min auto-retry will re-run it once the volume is back."
     exit 1
 fi
 
+# Byte offset of LOG before this run, so the EPERM check below greps ONLY this
+# invocation's output — not stale lines from an earlier run still in the file. The
+# log is a fixed accumulating per-job file; a `tail -n 12` match could otherwise
+# misread a prior run's pyvenv line and wrongly swallow (and drop the marker of) a
+# distinct later failure that printed only a line or two.
+LOG_OFF_BEFORE="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+LOG_OFF_BEFORE="${LOG_OFF_BEFORE//[^0-9]/}"; LOG_OFF_BEFORE="${LOG_OFF_BEFORE:-0}"
+
 "$@" >> "$LOG" 2>&1
 rc=$?
 
@@ -98,8 +106,14 @@ TS="$(date '+%Y-%m-%d %H:%M %Z')"
 # relocating the repo to an internal disk. See memory: FDA breaks on claude cask upgrade.
 # Match ONLY the unambiguous FDA signature (EPERM reading pyvenv.cfg) — a genuinely
 # broken/corrupted venv fails differently and still surfaces its red alert.
-if [ "$rc" -ne 0 ] && tail -n 12 "$LOG" 2>/dev/null \
+if [ "$rc" -ne 0 ] && tail -c "+$((LOG_OFF_BEFORE + 1))" "$LOG" 2>/dev/null \
         | grep -qE 'Operation not permitted.*pyvenv\.cfg'; then
+    # Retire any pending retry marker too. The EPERM skip is silent and exits 0
+    # WITHOUT bumping attempts, so a marker left over from an earlier failure would
+    # never clear and never hit the give-up cap — the 30-min sweep would replay this
+    # guaranteed-skip forever (the storm the 6/27 patch missed). Drop it silently;
+    # the job self-heals on its next scheduled fire once FDA returns.
+    rq_drop_marker "$JOB"
     echo "run_job: '${JOB}' SKIPPED — venv interpreter not execable under launchd (FDA/EPERM at Python startup); silent, retries on next schedule at ${TS}" >> "$LOG"
     exit 0
 fi
