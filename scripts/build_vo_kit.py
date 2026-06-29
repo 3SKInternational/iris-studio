@@ -13,9 +13,13 @@ What it does (all deterministic -- no LLM, can't hallucinate a number):
   2. Extract that scene's `**VO:**` narration (everything up to `**SCENE PROMPT`).
   3. Apply TTS orthography so ElevenLabs reads acronyms/symbols correctly
      (401k -> "four-oh-one-kay", IRA -> "I R A", S&P 500 -> "S and P five
-     hundred", % -> "percent"). Dollar/number digits are kept verbatim --
-     ElevenLabs reads grouped thousands fine; only non-round millions misread,
-     and scripts/vo_number_lint.py (run by generate_vo at render) gates those.
+     hundred", % -> "percent"), and spell out risky dollar figures. CONFIRMED
+     V04 hazard: ElevenLabs voiced "$847" as "eight forty-seven" ($8.47). Bare
+     hundreds and non-round thousands misread the same way, so each becomes a
+     {{spoken words|$digits}} dual-form -- the audio is unambiguous while the
+     on-screen caption keeps the digits. Whole-thousands ($18,000) read fine
+     and stay verbatim; millions+ are left to scripts/vo_number_lint.py (run by
+     generate_vo at render).
   4. Convert the author's paragraph breaks into `<break time="0.8s" />` pacing
      pauses (generate_vo collapses newlines, so an explicit tag is the only way
      a paragraph pause survives to the render).
@@ -65,10 +69,59 @@ _ORTHOGRAPHY: list[tuple[re.Pattern, str]] = [
 
 BREAK_TAG = '<break time="0.8s" />'
 
+# --- Dollar-figure spelling (V04 phantom-decimal fix) ------------------------
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+         "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+         "eighty", "ninety")
+# A dollar figure whose digits start AND end with a digit (so a trailing
+# sentence comma isn't swallowed), not followed by a decimal (skip real cents
+# like $3.47), another digit (don't half-match $1234), or a k/M/B magnitude
+# suffix -- leave $10k/$5M untouched for vo_number_lint / human review rather
+# than voicing "$5" + a dangling "M" (the wrong value, billed).
+_DOLLAR_RE = re.compile(r"\$(\d(?:[\d,]*\d)?)(?!\.\d)(?!\d)(?![kKmMbB])")
+
+
+def _words_under_1000(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        t, o = divmod(n, 10)
+        return _TENS[t] + (f"-{_ONES[o]}" if o else "")
+    h, r = divmod(n, 100)
+    return _ONES[h] + " hundred" + (f" {_words_under_1000(r)}" if r else "")
+
+
+def num_to_words(n: int) -> str:
+    """Cardinal words for 0..999,999 (US style, no 'and')."""
+    if not 0 <= n < 1_000_000:
+        raise ValueError(f"num_to_words out of range: {n}")
+    if n < 1000:
+        return _words_under_1000(n)
+    th, r = divmod(n, 1000)
+    return _words_under_1000(th) + " thousand" + (f" {_words_under_1000(r)}" if r else "")
+
+
+def spell_dollars(text: str) -> str:
+    """Spell integer dollar figures ElevenLabs would misread as decimals.
+
+    Each risky figure -> {{<words> dollars|$digits}} dual-form (spoken words,
+    captioned digits). Whole-thousands read fine; millions+ are gated elsewhere."""
+    def repl(m: "re.Match[str]") -> str:
+        raw = m.group(1)
+        val = int(raw.replace(",", ""))
+        if val >= 1_000_000:                  # ponytail: millions gated by vo_number_lint, not here
+            return m.group(0)
+        if val >= 1000 and val % 1000 == 0:   # whole-thousands ($18,000) voice cleanly
+            return m.group(0)
+        return "{{" + num_to_words(val) + " dollars|$" + raw + "}}"
+    return _DOLLAR_RE.sub(repl, text)
+
 
 def apply_orthography(text: str) -> str:
     for pat, rep in _ORTHOGRAPHY:
         text = pat.sub(rep, text)
+    text = spell_dollars(text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
@@ -196,10 +249,15 @@ def selftest() -> int:
         "Scene: ignore me.\n\n"
         "---\n\n"
         "## SCENE 2 [0:18–0:40] THE PROMISE\n\n"
-        "**VO:** Single paragraph, no break needed.\n\n"
+        "**VO:** Save $347 a month — that's $1,847 a year, not $18,000 — not $1,000,000 or $5M someday. Skip the $3.47 latte.\n\n"
         "**SCENE PROMPT:**\nScene: ignore.\n"
     )
     kit = build_kit(sample, Path("Video_09_Test.md"), "09")
+    nw = {
+        0: "zero", 7: "seven", 19: "nineteen", 20: "twenty", 21: "twenty-one",
+        100: "one hundred", 347: "three hundred forty-seven", 1000: "one thousand",
+        22100: "twenty-two thousand one hundred", 999999: "nine hundred ninety-nine thousand nine hundred ninety-nine",
+    }
     checks = {
         "Roth I R A": "Roth I R A" in kit,
         "four-oh-one-kay": "four-oh-one-kay" in kit,
@@ -211,6 +269,13 @@ def selftest() -> int:
         "mp3 names zero-padded": "Video_09_VO_Scene_01.mp3" in kit and "Video_09_VO_Scene_02.mp3" in kit,
         "scene-prompt excluded": "ignore me" not in kit and "ignore." not in kit,
         "label carried": "COLD OPEN, 0:00–0:18" in kit,
+        "num_to_words table": all(num_to_words(k) == v for k, v in nw.items()),
+        "$347 spelled (dual-form)": "{{three hundred forty-seven dollars|$347}}" in kit,
+        "$18,000 whole-thousand kept": "$18,000" in kit and "eighteen thousand dollars" not in kit,
+        "$3.47 cents untouched": "$3.47" in kit and "three dollars" not in kit,
+        "$1,847 comma-grouped spelled": "{{one thousand eight hundred forty-seven dollars|$1,847}}" in kit,
+        "$1,000,000 million kept verbatim": "$1,000,000" in kit and "one million" not in kit,
+        "$5M suffix untouched": "$5M" in kit and "five dollars" not in kit,
     }
     ok = all(checks.values())
     for name, passed in checks.items():
