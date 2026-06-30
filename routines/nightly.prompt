@@ -1,5 +1,9 @@
 Read /Users/steve/Documents/3SK/outputs/06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md and execute tonight's engineering work per the Work Queue. Append your session summary to /Users/steve/Documents/3SK/outputs/_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md per the Communication Protocol section. Do not duplicate any item Cowork's nightly pulse has already completed (check the Build Queue file).
 
+## 🥇 Work-selection rule — drain the OLDEST eligible build first (A-39)
+
+Before picking the freshest signal, check `06_CEO/Automation_Backlog.md` for rows still tagged `auto-build-eligible: true` (not yet 🟢 SHIPPED). If any exist, build the **oldest** one FIRST (by its seed/NEW date), ahead of any newer follow-up — a `auto-build-eligible` tag is a permission, not a scheduler, and newest-wins selection silently starves tagged items (A-32 starved ~12 nights, A-35 ~4). Only after the oldest eligible row is shipped (or genuinely blocked) do you move to fresher work. If a row is blocked, say why in the bridge and take the next-oldest. This rule exists so this starvation class cannot recur.
+
 ---
 
 ## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)

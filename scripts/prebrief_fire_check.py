@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Pre-brief Pass 12 (A-22) — expected-vs-actual fire diff (last 24h).
+"""Pre-brief Pass 12 (A-22, A-35) — expected-vs-actual fire diff (last 24h).
 
 Compares the set of scheduled fires that *should* have happened in the last
 24h against on-disk evidence (launchd log mtimes, iris.db rows, deliverable
 file mtimes). Prints `OK` when every expected fire is accounted for; prints
 a numbered anomaly report otherwise.
+
+A-35: the launchd-job coverage is now auto-derived from the plists in
+~/Library/LaunchAgents (com.iris.claude-code-*.plist) via `collect_launchd_expected`,
+not a hand-maintained table — so newly-added scheduled routines get silent-skip
+detection automatically instead of firing uncovered. Interval/manual jobs are
+listed as a coverage note (the daily/weekly model doesn't fit them yet).
 
 Catches the silent-skip class — the 2026-06-01 App Nap miss where the morning
 brief + chief-of-staff-weekly + market-researcher-monthly all skipped with
@@ -17,7 +23,11 @@ Output is consumed by `routines/pre-brief.prompt` Pass 12.
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -44,6 +54,128 @@ MORNING_BRIEFING_HOUR = 8
 # Python's weekday(): Mon=0..Sun=6. LaunchD's Weekday is Sun=0..Sat=6 so we
 # convert at the schedule table.
 MON, TUE, WED, THU, FRI, SAT, SUN = 0, 1, 2, 3, 4, 5, 6
+
+# === A-35: auto-derive launchd-job coverage from the plists themselves =========
+# The hardcoded table below covers ~12 fires, but ~/Library/LaunchAgents holds
+# 38 com.iris.claude-code-*.plist jobs — the rest fired with NO silent-skip
+# detection (A-22 reported OK while any could be dead). This derives an Expected
+# per calendar-scheduled claude-code plist straight from the schedule on disk.
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+CLAUDE_PLIST_GLOB = "com.iris.claude-code-*.plist"
+
+# Plists already covered by a hardcoded check below — auto-derive skips them to
+# avoid a duplicate Expected for the same fire. The 5 claude-code launchd jobs
+# keep their proven tee-log paths; youtube-research is verified more strongly by
+# the dispatch-row check (agent ran to completion) than by a log mtime.
+_AUTODERIVE_SKIP = {
+    "com.iris.claude-code-nightly",
+    "com.iris.claude-code-pre-brief",
+    "com.iris.claude-code-hygiene",
+    "com.iris.claude-code-credential-check",
+    "com.iris.claude-code-automation-scan",
+    "com.iris.claude-code-youtube-research",
+}
+
+
+def _load_plist(path: Path) -> dict | None:
+    """Read a plist via `plutil -convert json` rather than plistlib: 10 of these
+    plists carry explanatory XML comments containing `--` (e.g. "claude --print"),
+    which is illegal XML that Python's expat rejects but launchd/plutil accept.
+    plutil is the same lenient CFPropertyList parser launchd uses. None on any
+    failure (missing tool, bad exit, bad JSON) so a single odd plist can't crash
+    the whole fire-check."""
+    try:
+        out = subprocess.run(
+            ["plutil", "-convert", "json", "-o", "-", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _launchd_wd_to_py(wd: int) -> int:
+    """launchd Weekday (Sun=0..Sat=6) → Python weekday() (Mon=0..Sun=6)."""
+    return (wd + 6) % 7
+
+
+def _derive_log_path(data: dict, name: str) -> Path:
+    """The freshness signal is the wrapper's tee log, NOT StandardOutPath —
+    run_job.sh sends real output to its $LOG and stdout to /dev/null, so the
+    .stdout.log is near-empty/stale even when the job ran. Both wrappers name
+    their log deterministically from the JOB arg:
+      run_claude_job.sh <JOB> …  →  claude-code-<JOB>.log
+      run_job.sh <JOB> …         →  job-<JOB>.log
+    Joining ProgramArguments handles both the `-lc "<script> <JOB> …"` single-
+    string form and the split-element form. Falls back to StandardOutPath."""
+    joined = " ".join(str(a) for a in (data.get("ProgramArguments") or []))
+    if (mcj := re.search(r"run_claude_job\.sh\s+(\S+)", joined)):
+        return LOGS_DIR / f"claude-code-{mcj.group(1)}.log"
+    if (mj := re.search(r"run_job\.sh\s+(\S+)", joined)):
+        return LOGS_DIR / f"job-{mj.group(1)}.log"
+    out = data.get("StandardOutPath")
+    return Path(out) if out else (LOGS_DIR / f"{name}.log")
+
+
+def _expected_from_calendar_entry(
+    now: datetime, entry: dict, name: str, log_path: Path
+) -> Expected | None:
+    """One StartCalendarInterval dict → an Expected iff it fired in the last 24h.
+    Returns None for hourly/wildcard-hour entries (no single daily fire to model)
+    and for fires outside the lookback window."""
+    hour = entry.get("Hour")
+    if hour is None:
+        return None
+    minute = entry.get("Minute", 0)
+    if "Weekday" in entry:
+        t = _last_fire_weekly(now, {_launchd_wd_to_py(entry["Weekday"])}, hour, minute)
+    elif "Day" in entry:
+        t = _last_fire_monthly(now, entry["Day"], hour, minute)
+    else:
+        t = _last_fire_daily(now, hour, minute)
+    if t is None:
+        return None
+    return Expected(name, t, "launchd_log", log_path=log_path)
+
+
+def collect_launchd_expected(
+    now: datetime,
+) -> tuple[list[Expected], list[tuple[str, str]]]:
+    """Auto-derive launchd_log Expecteds from every calendar-scheduled
+    com.iris.claude-code-*.plist. Returns (expected, not_checked) where
+    not_checked is [(name, reason)] for interval/manual/unparseable plists — so
+    the report can be honest about what it does NOT cover (no silent confidence)."""
+    expected: list[Expected] = []
+    not_checked: list[tuple[str, str]] = []
+    if not shutil.which("plutil") or not LAUNCH_AGENTS_DIR.is_dir():
+        return expected, not_checked  # not on macOS / no agents dir — hardcoded-only
+    for path in sorted(LAUNCH_AGENTS_DIR.glob(CLAUDE_PLIST_GLOB)):
+        data = _load_plist(path)
+        if data is None:
+            not_checked.append((path.stem, "unparseable plist"))
+            continue
+        label = data.get("Label", path.stem)
+        if label in _AUTODERIVE_SKIP:
+            continue
+        name = label.replace("com.iris.", "")
+        sci = data.get("StartCalendarInterval")
+        if sci is None:
+            interval = data.get("StartInterval")
+            reason = (
+                f"StartInterval={interval}s — not coverage-checked"
+                if interval else "no schedule (RunAtLoad/manual) — not coverage-checked"
+            )
+            not_checked.append((name, reason))
+            continue
+        log_path = _derive_log_path(data, name)
+        entries = sci if isinstance(sci, list) else [sci]
+        for entry in entries:
+            exp = _expected_from_calendar_entry(now, entry, name, log_path)
+            if exp:
+                expected.append(exp)
+    return expected, not_checked
 
 
 @dataclass
@@ -293,6 +425,8 @@ def main(argv: list[str]) -> int:
     skip_self = "--skip-pre-brief-self" in argv
 
     expected = collect_expected(now)
+    auto_expected, not_checked = collect_launchd_expected(now)
+    expected += auto_expected
     findings: list[str] = []
     green = 0
     for exp in expected:
@@ -312,13 +446,25 @@ def main(argv: list[str]) -> int:
                 f"{exp.name}: expected {exp.expected_at:%Y-%m-%d %H:%M} — {msg}"
             )
 
+    # Surface unparseable plists as anomalies (a plist launchd can't reload is a
+    # silently-dead job — exactly the class this check exists for). Interval/manual
+    # jobs are listed once as a coverage note, not flagged.
+    bad_plists = [n for n, r in not_checked if r == "unparseable plist"]
+    coverage_notes = [(n, r) for n, r in not_checked if r != "unparseable plist"]
+    for name in bad_plists:
+        findings.append(f"{name}: plist unparseable by plutil — launchd cannot (re)load it")
+
     if not findings:
         print(f"OK ({green}/{green} expected fires verified)")
-        return 0
-
-    print(f"ANOMALIES ({len(findings)} of {green + len(findings)} expected fires):")
-    for i, line in enumerate(findings, 1):
-        print(f"  {i}. {line}")
+    else:
+        print(f"ANOMALIES ({len(findings)} of {green + len(findings)} expected fires):")
+        for i, line in enumerate(findings, 1):
+            print(f"  {i}. {line}")
+    if coverage_notes:
+        print(
+            f"NOT coverage-checked ({len(coverage_notes)} interval/manual jobs): "
+            + ", ".join(f"{n} ({r})" for n, r in coverage_notes)
+        )
     return 0  # surface-only; never block the routine
 
 
