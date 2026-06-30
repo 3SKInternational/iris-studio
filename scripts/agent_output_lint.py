@@ -1,6 +1,6 @@
-"""Pre-delivery lint for agent dispatched deliverables (A-23).
+"""Pre-delivery lint for agent dispatched deliverables (A-23, A-32).
 
-Two checks:
+Three checks:
 
 1. Banned vocabulary — words from the Master_Character_Prompt v3 banned table
    that consistently push image models toward realism ("cinematic", "realistic",
@@ -13,6 +13,10 @@ Two checks:
    only; surfaces script-level inconsistencies a human eye catches instantly
    (V05 calibration defect: $1,847 referenced 5+ times, $7,713 once — visible
    in the overview, easy to flag).
+
+3. VO density (A-32) — for script deliverables that state a "Runtime target:",
+   estimate spoken runtime from VO word-count (150 wpm) and flag when it falls
+   below 70% of target. Skip-silent on anything without a runtime target line.
 
 Read-only: writes `<deliverable>_lint.md` next to the deliverable. Never edits
 the deliverable itself. Returns a structured result dict so the caller can decide
@@ -246,8 +250,139 @@ def monetary_overview(text: str) -> dict:
     }
 
 
+# ── A-32: VO-density check ─────────────────────────────────────────────────
+# Catches script deliverables that claim a runtime target the VO word-count
+# can't fill. V1-V4 legacy scripts carried 600-730 words against 12-16 min
+# targets (~30-40% of the words needed); V5 (calibrated) carried 1,785 words /
+# 12 min ≈ 149 wpm — correct. Calibrated baseline rounded to 150 wpm.
+VO_WPM = 150
+VO_RATIO_FLAG_THRESHOLD = 0.70  # flag below 70% of stated runtime
+
+# Stated runtime target, anchored at line start so prose mentions don't trip it.
+# Tolerates the live scripts' markdown decoration — "- **Runtime target:** 19:49"
+# — plus the older bare "Runtime target: 12 min" / "Runtime: 15:00" forms. The
+# separator class [\s:*\-] absorbs the bullet, bold stars, and colon in any order
+# between the label and the number; the trailing $ keeps prose mentions out.
+_RUNTIME_TARGET_RE = re.compile(
+    r"^\s*[-*+]?\s*\*{0,2}\s*"
+    r"(?:runtime\s*target|target\s*runtime|runtime)"
+    r"[\s:*\-]*"
+    r"(\d+(?:[:.]\d+)?)\s*(?:min(?:ute)?s?|m)?\s*\*{0,2}\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# VO block marker. The live scriptwriter emits narration INLINE on the marker
+# line — "**VO:** By the end of this video, you'll…" (scriptwriter.md) — and may
+# continue onto following plain lines. Group 1 captures any inline remainder.
+_VO_MARKER_RE = re.compile(r"^\s*\*\*VO:?\*\*\s*(.*)$", re.IGNORECASE)
+
+# Any bold-label marker at line start ends the current VO block — e.g.
+# "**B-roll:** desc", "**Image:** prompt", "**On-screen:** text". Crucially this
+# matches markers WITH trailing inline content (the common scriptwriter shape),
+# so B-roll/image-prompt prose isn't miscounted as spoken VO (which would inflate
+# the density ratio and weaken the under-density flag).
+_BOLD_MARKER_RE = re.compile(r"^\s*\*\*[^*\n]+\*\*")
+
+
+def _parse_target_minutes(raw: str) -> "float | None":
+    """'12' / '12.5' / '12:00' / '15:30' → minutes as float. None on failure."""
+    raw = raw.strip()
+    if ":" in raw:
+        try:
+            m, s = raw.split(":", 1)
+            return int(m) + (int(s) / 60.0)
+        except (ValueError, TypeError):
+            return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_vo_blocks(text: str) -> list[str]:
+    """Pull each VO block body (between a **VO:** marker and the next structural
+    break: another bold-marker, heading, fence, or two blank lines)."""
+    blocks: list[str] = []
+    in_block = False
+    current: list[str] = []
+    blank_run = 0
+    for line in text.splitlines():
+        mvo = _VO_MARKER_RE.match(line)
+        if mvo:
+            if in_block and current:
+                blocks.append("\n".join(current).strip())
+            in_block = True
+            current = []
+            blank_run = 0
+            inline = mvo.group(1).strip()
+            if inline:  # narration on the same line as the marker
+                current.append(inline)
+            continue
+        if not in_block:
+            continue
+        stripped = line.strip()
+        if (
+            _BOLD_MARKER_RE.match(line)
+            or stripped.startswith("#")
+            or stripped.startswith("```")
+        ):
+            if current:
+                blocks.append("\n".join(current).strip())
+            current = []
+            in_block = False
+            blank_run = 0
+            continue
+        if not stripped:
+            blank_run += 1
+            if blank_run >= 2:
+                if current:
+                    blocks.append("\n".join(current).strip())
+                current = []
+                in_block = False
+                blank_run = 0
+            continue
+        blank_run = 0
+        current.append(stripped)
+    if in_block and current:
+        blocks.append("\n".join(current).strip())
+    return [b for b in blocks if b]
+
+
+def _word_count(text: str) -> int:
+    return len([w for w in re.split(r"\s+", text) if w])
+
+
+def check_vo_density(text: str) -> dict:
+    """Third lint check. Skip-silent (applicable=False) when there's no stated
+    'Runtime target:' line, so non-script deliverables never false-positive.
+    Pure read — never mutates the deliverable."""
+    target_match = _RUNTIME_TARGET_RE.search(text)
+    if not target_match:
+        return {"applicable": False, "should_alert": False}
+    target_minutes = _parse_target_minutes(target_match.group(1))
+    if target_minutes is None or target_minutes <= 0:
+        return {"applicable": False, "should_alert": False,
+                "parse_failure": target_match.group(0).strip()}
+    blocks = _extract_vo_blocks(text)
+    total_words = sum(_word_count(b) for b in blocks)
+    estimated_minutes = total_words / VO_WPM if VO_WPM else 0.0
+    ratio = (estimated_minutes / target_minutes) if target_minutes else 0.0
+    should_flag = ratio < VO_RATIO_FLAG_THRESHOLD and total_words > 0
+    return {
+        "applicable": True,
+        "target_minutes": round(target_minutes, 2),
+        "estimated_minutes": round(estimated_minutes, 2),
+        "word_count": total_words,
+        "vo_block_count": len(blocks),
+        "ratio": round(ratio, 3),
+        "wpm": VO_WPM,
+        "threshold": VO_RATIO_FLAG_THRESHOLD,
+        "should_alert": should_flag,
+    }
+
+
 def lint(path: Path) -> dict:
-    """Run both checks against the file at `path`. Returns a result dict the
+    """Run all checks against the file at `path`. Returns a result dict the
     caller can use to decide whether to write a report + Telegram-ping."""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -261,17 +396,21 @@ def lint(path: Path) -> dict:
 
     banned = check_banned_vocab(text)
     overview = monetary_overview(text)
+    vo = check_vo_density(text)
     # Worth-reporting threshold: any banned hit, OR >= 3 distinct monetary
-    # figures (i.e. the doc has enough $ talk that the overview is useful).
-    worth_reporting = bool(banned) or overview["distinct_count"] >= 3
+    # figures (overview is useful), OR an under-density VO flag.
+    worth_reporting = (
+        bool(banned) or overview["distinct_count"] >= 3 or vo["should_alert"]
+    )
     return {
         "path": str(path),
         "banned": banned,
         "monetary": overview,
+        "vo_density": vo,
         "worth_reporting": worth_reporting,
-        # Telegram pings only when banned vocab flagged (numeric is informational).
-        "should_alert": bool(banned),
-        "ok": not banned,
+        # Telegram pings on banned vocab OR under-dense VO (numeric is informational).
+        "should_alert": bool(banned) or vo["should_alert"],
+        "ok": not banned and not vo["should_alert"],
     }
 
 
@@ -291,8 +430,9 @@ def format_report(result: dict) -> str:
 
     banned = result.get("banned", [])
     overview = result.get("monetary", {})
+    vo = result.get("vo_density", {})
 
-    if not banned and overview["distinct_count"] < 3:
+    if not banned and overview["distinct_count"] < 3 and not vo.get("applicable"):
         lines.append("**✅ CLEAN** — no banned vocabulary; monetary content sparse.")
         return "\n".join(lines) + "\n"
 
@@ -343,6 +483,29 @@ def format_report(result: dict) -> str:
             lines.append("")
     elif overview["distinct_count"] > 0:
         lines.append(f"**💰 Monetary:** {overview['distinct_count']} distinct figure(s); below 3-figure overview threshold.")
+        lines.append("")
+
+    if vo.get("applicable"):
+        ratio = vo["ratio"]
+        threshold = vo["threshold"]
+        if vo["word_count"] == 0:
+            verdict = "ℹ️ No `**VO:**` blocks found — density not measurable here"
+        elif vo.get("should_alert"):
+            verdict = f"⚠️ Low density — {ratio:.0%} of target (threshold {threshold:.0%})"
+        else:
+            verdict = f"✅ OK — {ratio:.0%} of target"
+        lines.append("## 🎙️ VO density check")
+        lines.append("")
+        lines.append(f"- Runtime target: **{vo['target_minutes']:g} min**")
+        lines.append(
+            f"- VO words (across {vo['vo_block_count']} `**VO:**` block(s)): "
+            f"**{vo['word_count']}**"
+        )
+        lines.append(
+            f"- Estimated runtime: **{vo['estimated_minutes']:g} min** at {vo['wpm']} wpm"
+        )
+        lines.append(f"- Density ratio: **{ratio:.2f}** (flag below {threshold:.2f})")
+        lines.append(f"- Verdict: {verdict}")
         lines.append("")
 
     lines.append("---")
