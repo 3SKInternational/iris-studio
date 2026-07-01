@@ -7,8 +7,10 @@ WHY THIS EXISTS
 Image models (gpt-image-2) reliably garble long/exact text: dollar figures,
 multi-label diagrams, full sentences come back misspelled, dropped, or mislaid.
 For a finance channel the numbers MUST be perfect. So the 3SK image pipeline
-splits a data card into two layers, exactly like the thumbnail pipeline already
-does (see thumbnail_overlay.py — this is its generalized sibling):
+splits a data card into two layers, the same two-layer split the thumbnail
+pipeline uses (this ONE tool is the generalized compositor for both — there is
+no separate thumbnail_overlay.py; thumbnails burn through here too, driven by a
+<Video>_thumbnail_overlay.json spec, wired as build_video.py's --thumbnail stage):
 
   1. image_factory generates a *text-free SHAPE BACKPLATE* (the ladder, the
      scale, the bars, the pegs) with "leave label areas clear" in the prompt.
@@ -98,7 +100,7 @@ except ModuleNotFoundError:
                      "(pip install Pillow into the generation python).\n")
     sys.exit(1)
 
-# ---- Brand palette (locked; mirrors thumbnail_overlay.py + Brand Bible) ----
+# ---- Brand palette (locked; mirrors the Brand Bible) ----
 PALETTE = {
     "white":    (255, 255, 255, 255),
     "charcoal": (31, 42, 51, 255),     # #1F2A33

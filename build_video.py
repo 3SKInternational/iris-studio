@@ -937,7 +937,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--images", action="store_true", help="Run image_factory (BILLED).")
     p.add_argument("--vo", action="store_true", help="Run vo_factory (BILLED).")
     p.add_argument("--assemble", action="store_true", help="Run video_factory (free).")
-    p.add_argument("--run", action="store_true", help="All three stages (images+vo+assemble).")
+    p.add_argument("--thumbnail", action="store_true",
+                   help="Render the A/B thumbnail art (BILLED) from "
+                        "image_factory/manifests/<Video>_thumbnail.json, then burn the "
+                        "title text (free) if <Video>_thumbnail_overlay.json exists. "
+                        "Independent of the video stages; every video needs thumbnails.")
+    p.add_argument("--run", action="store_true", help="All stages (images+vo+assemble+thumbnail).")
     p.add_argument("--vo-source", help="Vault-relative dir of existing VO mp3s to assemble from (e.g. Voice_Files/Video_01).")
     p.add_argument("--image-set", help="Vault-relative dir of existing image PNGs to assemble from (e.g. Raw_Assets/Video_01_HD). Mutually exclusive with --images.")
     p.add_argument("--force", action="store_true", help="Pass --force to the billed stages (re-render existing).")
@@ -971,7 +976,8 @@ def main() -> None:
     do_images = args.images or args.run
     do_vo = args.vo or args.run
     do_assemble = args.assemble or args.run
-    plan_only = not (do_images or do_vo or do_assemble)
+    do_thumbnail = args.thumbnail or args.run
+    plan_only = not (do_images or do_vo or do_assemble or do_thumbnail)
 
     if do_vo and args.vo_source:
         die("--vo writes to <video>_gen but --vo-source points assembly elsewhere; "
@@ -1074,11 +1080,16 @@ def main() -> None:
         print(f"  images (billed) : python3 {img_gen} {img_manifest_path} --dry-run   # then drop --dry-run")
         print(f"  VO     (billed) : python3 {vo_gen} {vo_kit} --output {vo_out} --dry-run")
         print(f"  assemble (free) : python3 {assembler} {edit_manifest_path}")
+        thumb_manifest = REPO / "image_factory" / "manifests" / f"{vid}_thumbnail.json"
+        if thumb_manifest.is_file():
+            print(f"  thumbnail(billed): python3 {img_gen} {thumb_manifest} --dry-run")
         print("  or all at once  : build_video.py {0} --run".format(vid))
         # Free cost preview for the billed stages.
         run([sys.executable, str(img_gen), str(img_manifest_path), "--dry-run"], label="image cost preview")
         if kit:
             run([sys.executable, str(vo_gen), str(vo_kit), "--output", str(vo_out), "--dry-run"], label="VO cost preview")
+        if thumb_manifest.is_file():
+            run([sys.executable, str(img_gen), str(thumb_manifest), "--dry-run"], label="thumbnail cost preview")
         return
 
     # Trust-but-verify: a generation subprocess that exits 0 without writing its
@@ -1120,6 +1131,66 @@ def main() -> None:
                                        timeout=120, check=False)
                     except Exception as e:  # noqa: BLE001
                         print(f"  ⚠ contact sheet skipped (non-fatal): {e}")
+    if do_thumbnail:
+        # Two-layer thumbnail, mirroring the data-card split: (1) generate the
+        # reference-locked A/B backplate art (BILLED, gpt-image-2 skips existing
+        # PNGs unless --force), then (2) burn the crisp title text with PIL (free,
+        # guaranteed-correct — the model never renders the letters). Both paths
+        # (art output_dir, overlay base/out) live IN the manifests, so this stage
+        # just runs the two tools. Independent of the video edit — a thumbnail is
+        # a separate upload asset, so a failure here doesn't block --assemble.
+        thumb_manifest = REPO / "image_factory" / "manifests" / f"{vid}_thumbnail.json"
+        if not thumb_manifest.is_file():
+            msg = (f"--thumbnail: art manifest not found: {thumb_manifest} "
+                   f"(author one like image_factory/manifests/Video_01_thumbnail.json).")
+            if args.thumbnail:
+                die(msg)  # explicit --thumbnail: the user asked for it → fail loud
+            # bare --run on a thumbnail-less video: skip the stage, don't abort the
+            # run. A thumbnail is a separate upload asset (see comment above), so a
+            # missing spec must not block VO/assemble. Warn so it's not silent.
+            print(f"⚠ {msg} — skipping thumbnail stage (this run's other stages continue).")
+            thumb_manifest = None
+        if thumb_manifest is not None:
+            cmd = [sys.executable, str(img_gen), str(thumb_manifest)]
+            if args.force:
+                cmd.append("--force")
+            t_rc = run(cmd, label="STAGE thumbnail art (billed)")
+            rc |= t_rc
+            if t_rc == 0:
+                try:
+                    tdata = json.loads(thumb_manifest.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as e:  # unreachable in practice — the art
+                    # render just parsed the same file; guarded for symmetry so a bad
+                    # manifest degrades to a non-zero exit, never a traceback.
+                    print(f"error: --thumbnail: {thumb_manifest} is not valid JSON: {e}",
+                          file=sys.stderr)
+                    tdata = None
+                    rc |= 1
+                if tdata is not None:
+                    tout = Path(tdata.get("output_dir", "")).expanduser()
+                    want = [tout / f"{im['name']}.png" for im in tdata.get("images", []) if im.get("name")]
+                    overlay = REPO / "image_factory" / "manifests" / f"{vid}_thumbnail_overlay.json"
+                    if want and _missing("thumbnail art", want):
+                        rc |= 1
+                    elif overlay.is_file():
+                        co = REPO / "image_factory" / "card_overlay.py"
+                        rc |= run([sys.executable, str(co), str(overlay)],
+                                  label="STAGE thumbnail titles (free)")
+                    else:
+                        # Art rendered but no title spec → the thumbnail is UNTITLED,
+                        # i.e. NOT a finished upload asset. Fail loud (non-zero) so an
+                        # automated --run never reports "thumbnails done" with a
+                        # titleless image after a billed render. The art is cached, so
+                        # the two-pass workflow is cheap: author the overlay spec off
+                        # the rendered backplate, then re-run --thumbnail (art re-skips
+                        # at $0, title burn is free).
+                        names = [im.get("name") for im in tdata.get("images", [])]
+                        print(f"error: --thumbnail rendered the art but found no title-overlay "
+                              f"spec at {overlay} — the thumbnail is untitled. Author one "
+                              f"(spec base_dir must equal {tout}; its card names must be a "
+                              f"subset of {names}), then re-run --thumbnail (art re-skips at "
+                              f"$0).", file=sys.stderr)
+                        rc |= 1
     if do_vo:
         if not vo_kit.is_file():
             die(f"VO kit not found: {vo_kit}")
@@ -1168,7 +1239,10 @@ def main() -> None:
 
     if rc:
         raise SystemExit(1)
-    print(f"\ndone. Draft video -> {vlt / 'Footage_and_Edits' / (vid + '_v2.mp4')}")
+    if do_assemble:
+        print(f"\ndone. Draft video -> {vlt / 'Footage_and_Edits' / (vid + '_v2.mp4')}")
+    else:
+        print("\ndone.")
 
 
 if __name__ == "__main__":
