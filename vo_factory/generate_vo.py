@@ -777,7 +777,7 @@ def maybe_recalibrate_rate(script_dir: Path, out_dir: Path, full_blocks: list[di
     if result is None:
         return  # scenes not all rendered yet, or ffprobe unavailable -- try next run
     wpm, words, seconds = result
-    PLANNING_WPM = 184  # provisional 167*1.1 (speed 1.1, set 2026-06-29); docs still say 192 until this render measures the real figure
+    PLANNING_WPM = 180  # MEASURED off V06 (speed 1.1, 179.8 wpm, 2026-07-01); baseline for the next voice/speed recalibration. Sizing docs updated to 180.
     delta_pct = (wpm - PLANNING_WPM) / PLANNING_WPM * 100
     msg = (
         f"\nRATE CALIBRATION (first render at voice {voice_id}, speed {speed}):\n"
