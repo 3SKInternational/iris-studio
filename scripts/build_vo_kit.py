@@ -196,7 +196,7 @@ def build_kit(script_text: str, script_path: Path, vid: str) -> str:
         "type: vo-session-kit",
         f"video: Video_{vid}",
         "status: ok",
-        "voice: config-driven (generate_vo.py DEFAULT_VOICE_ID, current id UgBBYS2sOqTuMpoF3BR0, speed 1.15)",
+        "voice: config-driven (generate_vo.py DEFAULT_VOICE_ID, current id UgBBYS2sOqTuMpoF3BR0, speed 1.1)",
         f'source: "[[{script_path.stem}]]"',
         "generated-by: scripts/build_vo_kit.py",
         "tags:",
