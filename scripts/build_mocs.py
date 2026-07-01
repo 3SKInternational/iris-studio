@@ -58,19 +58,38 @@ def warn(msg: str) -> None:
     print(f"build_mocs: WARNING: {msg}", file=sys.stderr)
 
 
+def _body_after_frontmatter(text: str) -> str:
+    """Return `text` with a single leading YAML frontmatter block stripped, if present.
+    A malformed/unterminated block is left intact (returned as-is) so it can't be
+    mistaken for auto content."""
+    s = text.lstrip("﻿").lstrip()
+    if s.startswith("---"):
+        m = re.match(r"---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|$)", s, re.DOTALL)
+        if m:
+            return s[m.end():]
+    return s
+
+
 def is_auto_file(relpath: str, text: str | None) -> bool:
     """True ONLY for files this script generated, fingerprinted by AUTO_MARKER as the
-    FIRST line (the generator always emits it as line 1).
+    first content line — allowing an OPTIONAL leading YAML frontmatter block above it.
 
-    Deliberately NOT a substring check and NEVER a filename check: a substring check
-    would treat a human doc that merely *quotes* the marker (e.g. a design/review note
-    about this script) as auto — and that file could then be overwritten or pruned. A
-    filename check would misclassify the human master MOC (Vault_MOC.md). Requiring the
-    marker on line 1 is a structural signature a prose doc can't satisfy by accident."""
+    Why tolerate frontmatter: the librarian's frontmatter-tending pass prepends a YAML
+    block to notes it thinks lack one. When the marker was required on the literal line 1,
+    that prepend pushed it to line ~6 and permanently froze our own hubs out of
+    regeneration (build_mocs then "refused to overwrite" them → stale MOCs → loose nodes).
+
+    Still deliberately NOT a substring check and NEVER a filename check: the marker must
+    be the first *body* line (after optional frontmatter). A human doc that merely quotes
+    the marker deeper in its text, or names a file _MOC.md, is not matched — the exact
+    marker as the leading body line is a signature prose can't satisfy by accident."""
     if not text:
         return False
-    stripped = text.lstrip()
-    return bool(stripped) and stripped.splitlines()[0].strip() == AUTO_MARKER
+    body = _body_after_frontmatter(text)
+    for line in body.splitlines():
+        if line.strip():
+            return line.strip() == AUTO_MARKER
+    return False
 
 
 def removable_auto(relpath: str, text: str | None) -> bool:
@@ -228,7 +247,28 @@ def main() -> int:
     ap.add_argument("--vault", default=DEFAULT_VAULT)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="only print on changes/errors")
+    ap.add_argument("--selftest", action="store_true", help="run is_auto_file assertions and exit")
     args = ap.parse_args()
+
+    if args.selftest:
+        M = AUTO_MARKER
+        # marker as literal line 1 (legacy format) — still recognized
+        assert is_auto_file("x", f"{M}\n---\ntype: folder-moc\n---\n\n# H\n")
+        # marker AFTER a leading frontmatter block (librarian-tended format) — the fix
+        assert is_auto_file("x", f"---\ntype: index\ntags: [ceo, index]\ndate: 2026-06-26\n---\n{M}\n\n# H\n")
+        # human doc with frontmatter that never carries the marker as its first body line
+        assert not is_auto_file("x", "---\ntype: index\n---\n# A human note discussing build_mocs.py and its AUTO-MOC marker\n")
+        # marker quoted deeper in the body, not the leading line — must NOT match
+        assert not is_auto_file("x", f"---\ntype: note\n---\nsome prose\n{M}\n")
+        # plain note / empty
+        assert not is_auto_file("x", "# just a note\n")
+        assert not is_auto_file("x", "")
+        # unterminated frontmatter must not be mistaken for auto
+        assert not is_auto_file("x", f"---\ntype: broken\n{M}\n")
+        # CRLF frontmatter (in case the librarian ever emits it) still strips correctly
+        assert is_auto_file("x", f"---\r\ntype: index\r\n---\r\n{M}\r\n\r\n# H\r\n")
+        print("build_mocs --selftest: OK")
+        return 0
 
     vault = os.path.abspath(args.vault)
     if not os.path.isdir(vault):
@@ -286,7 +326,6 @@ def main() -> int:
         for m in members:
             by_kind[os.path.basename(os.path.dirname(m))].append(m)
         lines = [
-            AUTO_MARKER,
             "---",
             "type: video-hub",
             "brand: 3SK_Finance",
@@ -296,6 +335,7 @@ def main() -> int:
             "  - meta/moc",
             "  - production/video-hub",
             "---",
+            AUTO_MARKER,  # first BODY line — frontmatter above so the librarian leaves it alone
             "",
             f"# Video {vn} — Hub" + (f": {title}" if title else ""),
             "",
@@ -329,13 +369,13 @@ def main() -> int:
         leaf = os.path.basename(folder) or "Root"
         rel_moc = os.path.join(folder, f"_{leaf}_MOC.md")
         lines = [
-            AUTO_MARKER,
             "---",
             "type: folder-moc",
             "maintained-by: build_mocs.py",
             "tags:",
             "  - meta/moc",
             "---",
+            AUTO_MARKER,  # first BODY line — frontmatter above so the librarian leaves it alone
             "",
             f"# {title_case(leaf)} — Index",
             "",
