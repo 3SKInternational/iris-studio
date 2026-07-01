@@ -5,13 +5,14 @@ Build a labeled contact sheet (grid thumbnail montage) of a 3SK Finance video's
 rendered image batch, so a finished billed run can be eyeballed at a glance.
 
 WHY: after a billed image spend completes, Steve wants to SEE all the renders in
-one frame (and have it pop open in Preview) instead of opening 48 PNGs by hand.
-The spend watchdog (spend_watch.sh) calls this on a clean finish; it is also
-runnable by hand any time: `python3 scripts/contact_sheet.py 3 --open`.
+one frame (and have it pop open in Preview) instead of opening 30-48 PNGs by hand.
+build_video.py's image stage calls this on a clean finish; it is also runnable by
+hand any time (needs a PIL-capable interpreter, e.g. the repo .venv/bin/python or
+/usr/bin/python3): `.venv/bin/python scripts/contact_sheet.py 6 --open`.
 
-Shots are laid out in the manifest's order (the script/narrative order), each
-cell labeled with its short shot name (e.g. "05e"). A missing render shows as a
-dark placeholder cell so a gap is obvious rather than silently skipped.
+Shots are laid out in narrative order, filtered to the renders that ACTUALLY
+exist, each cell labeled with its short shot name (e.g. "05e"). A stale manifest
+listing shots later cut from the shot list will NOT paint phantom "missing" cells.
 
 Exit codes: 0 = sheet written (and opened if --open) | 3 = no renders found
             (quiet no-op — nothing to sheet) | 1 = a real error (bad args, PIL
@@ -32,12 +33,17 @@ def nn(video: int) -> str:
 
 
 def manifest_path(video: int) -> Path:
-    return (VAULT / BRAND_REL / "Raw_Assets" / "Image_Factory" /
-            "manifests" / f"video_{nn(video)}_hd.json")
+    # New orchestrated layout first, then the legacy _hd manifest.
+    base = VAULT / BRAND_REL / "Raw_Assets" / "Image_Factory" / "manifests"
+    orch = base / f"Video_{nn(video)}_orchestrated.json"
+    return orch if orch.exists() else base / f"video_{nn(video)}_hd.json"
 
 
 def renders_dir(video: int) -> Path:
-    return VAULT / BRAND_REL / "Raw_Assets" / f"Video_{nn(video)}_HD"
+    # Current pipeline renders to Video_NN_gen; older batches used Video_NN_HD.
+    base = VAULT / BRAND_REL / "Raw_Assets"
+    gen = base / f"Video_{nn(video)}_gen"
+    return gen if gen.is_dir() else base / f"Video_{nn(video)}_HD"
 
 
 def default_output(video: int) -> Path:
@@ -46,17 +52,26 @@ def default_output(video: int) -> Path:
 
 
 def shot_order(video: int, rdir: Path) -> list[str]:
-    """Manifest order if the manifest is readable; else fall back to a sorted
-    glob of the renders dir so the sheet still builds when the manifest is gone."""
-    mpath = manifest_path(video)
+    """Show exactly the shots that actually rendered, in narrative order.
+
+    Ordered by the manifest when it agrees with the renders, else by a sorted
+    glob (3SK shot names are zero-padded, so they sort into narrative order).
+    We deliberately filter to PRESENT renders so a stale manifest listing shots
+    that were later cut from the shot list doesn't paint phantom 'missing' cells
+    (the V6 hd manifest still lists 42 pre-consolidation shots; only 30 exist)."""
+    present = sorted(p.stem for p in rdir.glob("*.png"))
+    present_set = set(present)
     try:
-        data = json.loads(mpath.read_text(encoding="utf-8"))
+        data = json.loads(manifest_path(video).read_text(encoding="utf-8"))
         names = [im["name"] for im in data.get("images", []) if im.get("name")]
-        if names:
-            return names
+        names_set = set(names)
+        ordered = [n for n in names if n in present_set]
+        ordered += [n for n in present if n not in names_set]  # renders absent from manifest
+        if ordered:
+            return ordered
     except Exception:
         pass
-    return sorted(p.stem for p in rdir.glob("*.png"))
+    return present
 
 
 def build(video: int, out: Path) -> int:

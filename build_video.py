@@ -1105,6 +1105,21 @@ def main() -> None:
             want = [images_out / f"{img['name']}.png" for img in img_manifest["images"]]
             if want and _missing("images", want):
                 rc |= 1
+            else:
+                # $0 reference sheet of the just-rendered batch so every billed
+                # image batch is reviewable as one montage (Steve standing
+                # instruction). Best-effort — a sheet failure never fails the
+                # build. Needs a PIL-capable interpreter; build_video may run
+                # under a python without Pillow, so prefer the repo .venv.
+                _venv = REPO / ".venv" / "bin" / "python"
+                _py = str(_venv) if _venv.exists() else "/usr/bin/python3"
+                _sheet = REPO / "scripts" / "contact_sheet.py"
+                if _sheet.is_file():
+                    try:
+                        subprocess.run([_py, str(_sheet), str(int(nn)), "--open"],
+                                       timeout=120, check=False)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  ⚠ contact sheet skipped (non-fatal): {e}")
     if do_vo:
         if not vo_kit.is_file():
             die(f"VO kit not found: {vo_kit}")
