@@ -651,6 +651,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-caption-sweep", action="store_true",
                    help="Skip the post-upload verify-and-backfill caption sweep over all videos.")
     p.add_argument("--no-thumbnail", action="store_true", help="Skip thumbnail set.")
+    p.add_argument("--skip-preflight", action="store_true",
+                   help="Skip the deterministic pre-upload signoff (cut freshness + completeness). "
+                        "Escape hatch only — the gate exists because V6 shipped a stale-signoff cut.")
     p.add_argument("--token", help="Override path to youtube_token.json.")
     p.add_argument("--dry-run", action="store_true",
                    help="Validate inputs + metadata and print the plan; touch no network.")
@@ -733,6 +736,30 @@ def main() -> None:
 
     thumb = None if args.no_thumbnail else resolve_thumbnail(vlt, vid, args.thumbnail)
     have_srt = srt.is_file()
+
+    # --- pre-upload signoff gate (deterministic; fail-closed) ---
+    # V6 shipped with a PRE-render signoff: images were regenerated and the cut
+    # re-assembled after the last human GO, and nothing re-checked the final video.
+    # This gate verifies the cut is COMPLETE + FRESH before any network call. Runs
+    # in --dry-run too, so a bad cut is caught without touching YouTube. No agent can
+    # watch the mp4 — playback review stays the human step (the private upload).
+    if not args.skip_preflight:
+        from preflight_publish import check_publish_ready, write_signoff
+        ok, failures, warnings = check_publish_ready(
+            vlt, vid, video_file=video_file, desc_pack=desc_pack,
+            thumb=thumb, srt=srt if have_srt else None,
+        )
+        for w in warnings:
+            print(f"  ⚠ preflight: {w}")
+        if not ok:
+            die("pre-upload signoff FAILED — the cut is not ready:\n  - "
+                + "\n  - ".join(failures)
+                + "\nFix the above and re-assemble, or pass --skip-preflight to override.")
+        if args.dry_run:
+            print("  ✅ preflight: cut is fresh + complete (dry-run — stamp written on real upload)")
+        else:
+            stamp = write_signoff(vlt, vid, video_file, thumb, srt if have_srt else None)
+            print(f"  ✅ preflight signoff: cut is fresh + complete → {stamp.name}")
 
     # --- plan ---
     print(f"video      : {vid}")
