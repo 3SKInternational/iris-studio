@@ -14,6 +14,7 @@ PASS 1 — FETCH INCOMING COMMENTS:
     • If the run dies with a NON-ZERO exit (auth/credential failure → exit 2 "could not load YouTube credentials"; OR a hard mid-run API fault → exit 2 after a "HARD API ERRORS" block; in both cases NO `status: ok` line is printed) → go to PASS 4 and emit ROUTINE_INCOMPLETE with the blocker (this is the same token the comment-sweep + analytics jobs use; a failure here likely means the Claude/YouTube token needs Steve).
     • `status: ok (0 comments)` → nothing to triage. Do NOT dispatch the agent, do NOT send a Telegram push. Note "0 incoming comments" for the daily-note line and go to PASS 4.
     • `status: ok (<N> comments)` with N ≥ 1 → read the per-video lines and proceed to PASS 2 for ONLY the videos whose own count is ≥1.
+    • If stdout contains a `RECEIPT DRIFT (...)` block (a receipt's video_id is no longer on the channel — deleted / re-uploaded under a new id / stale receipt), the run still exits 0; do NOT treat it as a failure, but DO append the drift line(s) verbatim to your daily-note entry AND send one Telegram note via `scripts/notify.sh` ("📄 comment-fetcher receipt drift: <lines> — reconcile the Production_Kits upload receipt(s)"). This is how a stale/deleted published-video id surfaces instead of hiding as a benign skip.
 
 PASS 2 — DISPATCH community-manager (one per video that has comments):
   For EACH video with ≥1 incoming comment, invoke the `community-manager` subagent. Brief it explicitly:

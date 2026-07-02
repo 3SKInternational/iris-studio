@@ -45,15 +45,30 @@ def _today() -> str:
     return _dt.date.today().isoformat()
 
 
-def _is_public(youtube, video_id: str) -> bool:
-    """True only when the video's privacyStatus is 'public'. A scheduled/private
-    upload has no public comment thread yet — skip it (same go-live posture as
-    sweep_comments.py)."""
-    resp = youtube.videos().list(part="status", id=video_id).execute()
-    items = resp.get("items", [])
+def _classify_state(items: list) -> str:
+    """Pure classifier for a videos().list(part='status') response's items.
+
+    Returns:
+      * 'public'     — privacyStatus == 'public' (has a public comment thread).
+      * 'not-public' — the video exists but is private/unlisted/scheduled.
+      * 'missing'    — videos.list returned NO item. For the channel OWNER
+                       (this token is the owner) that does NOT mean "unpublished":
+                       the owner sees their own private/scheduled videos too. No
+                       item = the id is deleted or the receipt is STALE. Surfacing
+                       this instead of collapsing it into a benign 'not public yet'
+                       is what turns silent receipt drift into a visible signal —
+                       a re-uploaded/deleted video otherwise looks identical to a
+                       scheduled one, so its comments go silently un-ingested
+                       (V4 ClJVIUtwsVE, ~1 week 2026-06-22 → 2026-07-02)."""
     if not items:
-        return False
-    return items[0].get("status", {}).get("privacyStatus") == "public"
+        return "missing"
+    return "public" if items[0].get("status", {}).get("privacyStatus") == "public" else "not-public"
+
+
+def _video_state(youtube, video_id: str) -> str:
+    """Live one-shot state for a receipt's video_id (see _classify_state)."""
+    resp = youtube.videos().list(part="status", id=video_id).execute()
+    return _classify_state(resp.get("items", []))
 
 
 def _author_channel_id(snippet: dict) -> str:
@@ -212,13 +227,24 @@ def main() -> None:
     grand_total = 0
     per_video: list[str] = []
     hard_errors: list[str] = []
+    drift: list[str] = []
     for label, video_id, _rp, _data in receipts:
         try:
-            public = _is_public(youtube, video_id)
+            state = _video_state(youtube, video_id)
         except Exception as e:  # noqa: BLE001
             per_video.append(f"  {label}: status check failed ({e}) — skipped")
             continue
-        if not public:
+        if state == "missing":
+            # The receipt's video_id is not on the channel (deleted / re-uploaded
+            # under a new id / stale receipt). Skip like any non-public video so
+            # live-video ingestion still succeeds, but record it as DRIFT so it is
+            # surfaced, not hidden behind a benign-looking "not public yet".
+            drift.append(f"{label}: receipt video_id {video_id} not found on channel")
+            per_video.append(
+                f"  {label}: video_id {video_id} NOT FOUND on channel — "
+                "RECEIPT DRIFT (deleted/re-uploaded/stale receipt), skipped")
+            continue
+        if state == "not-public":
             per_video.append(f"  {label}: not public yet — skipped")
             continue
         threads, note = fetch_threads(youtube, video_id, max_pages=args.max_pages,
@@ -253,6 +279,16 @@ def main() -> None:
             print(f"  {he}")
         die(f"{len(hard_errors)} video(s) failed to fetch — likely token scope/quota",
             code=2)
+    if drift:
+        # Not a hard error (live videos still ingested → keep exit 0 + the
+        # `status: ok` contract the comment-ingest routine matches), but a real
+        # "someone should reconcile the receipt" signal. Print a distinct,
+        # greppable block so the routine + a human reading the log both see it.
+        print(f"RECEIPT DRIFT ({len(drift)}) — receipt video_id(s) not on the "
+              "channel (deleted / re-uploaded under a new id / stale receipt); "
+              "reconcile the Production_Kits upload receipt(s):")
+        for d in drift:
+            print(f"  {d}")
     print(f"status: ok ({grand_total} comments)")
 
 
