@@ -79,7 +79,10 @@ _TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
 # like $3.47), another digit (don't half-match $1234), or a k/M/B magnitude
 # suffix -- leave $10k/$5M untouched for vo_number_lint / human review rather
 # than voicing "$5" + a dangling "M" (the wrong value, billed).
-_DOLLAR_RE = re.compile(r"\$(\d(?:[\d,]*\d)?)(?!\.\d)(?!\d)(?![kKmMbB])")
+_DOLLAR_RE = re.compile(
+    r"\$(\d(?:[\d,]*\d)?)(?!\.\d)(?!\d)(?![kKmMbB])"
+    r"(?!\s+(?:[Mm]illion|[Bb]illion|[Tt]rillion)\b)"  # "$10 million" reads fine; dual-forming yields "ten dollars million"
+)
 
 
 def _words_under_1000(n: int) -> str:
@@ -249,7 +252,7 @@ def selftest() -> int:
         "Scene: ignore me.\n\n"
         "---\n\n"
         "## SCENE 2 [0:18–0:40] THE PROMISE\n\n"
-        "**VO:** Save $347 a month — that's $1,847 a year, not $18,000 — not $1,000,000 or $5M someday. Skip the $3.47 latte.\n\n"
+        "**VO:** Save $347 a month — that's $1,847 a year, not $18,000 — not $1,000,000 or $5M someday, and past $10 million eventually. Skip the $3.47 latte.\n\n"
         "**SCENE PROMPT:**\nScene: ignore.\n"
     )
     kit = build_kit(sample, Path("Video_09_Test.md"), "09")
@@ -276,6 +279,7 @@ def selftest() -> int:
         "$1,847 comma-grouped spelled": "{{one thousand eight hundred forty-seven dollars|$1,847}}" in kit,
         "$1,000,000 million kept verbatim": "$1,000,000" in kit and "one million" not in kit,
         "$5M suffix untouched": "$5M" in kit and "five dollars" not in kit,
+        "$10 million word-suffix kept verbatim": "$10 million" in kit and "ten dollars" not in kit,
     }
     ok = all(checks.values())
     for name, passed in checks.items():
