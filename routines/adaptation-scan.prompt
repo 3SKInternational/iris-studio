@@ -5,7 +5,8 @@ REPO:  /Volumes/AI_Workspace/iris_studio
 QUEUE DIR: /Users/steve/Documents/3SK/outputs/06_CEO/Adaptations/queue
 
 HARD RULES (read before doing anything):
-- You DRAFT and SURFACE — you NEVER apply. The proposer writes proposal files; Steve approves each via `/adapt approve <id>` in Telegram; the deterministic apply core (scripts/adaptation.py) performs the edit. Do NOT edit any agent file, content standard, script, or the proposals themselves in this routine.
+- APPLY POLICY (Steve directive 2026-07-03, Decisions_Log/2026-07-03_Adaptation_AutoApply_Policy.md): LOW/MEDIUM-risk proposals that pass the PASS 2 audit are auto-applied via the deterministic core (`scripts/adaptation.py --apply <id>` — allowlist, exact-once match, per-file backup, ledger, evaluate_after). HIGH-risk proposals are NEVER auto-applied — they stay pending for Steve's `/adapt approve <id>`. You NEVER edit any target file directly — only the apply core touches targets. Do not edit the proposal files themselves.
+- HIGH-risk (always HOLD for Steve): Brand Bible locked sections; the locked "Three" character identity spec; anonymity/identity policy; any edit that WEAKENS a compliance/disclosure requirement (edits that ADD or strengthen disclosures are LOW risk); money-handling semantics; any proposal with thin/conflicting evidence targeting shared canon.
 - NEVER fabricate a signal to manufacture a proposal. If no signal clears the proposer's bar, ZERO proposals is the correct, successful outcome — a clean no-op week is a SUCCESS, not a failure.
 - This routine is read-only against the vault except for: the proposal files (written by the proposer agent it dispatches) and your one daily-note line. Do not delete or move any file.
 
@@ -24,16 +25,41 @@ PASS 1 — DISPATCH THE PROPOSER:
     • status: partial-* → it could read only some signals but proposed from what it had. Proceed to PASS 2; carry the partial reason into your completion signal.
     • status: blocked-* → it could not read the signal sources at all. Do NOT treat as success: go to PASS 3 and emit ROUTINE_INCOMPLETE with the blocker.
 
-PASS 2 — SURFACE PENDING PROPOSALS TO TELEGRAM:
+PASS 2 — AUDIT THE QUEUE, AUTO-APPLY LOW/MEDIUM, SURFACE HOLDS (policy 2026-07-03):
   Enumerate what is actually in the queue (do not trust the proposer's count alone — read the source of truth):
       cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --list
-  Branch on the result:
-    • No pending proposals → do NOT send a Telegram push (the wrapper's ✅ completion ping is enough for a quiet week). Note "0 pending" for the daily-note line.
-    • ≥1 pending proposal → push ONE concise alert to Steve via notify.sh so he can act from his phone. Build the message body from the --list output and send it:
-          cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "🧠 Adaptation scan: <N> proposal(s) awaiting your call.
-      <for each: • <id> [confidence] → <target-basename>: <summary>>
+  • No pending proposals → skip the audit/apply block entirely, go straight to PASS 2.5; note "0 pending" for the daily-note line.
+  • ≥1 pending → run the AUDIT-THEN-APPLY flow:
+
+  2a. AUDIT (independent gate — never skip it, never let the proposer self-certify):
+      First ensure the audit dir exists: mkdir -p /Users/steve/Documents/3SK/outputs/06_CEO/Adaptations/audits
+      Dispatch ONE general-purpose subagent to audit every pending proposal against CURRENT state.
+      Brief it: for each id from `--list --json`, read `--show <id>` (exact old→new + target),
+      read the CURRENT target file, and verdict each:
+        APPLY  — LOW/MEDIUM risk per the HARD RULES rubric AND still valid: old text still present
+                 in the target, new value still correct against current canon (check for newer
+                 recalibrations/decisions that supersede it), no conflict with a sibling proposal.
+                 If two proposals edit the same target section, APPLY the better-evidenced one and
+                 REJECT the sibling (name it).
+        REJECT(reason) — stale (anchor drifted / superseded by newer canon / already implemented —
+                 cite the evidence) or wrong against current state.
+        HOLD(reason)   — HIGH-risk per the HARD RULES rubric: stays human-gated.
+      It must return a JSON block {"apply": [...], "reject": [{"id","reason"}], "hold": [{"id","reason"}]}
+      and write its audit table to 06_CEO/Adaptations/audits/<YYYY-MM-DD>_queue_audit.md.
+  2b. APPLY the audit's APPLY list, capped at 10 per night (oldest first; the rest roll to the
+      next run — bounds nightly blast radius):
+          cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --apply <id>
+      The core fails loudly on anchor drift — a failed apply is a REJECT-with-reason
+      (`--reject <id> --reason "anchor drifted at apply time"`), never a retry-with-edits.
+      A = the number that actually returned APPLIED; drift-failures count toward R, not A.
+  2c. REJECT the audit's REJECT list with its reasons:
+          python3 scripts/adaptation.py --reject <id> --reason "<audit reason>"
+  2d. SURFACE: push ONE concise Telegram alert via notify.sh summarizing the run:
+          "🧠 Adaptation scan: applied <A> (low/med, audited), rejected <R> stale, <H> HELD for your call.
+      <for each HOLD: • <id> [confidence] → <target-basename>: <hold reason>>
       Review: /adapt show <id>  ·  Approve: /adapt approve <id>  ·  Reject: /adapt reject <id> [reason]"
-      Keep it under ~25 lines; if more than 5, list the 5 and say "…and the rest via /adapt list".
+      Keep it under ~25 lines; if more than 5 holds, list 5 and say "…and the rest via /adapt list".
+      If A=0, R=0 and H=0 changed nothing new, no push (wrapper ✅ is enough).
 
 PASS 2.5 — SURFACE ADAPTATIONS DUE FOR AN OUTCOME CALL (close the learning loop):
   An applied adaptation is a HYPOTHESIS until its effect is checked. Enumerate the ones whose evaluation horizon has passed and that have no outcome recorded yet:
@@ -49,7 +75,7 @@ PASS 2.5 — SURFACE ADAPTATIONS DUE FOR AN OUTCOME CALL (close the learning loo
 PASS 3 — LOG (always, exactly one short section):
   Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
       ## 🧠 Adaptation scan (nightly)
-  ~3-5 lines: how many proposals the proposer drafted + their ids/targets (or "clean no-op — no signal cleared the bar"); how many applied adaptations are due for an outcome call (PASS 2.5); whether the Telegram push was sent; the headline pattern behind each proposal if any. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do not touch any other agent's section.
+  ~3-5 lines: how many proposals the proposer drafted + their ids/targets (or "clean no-op — no signal cleared the bar"); the PASS 2 audit outcome (applied N / rejected M / held K, with the audit file path); how many applied adaptations are due for an outcome call (PASS 2.5); whether the Telegram push was sent; the headline pattern behind each proposal if any. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do not touch any other agent's section.
 
 ────────────────────────────────────────────────────────
 ## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
