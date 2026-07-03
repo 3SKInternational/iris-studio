@@ -44,3 +44,6 @@ backups/
 
 # local image-render spend ledger (data, not code)
 image_factory/cost_ledger.jsonl
+
+# Watch packs from scripts/watch_video.py — downloaded third-party video frames/transcripts (data, not code)
+video_studies/
