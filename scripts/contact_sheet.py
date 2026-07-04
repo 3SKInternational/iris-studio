@@ -40,7 +40,18 @@ def manifest_path(video: int) -> Path:
 
 
 def renders_dir(video: int) -> Path:
-    # Current pipeline renders to Video_NN_gen; older batches used Video_NN_HD.
+    # The manifest's own output_dir is ground truth — guessing by dir layout
+    # picked V07's stale _gen dir (June's retired first cut) over the fresh
+    # _HD batch the manifest actually rendered to (2026-07-04).
+    mp = manifest_path(video)
+    try:
+        out = json.loads(mp.read_text()).get("output_dir")
+        if out:
+            p = Path(out).expanduser()
+            if p.is_dir():
+                return p
+    except Exception:
+        pass  # fall through to the layout guess
     base = VAULT / BRAND_REL / "Raw_Assets"
     gen = base / f"Video_{nn(video)}_gen"
     return gen if gen.is_dir() else base / f"Video_{nn(video)}_HD"
