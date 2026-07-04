@@ -63,6 +63,16 @@ NOTIFY_SH = ROOT / "scripts" / "notify.sh"
 # Host-local lock dir (flock is per-host; keep it OUT of the synced vault).
 LOCK_DIR = Path(os.path.expanduser("~/iris_studio/pipeline_locks"))
 
+# Interpreter for repo shell-outs. The orchestrator itself is stdlib-only and
+# runs under any python3, but the scripts it shells need the repo venv:
+# generate_images.py lazily imports openai, card_overlay.py imports PIL —
+# neither is in the system python (Video 8 spend failed on exactly this).
+# build_video.py propagates ITS interpreter to its billed children, so it gets
+# the venv too. Fall back to sys.executable if the venv is missing (e.g. X9
+# unmounted) so the failure mode stays the old one, not a hard crash here.
+_VENV_PY = ROOT / ".venv" / "bin" / "python"
+PYTHON = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
+
 # Resolve the claude CLI the same way the daemon does (iris.py).
 CLAUDE_CLI_PATH = (
     os.environ.get("CLAUDE_CLI_PATH")
@@ -720,7 +730,7 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     cfg = RUN_TABLE[key]
     vid = f"Video_{nn(video)}"
     cmd = [
-        sys.executable, "build_video.py", vid, "--assemble",
+        PYTHON, "build_video.py", vid, "--assemble",
         "--image-set", f"Raw_Assets/{vid}_HD",
         "--vo-source", f"Voice_Files/{vid}",
         "--align",
@@ -801,7 +811,7 @@ def run_thumbnail_overlay_stage(video: int) -> tuple[bool, str]:
     out_abs.mkdir(parents=True, exist_ok=True)
     cfg = RUN_TABLE["8_thumbnail"]
     cmd = [
-        sys.executable, "image_factory/card_overlay.py", str(spec_abs),
+        PYTHON, "image_factory/card_overlay.py", str(spec_abs),
         "--base-dir", str(art_dir), "--out-dir", str(out_abs), "--suffix", "_FINAL",
     ]
     for name in backplates:
@@ -2111,7 +2121,7 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     _mark_running(s)
     sf.save()
     cmd = [
-        sys.executable, "image_factory/generate_images.py",
+        PYTHON, "image_factory/generate_images.py",
         str(manifest_abs), "--output", str(out_abs),
     ]
     cfg = RUN_TABLE[key]
