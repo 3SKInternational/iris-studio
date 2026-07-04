@@ -268,7 +268,13 @@ def extract_frames(video: Path, out: Path, start: float, end: float,
     run(cmd, timeout=FF_TIMEOUT, check=True)
     frames = []
     for i, f in enumerate(sorted(out.glob("raw_*.jpg"))):
-        t = start + i * interval
+        # +0.5: fps=1/interval emits the source frame nearest each slot CENTER, so the i-th
+        # emitted frame's real content time is start + (i+0.5)*interval, not start + i*interval.
+        # Ground-truthed 2026-07-04 by checksum-correlating emitted frames back to their true
+        # decode time (content = label + interval/2 across whole-clip + window cases). Labeling
+        # with i alone put frames ~interval/2 early (~23s on a default 30-frame ~23min watch) and
+        # nearly caused a false assembly-QA flag. Guard: test_watch_video_frames.py.
+        t = start + (i + 0.5) * interval
         dest = out / f"frame_{i + 1:03d}_t{fmt_ts(t).replace(':', 'm', 1).replace(':', 's')}.jpg"
         f.rename(dest)
         frames.append((t, dest))
