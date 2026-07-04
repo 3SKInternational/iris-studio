@@ -80,8 +80,17 @@ _TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
 # suffix -- leave $10k/$5M untouched for vo_number_lint / human review rather
 # than voicing "$5" + a dangling "M" (the wrong value, billed).
 _DOLLAR_RE = re.compile(
-    r"\$(\d(?:[\d,]*\d)?)(?!\.\d)(?!\d)(?![kKmMbB])"
+    r"\$(\d(?:[\d,]*\d)?)(?!\.\d)(?!,\d)(?!\d)(?![kKmMbB])"  # (?!,\d) kills the partial match ending pre-comma ("$1,234.56" → "$1" mangle)
     r"(?!\s+(?:[Mm]illion|[Bb]illion|[Tt]rillion)\b)"  # "$10 million" reads fine; dual-forming yields "ten dollars million"
+)
+# Decimal dollars ("$31.40") — voiced "thirty-one dollars forty" without the
+# "and … cents"; dual-form them separately (exactly 2 decimals = cents; a
+# longer decimal is a rate/price-point, leave it alone). The % guard only
+# matters on direct calls — in the pipeline apply_orthography rewrites % to
+# " percent" BEFORE spell_dollars runs.
+_DOLLAR_CENTS_RE = re.compile(
+    r"\$(\d(?:[\d,]*\d)?)\.(\d{2})(?!\d)(?![kKmMbB%])"
+    r"(?!\s+(?:[Mm]illion|[Bb]illion|[Tt]rillion)\b)"  # "$2.25 billion" must stay verbatim
 )
 
 
@@ -118,7 +127,21 @@ def spell_dollars(text: str) -> str:
         if val >= 1000 and val % 1000 == 0:   # whole-thousands ($18,000) voice cleanly
             return m.group(0)
         return "{{" + num_to_words(val) + " dollars|$" + raw + "}}"
-    return _DOLLAR_RE.sub(repl, text)
+    text = _DOLLAR_RE.sub(repl, text)
+    return _DOLLAR_CENTS_RE.sub(_repl_cents, text)
+
+
+def _repl_cents(m: "re.Match[str]") -> str:
+    # "$31.40" is voiced "thirty-one dollars forty" — spell "and forty cents"
+    # (Steve directive 2026-07-04, heard live on the V07 pump line).
+    dollars = int(m.group(1).replace(",", ""))
+    if dollars >= 1_000_000:                  # mirror the integer-path guard; num_to_words raises past 1M
+        return m.group(0)
+    cents = int(m.group(2))
+    spoken = num_to_words(dollars) + (" dollar" if dollars == 1 else " dollars")
+    if cents:
+        spoken += " and " + num_to_words(cents) + (" cent" if cents == 1 else " cents")
+    return "{{" + spoken + "|$" + m.group(1) + "." + m.group(2) + "}}"
 
 
 def apply_orthography(text: str) -> str:
@@ -252,7 +275,7 @@ def selftest() -> int:
         "Scene: ignore me.\n\n"
         "---\n\n"
         "## SCENE 2 [0:18–0:40] THE PROMISE\n\n"
-        "**VO:** Save $347 a month — that's $1,847 a year, not $18,000 — not $1,000,000 or $5M someday, and past $10 million eventually. Skip the $3.47 latte.\n\n"
+        "**VO:** Save $347 a month — that's $1,847 a year, not $18,000 — not $1,000,000 or $5M someday, and past $10 million eventually. Skip the $3.47 latte, the $1.50 tip, the $1,234.56 splurge, the $2.25 billion fantasy, and the $1,234,567.89 daydream.\n\n"
         "**SCENE PROMPT:**\nScene: ignore.\n"
     )
     kit = build_kit(sample, Path("Video_09_Test.md"), "09")
@@ -275,7 +298,11 @@ def selftest() -> int:
         "num_to_words table": all(num_to_words(k) == v for k, v in nw.items()),
         "$347 spelled (dual-form)": "{{three hundred forty-seven dollars|$347}}" in kit,
         "$18,000 whole-thousand kept": "$18,000" in kit and "eighteen thousand dollars" not in kit,
-        "$3.47 cents untouched": "$3.47" in kit and "three dollars" not in kit,
+        "$3.47 cents dual-formed": "{{three dollars and forty-seven cents|$3.47}}" in kit,
+        "$1.50 singular dollar": "{{one dollar and fifty cents|$1.50}}" in kit,
+        "$1,234.56 comma-decimal dual-formed": "{{one thousand two hundred thirty-four dollars and fifty-six cents|$1,234.56}}" in kit,
+        "$2.25 billion kept verbatim": "$2.25 billion" in kit and "two dollars and twenty-five cents" not in kit,
+        "$1,234,567.89 big-decimal kept verbatim (no crash)": "$1,234,567.89" in kit,
         "$1,847 comma-grouped spelled": "{{one thousand eight hundred forty-seven dollars|$1,847}}" in kit,
         "$1,000,000 million kept verbatim": "$1,000,000" in kit and "one million" not in kit,
         "$5M suffix untouched": "$5M" in kit and "five dollars" not in kit,
