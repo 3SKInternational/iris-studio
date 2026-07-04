@@ -17,7 +17,12 @@ Checks (each one FAILS the gate — fail-closed):
      it on every invocation (even plan-only), so it's routinely newer than the mp4
      without the pixels having changed;
   4. the description pack exists;
-  5. a thumbnail resolves (the file the uploader will actually set).
+  5. a thumbnail resolves (the file the uploader will actually set);
+  6. every VO clip the cut references is at least as new as the VO kit that
+     should have produced it (Voice_Files/<vid>/_VO_Session_B_Kit.md) — an mp3
+     OLDER than its kit is retired narration a skip-existing VO run kept alive
+     (the V7 gap 2026-07-04: stale VO is older than the mp4 too, so check 3
+     can't see it). No kit on disk → warn-only (freshness unverifiable).
 Warn-only (never fails the gate): a missing .srt caption file — the uploader
 already treats captions as best-effort.
 
@@ -78,6 +83,20 @@ def _select_edit_manifest(vid: str, mp4_stem: str) -> Path | None:
         except (json.JSONDecodeError, OSError):
             continue
     return (matches or cands)[-1]  # newest identity-match, else newest overall
+
+
+def _vo_kit_for(vlt: Path, clip_rel: str) -> Path:
+    """The VO kit that should have produced this clip: the clip's folder with any
+    `_gen` suffix stripped is the kit folder (generate_vo renders Voice_Files/
+    <vid>/_VO_Session_B_Kit.md into Voice_Files/<vid>_gen/; hand-recorded sets
+    keep the kit in the clip folder itself)."""
+    d = (vlt / clip_rel).parent.name
+    kit_dir = d[: -len("_gen")] if d.endswith("_gen") else d
+    return vlt / "Voice_Files" / kit_dir / "_VO_Session_B_Kit.md"
+
+
+def _ts(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime).isoformat(timespec="minutes")
 
 
 def resolve_thumbnail(vlt: Path, vid: str) -> Path | None:
@@ -160,6 +179,34 @@ def check_publish_ready(
                 f"STALE CUT: {len(stale)} input(s) were regenerated AFTER the mp4 "
                 f"was built ({', '.join(stale[:6])}{' …' if len(stale) > 6 else ''}) "
                 "— re-assemble before upload."
+            )
+        # Check 6 — VO freshness vs the kit (the V7 gap): a skip-existing VO run
+        # keeps mp3s that PREDATE the kit that should have produced them; they're
+        # older than the mp4 too, so the stale-input check above is blind to them.
+        # Same tie policy as above: equal mtimes read fresh.
+        stale_vo: list[str] = []
+        no_kit: set[str] = set()
+        for rel in sorted(inputs):
+            p = vlt / rel
+            if not rel.endswith(".mp3") or not p.is_file():
+                continue  # non-VO input, or already reported missing
+            kit = _vo_kit_for(vlt, rel)
+            if not kit.is_file():
+                no_kit.add(str(kit.parent.relative_to(vlt)))
+                continue
+            if p.stat().st_mtime < kit.stat().st_mtime:
+                stale_vo.append(f"{rel} (mp3 {_ts(p.stat().st_mtime)} < "
+                                f"kit {_ts(kit.stat().st_mtime)})")
+        if stale_vo:
+            failures.append(
+                f"STALE VO: {len(stale_vo)} clip(s) are OLDER than the VO kit that "
+                f"should have produced them — retired narration; re-render VO "
+                f"(generate_vo --force) and re-assemble: "
+                + "; ".join(stale_vo[:4]) + (" …" if len(stale_vo) > 4 else "")
+            )
+        for d in sorted(no_kit):
+            warnings.append(
+                f"no VO kit at {d}/_VO_Session_B_Kit.md — VO freshness unverified."
             )
 
     if not desc_pack.is_file():
@@ -267,6 +314,11 @@ def _selftest() -> int:
         vo = f"Voice_Files/{vid}_gen/{vid}_VO_Scene_01.mp3"
         for rel in (img, vo):
             (vlt / rel).write_text("x")
+        (vlt / "Voice_Files" / vid).mkdir()
+        kit_file = vlt / "Voice_Files" / vid / "_VO_Session_B_Kit.md"
+        kit_file.write_text("## Scene 1 -> `x.mp3`\n")
+        kit_old = datetime(2019, 1, 1).timestamp()
+        os.utime(kit_file, (kit_old, kit_old))  # older than the 2020 mp3s → fresh
         desc = vlt / "Video_Descriptions" / f"{vid}_Description.md"
         desc.write_text("## Description\nx\n")
         thumb = vlt / "Thumbnails" / f"{vid}_A.jpg"
@@ -293,6 +345,25 @@ def _selftest() -> int:
                 f"expected empty-manifest fail, got {fails}"
             man.write_text(json.dumps(
                 {"output_name": stem, "shots": [{"image": img, "vo_clip": vo}]}))
+
+            # VO mp3 OLDER than its kit → STALE VO → FAIL (the V7 gap: the mp3 is
+            # older than the mp4 too, so the stale-input check can't catch it).
+            kit_new = datetime(2021, 1, 1).timestamp()
+            os.utime(kit_file, (kit_new, kit_new))
+            ok, fails, _ = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert not ok and any("STALE VO" in f for f in fails), \
+                f"expected stale-VO fail, got {fails}"
+            os.utime(kit_file, (kit_old, kit_old))
+
+            # Kit missing entirely → warn-only, still PASS.
+            kit_file.unlink()
+            ok, fails, warns = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert ok and any("VO kit" in w for w in warns), \
+                f"expected missing-kit warn + PASS, got fails={fails} warns={warns}"
+            kit_file.write_text("## Scene 1 -> `x.mp3`\n")
+            os.utime(kit_file, (kit_old, kit_old))
 
             # Touch an input newer than the mp4 → STALE → FAIL.
             future = datetime(2099, 1, 1).timestamp()

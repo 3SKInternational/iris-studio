@@ -20,6 +20,7 @@ change, not a rewrite. Stdlib-only (urllib) to match video_factory -- no deps.
   python3 generate_vo.py <kit.md> --output DIR        # generate into a chosen dir
   python3 generate_vo.py <kit.md> --limit 1           # smoke-test one clip
   python3 generate_vo.py <kit.md> --force             # re-render existing mp3s
+  python3 generate_vo.py <kit.md> --allow-stale       # keep skipped mp3s even if the kit is newer
 
 Key: ELEVENLABS_API_KEY from the environment first, then the repo-root .env.
 Never put the key in the vault -- it is git-tracked + synced.
@@ -39,6 +40,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 # VO model allocator (premium v2 vs cheap flash, per-video, budget-aware).
@@ -512,6 +514,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--only", help="Render only these scene numbers (comma-separated, e.g. 22,24). Add --force to overwrite existing mp3s. Model is still chosen from the WHOLE kit, so a single-scene redo keeps the same voice as the rest of the video.")
     p.add_argument("--limit", type=int, help="Generate at most N clips (smoke test).")
     p.add_argument("--force", action="store_true", help="Re-render mp3s that already exist.")
+    p.add_argument("--allow-stale", action="store_true", help="Don't fail when a skipped existing mp3 is OLDER than the kit (default: that's fatal — the kit changed after the audio was rendered).")
     p.add_argument("--dry-run", action="store_true", help="Plan + credit estimate; no API calls, no writes.")
     p.add_argument("--check", action="store_true", help="Verify the API key + print credits, then exit.")
     p.add_argument("--measure-rate", action="store_true", help="Measure the effective words-per-minute of this kit's already-rendered mp3s (in the _gen dir) and exit. No API calls. Use to recalibrate the script-sizing rate after a voice/speed change.")
@@ -618,6 +621,7 @@ def main() -> None:
 
     total_chars = 0
     to_make: list[dict] = []
+    skipped: list[dict] = []
     for b in blocks:
         chars = len(b["text"])
         total_chars += chars
@@ -626,6 +630,8 @@ def main() -> None:
         flag = "skip" if exists else "gen "
         if not exists:
             to_make.append(b)
+        else:
+            skipped.append(b)
         nparts = len(split_for_tts(b["text"]))
         parts_note = f"  ({nparts} parts)" if nparts > 1 else ""
         print(f"  [{flag}] scene {b['scene']:>2}  {b['filename']:<32} {chars:>5} chars{parts_note}")
@@ -637,6 +643,27 @@ def main() -> None:
         print(f"  shown (--limit {args.limit}): {total_chars} chars ~= {shown_credits} credits")
     print(f"  full batch: {full_chars} chars  ~= {est_credits} credits ({full_count} scenes)")
     print(f"  to generate now: {len(to_make)} / {len(blocks)}")
+
+    # Stale-audio guard (V7 incident 2026-07-04): a skip-existing run that keeps
+    # mp3s OLDER than the kit is shipping retired narration — the kit changed
+    # after that audio was rendered. A silent skip let 12 old clips reach
+    # assembly while the stage printed "done.". Loud summary on ANY skip; fatal
+    # (before the dry-run branch, so plan-time surfaces it too) when a skipped
+    # mp3 predates the kit, unless --allow-stale. Tie reads fresh, matching
+    # preflight_publish's mtime-tie policy.
+    if skipped:
+        kit_mtime = kit_path.stat().st_mtime
+        pairs = [(b["filename"], (out_dir / b["filename"]).stat().st_mtime) for b in skipped]
+        oldest = datetime.fromtimestamp(min(mt for _, mt in pairs))
+        print(f"  ⚠️  {len(pairs)} skipped (existing) — pass --force to re-render; "
+              f"existing files date from {oldest:%Y-%m-%d %H:%M}")
+        stale = [name for name, mt in pairs if mt < kit_mtime]
+        if stale and not args.allow_stale:
+            die(f"STALE VO: {len(stale)} skipped mp3(s) are OLDER than {kit_path.name} "
+                f"(kit modified {datetime.fromtimestamp(kit_mtime):%Y-%m-%d %H:%M}) — "
+                f"they were rendered from a previous kit: "
+                + ", ".join(stale[:6]) + (" …" if len(stale) > 6 else "")
+                + ". Re-render with --force, or pass --allow-stale to keep them.")
 
     if args.dry_run:
         print("\n(dry run -- no API calls, no files written)")

@@ -103,6 +103,71 @@ class TestGenerateVoExitCodes(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
 
 
+class TestGenerateVoStaleGuard(unittest.TestCase):
+    """V7 incident (2026-07-04): a skip-existing run kept 12 mp3s rendered from a
+    RETIRED kit (mp3s older than the kit) and exited 0 — build_video printed
+    "done." with zero generated. The guard must make any skip loud, and a
+    kit-newer-than-skipped-mp3 skip fatal. It fires before the dry-run branch,
+    so --dry-run exercises it hermetically (no key, no billed call)."""
+
+    def _setup(self):
+        td = Path(tempfile.mkdtemp())
+        kit = td / "_VO_Session_B_Kit.md"
+        kit.write_text(
+            textwrap.dedent(
+                """\
+                ## Scene 1 -> `Video_99_VO_Scene_01.mp3` (cold open)
+
+                The median American household holds a few thousand dollars in savings.
+
+                ---
+                """
+            ),
+            encoding="utf-8",
+        )
+        out = td / "gen"
+        out.mkdir()
+        mp3 = out / "Video_99_VO_Scene_01.mp3"
+        mp3.write_bytes(b"\x00")
+        return kit, out, mp3
+
+    def _gv(self, kit, out, *extra):
+        return _run([sys.executable, str(_GENERATE_VO), str(kit),
+                     "--output", str(out), "--dry-run", *extra])
+
+    def test_skipped_mp3_older_than_kit_exits_nonzero(self):
+        kit, out, mp3 = self._setup()
+        old = 1_600_000_000  # 2020 — well before the kit's just-written mtime
+        os.utime(mp3, (old, old))
+        r = self._gv(kit, out)
+        self.assertNotEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIn("STALE VO", r.stdout + r.stderr)
+        self.assertIn("skipped (existing)", r.stdout + r.stderr)
+
+    def test_allow_stale_overrides(self):
+        kit, out, mp3 = self._setup()
+        old = 1_600_000_000
+        os.utime(mp3, (old, old))
+        r = self._gv(kit, out, "--allow-stale")
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIn("skipped (existing)", r.stdout + r.stderr)
+
+    def test_fresh_skip_exits_zero_but_warns(self):
+        # mp3 written AFTER the kit → a legitimate skip: loud summary, exit 0.
+        kit, out, mp3 = self._setup()
+        r = self._gv(kit, out)
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIn("skipped (existing)", r.stdout + r.stderr)
+
+    def test_force_run_has_no_skip_summary(self):
+        kit, out, mp3 = self._setup()
+        old = 1_600_000_000
+        os.utime(mp3, (old, old))
+        r = self._gv(kit, out, "--force")  # nothing skipped → guard silent
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertNotIn("skipped (existing)", r.stdout + r.stderr)
+
+
 class TestBuildVideoArtifactVerify(unittest.TestCase):
     """White-box: the headline of the fix is that a stage which exits 0 WITHOUT
     writing its artifact must still fail the build. Stub the gen subprocess to
