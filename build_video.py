@@ -667,7 +667,7 @@ CTA_SEGMENTS = {
         "image": f"{CTA_DIR}/CTA_midroll.png",
         "vo_clip": f"{CTA_DIR}/CTA_midroll.mp3",
         "motion": "zoom_in",
-        "caption_text": ("Quick thing before we keep going — if this is landing, "
+        "caption_text": ("Quick thing before we keep going, if this is landing, "
                          "subscribe. It's the easiest way to make sure the next one "
                          "reaches you. Okay, back to it."),
     },
@@ -675,7 +675,7 @@ CTA_SEGMENTS = {
         "image": f"{CTA_DIR}/CTA_outro.png",
         "vo_clip": f"{CTA_DIR}/CTA_outro.mp3",
         "motion": "zoom_in",
-        "caption_text": ("And before you go — if this helped, like it and "
+        "caption_text": ("And before you go, if this helped, like it and "
                          "subscribe so the next one finds you."),
     },
 }
