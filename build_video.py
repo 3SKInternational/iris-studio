@@ -332,12 +332,50 @@ def _convert_expr(expr: str, fmt) -> str:
     return "".join(out)
 
 
+# Steve's standing caption rule (2026-07-05): captions ship NO dashes of any kind
+# and NO markdown asterisks (both are AI tells). Deterministic strip so no VO kit,
+# script, or agent authoring can leak one — the can't-hallucinate backstop.
+# Design: eliminate EVERY dash character (ASCII hyphen + the Unicode dash family
+# LLMs love — en/em-dash, figure dash, non-breaking hyphen, minus sign), keeping
+# only the SRT structural "-->" cue arrow, which is protected end-to-end via a
+# private-use sentinel so no dash rule can touch it.
+_ARROW_SENTINEL = "\ue000"                    # PUA char; never occurs in caption text
+_DASHES = "\\-‐‑‒–—―−"  # - ‐ ‑ ‒ – — ― −
+# digit/percent range ("3-5", "2010–2020", "$50-$100", "10%-20%") -> " to "
+_RANGE_RE = re.compile(r"(?<=[\d%])\s*[" + _DASHES + r"]\s*(?=\$?\d)")
+# a real minus sign on a signed figure at a token start ("-$500", "-37%") -> the
+# WORD "minus", never a bare space — a silent sign-flip on a loss/drawdown figure
+# is a data-integrity bug no gate would catch. Runs AFTER _RANGE_RE (so a genuine
+# range's digit-flanked dash is already consumed and can't be misread as a minus);
+# hyphen + U+2212 only, NOT em/en-dash (those are prose tells -> comma below).
+_MINUS_RE = re.compile(r"(?<![\w])[-−](?=\$?\d)")
+# remaining en/em-dash/horizontal-bar used as a prose separator -> comma
+_EMEN_RE = re.compile(r"\s*[–—―]+\s*")
+# any dash still standing (compounds like "first-generation", strays) -> space
+_HYPHEN_RE = re.compile(r"[" + _DASHES + r"]")
+
+
+def strip_ai_tell_punct(text: str) -> str:
+    """No dashes / no markdown asterisks, per Steve's caption rule. Order matters:
+    asterisks first (so "*3*-*5*" can't hide a dash behind removed markup); protect
+    "-->"; range before minus (a range's dash is digit-flanked, a minus is token-
+    initial) before the em/en separator; blanket dash->space last."""
+    text = text.replace("*", "")                  # strip markdown asterisks
+    text = text.replace("-->", _ARROW_SENTINEL)   # protect SRT cue arrow
+    text = _RANGE_RE.sub(" to ", text)            # 3-5 / 2010–2020 / $50-$100 -> " to "
+    text = _MINUS_RE.sub("minus ", text)          # -$500 / -37% -> minus $500 / minus 37%
+    text = _EMEN_RE.sub(", ", text)               # em/en-dash prose separator -> comma
+    text = _HYPHEN_RE.sub(" ", text)              # first-generation -> first generation
+    return text.replace(_ARROW_SENTINEL, "-->")   # restore cue arrow
+
+
 def normalize_caption(text: str) -> str:
     """Spoken finance orthography -> caption digits/symbols, anchors only.
     Skips any match that already carries a $/% symbol — `parse_kit` runs this
     AFTER the dual-form substitution has injected `$`-formatted figures, so a
     re-grab would emit `$$100,000`; the guard keeps already-formatted money/percent
-    intact."""
+    intact. Ends with the no-dash/no-asterisk strip so the caption is clean
+    regardless of what the kit authored."""
     for pat, repl in _CAPTION_LOOKUPS:
         text = pat.sub(repl, text)
     text = _YEAR_RE.sub(lambda m: str(_YEAR_MAP[m.group(0).lower()]), text)
@@ -347,7 +385,7 @@ def normalize_caption(text: str) -> str:
     text = _PCT_RE.sub(
         lambda m: m.group(0) if "%" in m.group(0)
         else _convert_expr(m.group(1), lambda n: f"{n}%"), text)
-    return text
+    return strip_ai_tell_punct(text)
 
 
 def _selftest_normalize_caption() -> None:
@@ -376,7 +414,7 @@ def _selftest_normalize_caption() -> None:
         ("hand you two thousand eighty dollars a year", "hand you $2,080 a year"),
         ("an instant fifty to one hundred percent return",
          "an instant 50% to 100% return"),
-        ("toward fifteen percent of take-home pay", "toward 15% of take-home pay"),
+        ("toward fifteen percent of take-home pay", "toward 15% of take home pay"),
         ("the market only contributed twenty percent", "the market only contributed 20%"),
         ("contributing seventy-seven percent of the growth",
          "contributing 77% of the growth"),
@@ -403,8 +441,30 @@ def _selftest_normalize_caption() -> None:
         # already-formatted $/% figures (post dual-form sub) must NOT be re-grabbed
         ("$10,000 to $100,000 dollars", "$10,000 to $100,000 dollars"),
         ("$5,000 to ten thousand dollars", "$5,000 to $10,000"),
-        ("crossed $1.1 million at forty-eight", "crossed $1.1 million at forty-eight"),
+        ("crossed $1.1 million at forty-eight", "crossed $1.1 million at forty eight"),
         ("a 4% match", "a 4% match"),
+        # no-dash / no-asterisk caption rule (Steve 2026-07-05)
+        ("It compounds—quietly—over decades", "It compounds, quietly, over decades"),
+        ("give it three to five years", "give it three to five years"),  # already words
+        ("first-generation wealth builders", "first generation wealth builders"),
+        ("a $1,650-a-month habit", "a $1,650 a month habit"),
+        ("**subscribe** and *like*", "subscribe and like"),
+        ("built over 3-5 years", "built over 3 to 5 years"),
+        # every dash flavor an LLM emits -> gone (en/em-dash, currency/percent ranges)
+        ("growth from 2010–2020 was steady", "growth from 2010 to 2020 was steady"),
+        ("a $50-$100 monthly habit", "a $50 to $100 monthly habit"),
+        ("keep 10%-20% of income", "keep 10% to 20% of income"),
+        ("the S&P‑500 index", "the S&P 500 index"),          # non-breaking hyphen U+2011
+        ("risk – reward tradeoff", "risk, reward tradeoff"),  # spaced en-dash separator
+        ("*3*-*5* years", "3 to 5 years"),                    # asterisks stripped first
+        # a real minus on a loss/drawdown figure must NOT become a bare space (sign flip)
+        ("a return of -37% in 2008", "a return of minus 37% in 2008"),
+        ("the fund lost -$4,800", "the fund lost minus $4,800"),
+        ("down -12% for the year", "down minus 12% for the year"),
+        # ...but a digit/percent-flanked dash is still a range, not a minus
+        ("keep 10%-20% of income", "keep 10% to 20% of income"),
+        # "-->" must survive the strip if it ever runs on an SRT line
+        ("00:00:01,000 --> 00:00:02,000", "00:00:01,000 --> 00:00:02,000"),
     ]
     bad = [(i, o, normalize_caption(i)) for i, o in cases if normalize_caption(i) != o]
     for i, want, got in bad:

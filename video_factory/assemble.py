@@ -85,6 +85,36 @@ CAP_MAX_WORDS = 9        # word-timed path: max words before a forced cue break
 CAP_ALIGN_TRUST = 0.3    # >= this match_rate -> trust on-disk alignment for timing
 CAP_ALIGN_REFRESH = 0.5  # under --align, below this (or stale) -> re-run alignment
 SSML_BREAK_RE = re.compile(r"<break[^>]*/?>", re.IGNORECASE)
+
+# Steve's standing caption rule (2026-07-05): captions ship NO dashes of any kind
+# and NO markdown asterisks. Assembler-side backstop covering EVERY caption path:
+# the word-timed cue builder (_word_timed_cues.flush — the DEFAULT path when a
+# trusted alignment exists, whose tokens are the unstripped SPOKEN transcript), the
+# proportional fallback (chunk_caption), CTA caption_text, and per-video script text.
+# Design mirrors build_video.strip_ai_tell_punct exactly (two processes, no shared
+# import): eliminate every dash char, keep only the SRT "-->" arrow via a PUA
+# sentinel. Keep the two copies in lockstep — both carry selftests to catch drift.
+_ARROW_SENTINEL = "\ue000"               # PUA char; never occurs in caption text
+_DASHES = "\\-‐‑‒–—―−"  # hyphen ‐ ‑ ‒ – — ― −
+_RANGE_RE = re.compile(r"(?<=[\d%])\s*[" + _DASHES + r"]\s*(?=\$?\d)")  # ranges -> " to "
+# minus sign on a signed figure ("-$500", "-37%") -> the WORD "minus" (never a bare
+# space) so a loss/drawdown figure never silently flips sign; after _RANGE_RE.
+_MINUS_RE = re.compile(r"(?<![\w])[-−](?=\$?\d)")
+_EMEN_RE = re.compile(r"\s*[–—―]+\s*")           # en/em-dash prose separator -> comma
+_HYPHEN_RE = re.compile(r"[" + _DASHES + r"]")   # any remaining dash -> space
+
+
+def strip_ai_tell_punct(text: str) -> str:
+    """No dashes / no markdown asterisks (Steve's caption rule). Asterisks first,
+    protect "-->", range before minus before the em/en rule, blanket dash->space
+    last. Kept identical to build_video.strip_ai_tell_punct."""
+    text = text.replace("*", "")
+    text = text.replace("-->", _ARROW_SENTINEL)
+    text = _RANGE_RE.sub(" to ", text)
+    text = _MINUS_RE.sub("minus ", text)
+    text = _EMEN_RE.sub(", ", text)
+    text = _HYPHEN_RE.sub(" ", text)
+    return text.replace(_ARROW_SENTINEL, "-->")
 CAP_SENT_END_RE = re.compile(r"[.!?—]$")
 
 
@@ -381,6 +411,10 @@ def chunk_caption(text: str) -> list[str]:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
+    # No-dash / no-asterisk backstop BEFORE the sentence split: em-dash -> comma
+    # here means the split's "—" cue-hint is now dead (harmless) — a comma isn't a
+    # cue boundary, so those clauses just wrap via CAP_MAX_CHARS instead.
+    text = strip_ai_tell_punct(text)
     # Split on sentence-ish boundaries, keeping the terminator.
     parts = re.split(r"(?<=[.!?—])\s+", text)
     cues: list[str] = []
@@ -563,12 +597,17 @@ def _word_timed_cues(words: list[dict], offset: float, audio_start: float,
         e = offset + (float(buf[-1]["end"]) - audio_start)
         s = min(max(s, offset), end_t)
         e = min(max(e, s), end_t)
-        out.append((s, e, _wrap_cue(" ".join(w["text"] for w in buf))))
+        # Strip AI-tell punctuation from the SPOKEN word tokens BEFORE wrapping, so
+        # this default cue path is dash/asterisk-clean like the fallback and the
+        # CAP_MAX_CHARS/CAP_MAX_LINES wrap sees the final text.
+        out.append((s, e, _wrap_cue(strip_ai_tell_punct(" ".join(w["text"] for w in buf)))))
 
     for w in words:
         # Would adding this word overflow the cue's word/line budget? If so, close
         # the current cue first so this word starts the next one (never overflow).
-        joined = " ".join(x["text"] for x in buf + [w])
+        # Fit-test the STRIPPED text: a spoken "3-5" token expands to "3 to 5" (+3),
+        # so a raw-fitting cue can wrap to 3 lines post-strip — gate on final text.
+        joined = strip_ai_tell_punct(" ".join(x["text"] for x in buf + [w]))
         if buf and (len(buf) >= CAP_MAX_WORDS or not _cue_fits(joined)):
             flush()
             buf = []
@@ -1068,6 +1107,51 @@ def _selftest() -> None:
 
     # A caption-less all-silent manifest yields an empty SRT (no crash).
     assert build_srt([mk(1, 1.0, "")]) == ""
+
+    # No-dash / no-asterisk strip (Steve 2026-07-05) — unit cases kept in lockstep
+    # with build_video.strip_ai_tell_punct so the two independent copies can't drift.
+    strip_cases = [
+        ("It compounds—quietly—on", "It compounds, quietly, on"),
+        ("first-generation wealth", "first generation wealth"),
+        ("built over 3-5 years", "built over 3 to 5 years"),
+        ("a $50-$100 habit", "a $50 to $100 habit"),
+        ("keep 10%-20% of it", "keep 10% to 20% of it"),
+        ("2010–2020 was steady", "2010 to 2020 was steady"),
+        ("**subscribe** and *like*", "subscribe and like"),
+        ("the fund lost -$4,800", "the fund lost minus $4,800"),  # no sign flip
+        ("down -37% in 2008", "down minus 37% in 2008"),
+        ("00:00:01,000 --> 00:00:02,000", "00:00:01,000 --> 00:00:02,000"),
+    ]
+    for src, want in strip_cases:
+        assert strip_ai_tell_punct(src) == want, (src, want, strip_ai_tell_punct(src))
+
+    # CAP_MAX_LINES honesty: a spoken "3-5" token expands to "3 to 5" (+3 chars).
+    # A cue whose RAW text fits 2 lines but whose STRIPPED text would wrap to 3 must
+    # be closed by the fit gate, never emitted over budget. Words sized to sit a hair
+    # under 2x42 raw, tipping over once "3-5" -> "3 to 5".
+    ov = [{"text": t, "start": i * 0.5, "end": i * 0.5 + 0.5} for i, t in enumerate(
+        ["Returns", "ranged", "widely", "over", "roughly", "3-5", "tough", "market", "years"])]
+    for _s, _e, txt in _word_timed_cues(ov, 0.0, 0.0, 6.0):
+        assert "-" not in txt and len(txt.split("\n")) <= CAP_MAX_LINES, repr(txt)
+        for ln in txt.split("\n"):
+            assert len(ln) <= CAP_MAX_CHARS, (len(ln), ln)
+
+    # End-to-end: SPOKEN word tokens carrying an em-dash + a compound hyphen must
+    # reach the SRT clean on the DEFAULT (word-timed) path — the primary-path gap.
+    dashy = [{"text": "Wealth", "start": 0.0, "end": 1.0},
+             {"text": "—", "start": 1.0, "end": 1.2},
+             {"text": "first-generation", "start": 1.2, "end": 2.4},
+             {"text": "wealth.", "start": 2.4, "end": 3.0}]
+    dshots = [mk(1, 3.0, "unused caption", audio=mp3, audio_start=0.0)]
+    try:
+        _clip_alignments = lambda s, c, a: {mp3: {"words": dashy, "match_rate": 0.9}}
+        dsrt = build_srt(dshots)
+    finally:
+        _clip_alignments = orig
+    cap_lines = [ln for blk in dsrt.strip().split("\n\n")
+                 for ln in blk.split("\n")[2:]]
+    assert cap_lines and not any(ch in "".join(cap_lines) for ch in "-–—―−*"), dsrt
+    assert "-->" in dsrt, dsrt  # structural cue arrow untouched
     print("[assemble] selftest OK")
 
 
