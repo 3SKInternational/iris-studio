@@ -23,6 +23,20 @@ Checks (each one FAILS the gate — fail-closed):
      OLDER than its kit is retired narration a skip-existing VO run kept alive
      (the V7 gap 2026-07-04: stale VO is older than the mp4 too, so check 3
      can't see it). No kit on disk → warn-only (freshness unverifiable).
+  7. no thumbnail overlay restates a dollar VALUE the locked title already
+     carries — the Pairing Principle CTR-drop pattern (title + thumb answering
+     the SAME dollar question). The overlay text lives machine-readably in
+     image_factory/manifests/<vid>_thumbnail_overlay.json; the title mirrors
+     upload_video's precedence (desc-pack `youtube_title:` frontmatter, else the
+     NEWEST Packaging_<vid>*.md ⭐ recommended title). A violation on the
+     THUMBNAIL THAT WILL BE UPLOADED (the one preflight resolves) FAILS; an
+     A/B *alternate*
+     only warns (Steve may intentionally test it). Spec or title unparseable →
+     warn-only. This is the V8 gap 2026-07-04: B burned "$1,650 → $10M" against
+     a title already carrying "($0–$10M)" and nothing between the packaging doc
+     and the built thumbnail caught it. The check is deliberately narrow — a
+     shared dollar VALUE (a title endpoint restated), NOT "the overlay has any
+     dollar", so a distinct in-range stakes figure (e.g. "$340") stays clean.
 Warn-only (never fails the gate): a missing .srt caption file — the uploader
 already treats captions as best-effort.
 
@@ -47,7 +61,78 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFEST_DIR = REPO / "video_factory" / "manifests"
+THUMB_OVERLAY_DIR = REPO / "image_factory" / "manifests"
 DEFAULT_VAULT = "~/Documents/3SK/outputs/BRANDS/3SK_Finance"
+
+# A dollar figure, with an optional K/M/B magnitude suffix: $0, $1,650, $10M, $10.03M.
+# The `\b` after the suffix keeps a following word from becoming a multiplier —
+# "$500 MISTAKE" is $500, not $500M (overlays are all-caps by house style).
+_DOLLAR_RE = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)(?:\s?([KkMmBb])\b)?")
+_MULT = {"k": 1e3, "m": 1e6, "b": 1e9}
+
+
+def _dollar_values(text: str) -> set[int]:
+    """Normalized integer dollar values in `text` ($10M and $10,000,000 → 10000000).
+
+    Used to detect a thumbnail overlay RESTATING a value the title already owns.
+    Magnitude-normalized so "$10M" (title) and "$10,000,000" (overlay) compare equal.
+    """
+    out: set[int] = set()
+    for num, suf in _DOLLAR_RE.findall(text):
+        val = float(num.replace(",", "")) * (_MULT[suf.lower()] if suf else 1)
+        out.add(round(val))
+    return out
+
+
+def _pkg_version(path: Path) -> int:
+    """Sort key for packaging docs: Packaging_Video_08_v4.md → 4; base or any
+    non-numeric suffix (_repackage) → 1. Highest = newest recommended package."""
+    m = re.search(r"_v(\d+)\.md$", path.name)
+    return int(m.group(1)) if m else 1
+
+
+def _title_from_packaging(pkg: Path) -> str | None:
+    """The ⭐ recommended title in a packaging doc. Repackage (_vN) docs carry
+    more than one `**Title:**` (recommended + alts), so anchor to the text AFTER
+    the ⭐ marker; the variants TABLE uses `| # | Title |` so it can't be picked
+    up. Fall back to the first `**Title:**` only if there's no ⭐ section."""
+    text = pkg.read_text(encoding="utf-8")
+    star = text.find("⭐")
+    scope = text[star:] if star != -1 else text
+    m = re.search(r'\*\*Title:\*\*\s*"([^"]+)"', scope)
+    return m.group(1) if m else None
+
+
+def _locked_title(vlt: Path, vid: str, desc_pack: Path) -> str | None:
+    """The title the thumbnail overlay is checked against, or None if none found.
+
+    Mirrors upload_video's real precedence: the desc-pack frontmatter
+    `youtube_title:` (what upload_video actually SETS as the title) wins; else the
+    NEWEST packaging doc's ⭐ recommended title (a suggestion only, but the best
+    pre-upload signal). Reading only base Packaging_<vid>.md would check a
+    repackaged video against a RETIRED title — a silent fail-open (V5's base title
+    is dollar-free while its _v4 carries "$100 to $1,000,000")."""
+    if desc_pack.is_file():
+        m = re.search(r'(?m)^youtube_title:\s*"?(.+?)"?\s*$',
+                      desc_pack.read_text(encoding="utf-8"))
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    pkgs = sorted((vlt / "Packaging").glob(f"Packaging_{vid}*.md"),
+                  key=_pkg_version, reverse=True)
+    for pkg in pkgs:
+        t = _title_from_packaging(pkg)
+        if t:
+            return t
+    return None
+
+
+def _thumb_card_key(thumb_stem: str) -> str:
+    """The overlay-spec card key for a resolved thumbnail file
+    (Video_08_Thumbnail_A_FINAL → Video_08_Thumbnail_A)."""
+    for suf in ("_FINAL", "_text"):
+        if thumb_stem.endswith(suf):
+            thumb_stem = thumb_stem[: -len(suf)]
+    return thumb_stem
 
 
 def vault() -> Path:
@@ -221,6 +306,61 @@ def check_publish_ready(
     elif not Path(thumb).is_file():
         failures.append(f"thumbnail not found: {thumb}")
 
+    # Check 7 — thumbnail overlay vs locked-title pairing (the V8 gap): an overlay
+    # that restates a dollar VALUE the title already carries answers the same
+    # question the title does — the documented CTR-drop pattern. The overlay text
+    # is machine-readable (the thumbnail_overlay spec); the title from packaging.
+    title = _locked_title(vlt, vid, desc_pack)
+    spec_path = THUMB_OVERLAY_DIR / f"{vid}_thumbnail_overlay.json"
+    if title is None:
+        warnings.append(f"no parseable locked title (desc-pack youtube_title or "
+                        f"Packaging/Packaging_{vid}*.md) — thumbnail↔title pairing "
+                        "unverified.")
+    elif not spec_path.is_file():
+        warnings.append(f"no thumbnail overlay spec {spec_path.name} — "
+                        "thumbnail↔title pairing unverified.")
+    else:
+        title_vals = _dollar_values(title)
+        resolved_key = _thumb_card_key(Path(thumb).stem) if thumb else None
+        try:
+            loaded = json.loads(spec_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            warnings.append(f"thumbnail overlay spec {spec_path.name} unreadable: {e}")
+            loaded = {}
+        cards = loaded.get("cards", {}) if isinstance(loaded, dict) else {}
+        if not isinstance(cards, dict):
+            warnings.append(f"thumbnail overlay spec {spec_path.name} has no valid "
+                            "'cards' object — pairing unverified.")
+            cards = {}
+        for key, els in cards.items():
+            if not isinstance(els, list):
+                continue  # malformed card; a real burn would have failed already
+            # str() coerces a numeric "text" (e.g. 10000000) so join never raises;
+            # a bare number without a "$" isn't a dollar token anyway.
+            overlay_text = " ".join(str(el.get("text", "")) for el in els
+                                    if isinstance(el, dict))
+            shared = title_vals & _dollar_values(overlay_text)
+            if not shared:
+                continue
+            shared_str = ", ".join(f"${v:,}" for v in sorted(shared))
+            msg = (f"THUMBNAIL PAIRING: overlay '{key}' ({overlay_text.strip()!r}) "
+                   f"restates dollar value(s) {shared_str} the locked title already "
+                   f"carries ({title!r}) — the Pairing Principle CTR-drop pattern. "
+                   "Rebuild the overlay with a figure ORTHOGONAL to the title's range.")
+            # Fail only if it's the thumbnail that will actually be uploaded; a
+            # mispaired A/B alternate only warns (Steve may intentionally test it).
+            if key == resolved_key:
+                failures.append(msg)
+            else:
+                warnings.append(msg)
+        # If the to-be-uploaded thumbnail matches no card, a violation on it could
+        # only ever warn — surface that the severity attribution failed.
+        if resolved_key is not None and cards and resolved_key not in cards:
+            warnings.append(
+                f"resolved thumbnail '{resolved_key}' matched no overlay card in "
+                f"{spec_path.name} — pairing severity unattributable; verify the "
+                "thumbnail↔spec naming.")
+
     if srt is None or not Path(srt).is_file():
         warnings.append(
             f"no caption .srt for {vid} — captions will be skipped (upload continues)."
@@ -297,12 +437,15 @@ def _cli() -> int:
 
 def _selftest() -> int:
     import tempfile
-    global MANIFEST_DIR
+    global MANIFEST_DIR, THUMB_OVERLAY_DIR
     real_manifest_dir = MANIFEST_DIR
+    real_thumb_overlay_dir = THUMB_OVERLAY_DIR
     with tempfile.TemporaryDirectory() as td:
         vlt = Path(td)
         MANIFEST_DIR = vlt / "manifests"  # isolate: never touch the real repo dir
         MANIFEST_DIR.mkdir()
+        THUMB_OVERLAY_DIR = vlt / "thumb_manifests"
+        THUMB_OVERLAY_DIR.mkdir()
         vid = "Video_99"
         stem = f"{vid}_v2"
         (vlt / "Footage_and_Edits").mkdir(parents=True)
@@ -372,6 +515,101 @@ def _selftest() -> int:
                 vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
             assert not ok and any("STALE" in f for f in fails), f"expected STALE fail, got {fails}"
 
+            # --- Check 7: thumbnail↔title pairing ---
+            for rel in (img, vo):  # prior case left img at 2099 → reset to fresh
+                os.utime(vlt / rel, (old, old))
+            pkg_dir = vlt / "Packaging"
+            pkg_dir.mkdir()
+            pkg = pkg_dir / f"Packaging_{vid}.md"
+            pkg.write_text('## ⭐ Recommended package\n'
+                           '- **Title:** "POV: Your House ($0–$10M)"\n')
+            spec = THUMB_OVERLAY_DIR / f"{vid}_thumbnail_overlay.json"
+            # Resolved thumb (Video_99_A.jpg) is clean "$340"; alternate B restates
+            # "$10M" (a title endpoint) → alternate WARNS, gate still PASSES.
+            spec.write_text(json.dumps({"cards": {
+                f"{vid}_A": [{"text": "BALANCE: $340"}],
+                f"{vid}_B": [{"text": "$1,650"}, {"text": "→ $10M"}],
+            }}))
+            ok, fails, warns = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert ok, f"expected PASS (clean resolved thumb), got {fails}"
+            assert any("THUMBNAIL PAIRING" in w and f"{vid}_B" in w for w in warns), \
+                f"expected mispaired-alternate warning, got {warns}"
+
+            # Now the RESOLVED thumb itself restates $10M → FAIL.
+            spec.write_text(json.dumps({"cards": {
+                f"{vid}_A": [{"text": "$1,650 → $10M"}],
+            }}))
+            ok, fails, _ = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert not ok and any("THUMBNAIL PAIRING" in f for f in fails), \
+                f"expected resolved-thumb pairing FAIL, got {fails}"
+
+            # $10M and $10,000,000 must compare equal (magnitude normalization).
+            assert _dollar_values("$10M") == _dollar_values("$10,000,000") == {10_000_000}
+            # A distinct in-range figure ($340) is NOT a restatement → clean.
+            assert not (_dollar_values("POV ($0–$10M)") & _dollar_values("BALANCE: $340"))
+
+            # --- check-7 hardening (skeptical-code-reviewer 2026-07-04) ---
+            # Malformed-but-valid-JSON specs must WARN, never crash (warn-only contract).
+            for bad in ([], {"cards": None}, {"cards": [1]}, {"cards": {"K": None}},
+                        {"cards": {"K": 5}}, {"cards": {"K": [{"text": 10_000_000}]}}):
+                spec.write_text(json.dumps(bad))
+                ok, fails, _ = check_publish_ready(  # must not raise
+                    vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+                assert ok, f"malformed spec {bad} should not FAIL, got {fails}"
+
+            # Regex: a trailing word must NOT become a magnitude multiplier.
+            assert _dollar_values("$500 MISTAKE") == {500}, _dollar_values("$500 MISTAKE")
+            assert _dollar_values("$700K") == {700_000}
+            assert _dollar_values("$10M+") == {10_000_000}
+            assert _dollar_values("$10 M") == {10_000_000}
+
+            # Title precedence: desc-pack youtube_title wins over packaging.
+            desc.write_text('---\nyoutube_title: "Clean Title No Dollars"\n---\nx\n')
+            spec.write_text(json.dumps({"cards": {f"{vid}_A": [{"text": "$10M"}]}}))
+            ok, fails, _ = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert ok, f"clean youtube_title → overlay $10M is not a restatement, got {fails}"
+            desc.write_text('---\nyoutube_title: "Ladder To $10M"\n---\nx\n')
+            ok, fails, _ = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert not ok and any("THUMBNAIL PAIRING" in f for f in fails), \
+                f"youtube_title $10M vs overlay $10M → FAIL, got {fails}"
+            desc.write_text("## Description\nx\n")  # restore no-frontmatter
+
+            # Newest packaging doc wins over the base (repackage-staleness fix).
+            pkg.write_text('## ⭐ Recommended package\n- **Title:** "Base No Dollars"\n')
+            pkg_v2 = pkg_dir / f"Packaging_{vid}_v2.md"
+            pkg_v2.write_text('## ⭐ Recommended package\n'
+                              '- **Title:** "V2 Ladder ($0–$10M)"\n'
+                              '## Alt\n- **Title:** "decoy $999"\n')
+            spec.write_text(json.dumps({"cards": {f"{vid}_A": [{"text": "$10M"}]}}))
+            ok, fails, _ = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert not ok and any("THUMBNAIL PAIRING" in f for f in fails), \
+                f"newest packaging (_v2, $10M) should catch overlay $10M, got {fails}"
+            pkg_v2.unlink()
+            pkg.write_text('## ⭐ Recommended package\n'
+                           '- **Title:** "POV: Your House ($0–$10M)"\n')
+
+            # Resolved thumb matching no card → warn (severity unattributable).
+            spec.write_text(json.dumps({"cards": {f"{vid}_Zzz": [{"text": "$999"}]}}))
+            ok, fails, warns = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert ok and any("unattributable" in w for w in warns), \
+                f"resolved-key mismatch should warn, got warns={warns}"
+
+            # Spec present but no title parseable → warn-only, still PASS.
+            spec.write_text(json.dumps({"cards": {f"{vid}_A": [{"text": "$10M"}]}}))
+            pkg.write_text("no title field here\n")
+            ok, fails, warns = check_publish_ready(
+                vlt, vid, video_file=mp4, desc_pack=desc, thumb=thumb, srt=None)
+            assert ok and any("locked title" in w for w in warns), \
+                f"expected no-title warn + PASS, got fails={fails} warns={warns}"
+            pkg.unlink()
+            spec.unlink()
+
             # Missing thumbnail → FAIL.
             ok, fails, _ = check_publish_ready(
                 vlt, vid, video_file=mp4, desc_pack=desc, thumb=None, srt=None)
@@ -383,6 +621,7 @@ def _selftest() -> int:
             assert not ok, "expected missing-mp4 fail"
         finally:
             MANIFEST_DIR = real_manifest_dir
+            THUMB_OVERLAY_DIR = real_thumb_overlay_dir
     print("selftest ok")
     return 0
 
