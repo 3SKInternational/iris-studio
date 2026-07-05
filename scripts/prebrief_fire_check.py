@@ -274,8 +274,9 @@ def collect_expected(now: datetime) -> list[Expected]:
 
     # === iris.py daemon (APScheduler) ===
     # MUST match iris.py MORNING_BRIEFING_HOUR (currently 8 — moved 06:00→08:00
-    # ET on 2026-06-16). A stale value here makes the check perpetually false-flag
-    # the brief as a skip (H1); keep this in sync if iris.py changes.
+    # ET on 2026-06-16). This is the ONLY scheduled writer of DAILY_BRIEFING.md;
+    # overnight rewrites (Claude Code sessions / manual /briefing) only ever make
+    # it fresher, and _check_morning_brief treats fresher-than-expected as OK.
     if (t := _last_fire_daily(now, MORNING_BRIEFING_HOUR, 0)):
         expected.append(Expected(
             "morning_briefing", t, "morning_brief",
@@ -334,15 +335,22 @@ def _check_db_backup_file(exp: Expected, now: datetime) -> tuple[bool, str]:
 
 
 def _check_morning_brief(exp: Expected, now: datetime) -> tuple[bool, str]:
+    # Freshness is DIRECTIONAL: a briefing NEWER than the expected 08:00 fire is
+    # never a skip. Overnight Claude Code sessions and manual /briefing regens
+    # legitimately rewrite DAILY_BRIEFING.md before 08:00 (e.g. 03:26), which
+    # only makes it MORE current — the old symmetric abs() window wrongly flagged
+    # those fresher files as anomalies EVERY such night (A-22 false-flag). Only a
+    # STALE file (older than expected minus grace) signals the brief silently
+    # didn't happen — the 2026-06-01 App Nap class this check exists for.
     if not DAILY_BRIEFING_PATH.exists():
         return False, f"DAILY_BRIEFING.md missing at {DAILY_BRIEFING_PATH}"
     mtime = datetime.fromtimestamp(DAILY_BRIEFING_PATH.stat().st_mtime)
-    delta = abs(mtime - exp.expected_at)
-    if delta <= ACCEPTABLE_LATENESS:
-        return True, f"DAILY_BRIEFING.md mtime {mtime:%H:%M}"
+    floor = exp.expected_at - ACCEPTABLE_LATENESS
+    if mtime >= floor:
+        return True, f"DAILY_BRIEFING.md mtime {mtime:%Y-%m-%d %H:%M} (fresh; ≥ {floor:%H:%M} floor)"
     return False, (
-        f"DAILY_BRIEFING.md mtime {mtime:%Y-%m-%d %H:%M} too far from expected "
-        f"{exp.expected_at:%Y-%m-%d %H:%M}"
+        f"DAILY_BRIEFING.md mtime {mtime:%Y-%m-%d %H:%M} is stale — older than "
+        f"expected fire {exp.expected_at:%Y-%m-%d %H:%M} minus grace — brief may have skipped"
     )
 
 
@@ -418,7 +426,59 @@ CHECKERS = {
 }
 
 
+def _selftest() -> int:
+    """Hermetic check of the directional morning-brief freshness rule (A-22 fix).
+    Sets DAILY_BRIEFING.md mtime to controlled values and asserts fresh≥floor is
+    OK while stale is an anomaly. No network/db; temp file only."""
+    import os
+    import tempfile
+
+    global DAILY_BRIEFING_PATH
+    real = DAILY_BRIEFING_PATH
+    now = datetime(2026, 7, 5, 5, 0, 0)  # a 05:00 pre-brief run
+    exp = Expected("morning_briefing", datetime(2026, 7, 4, 8, 0, 0), "morning_brief")
+    # floor = expected_at − 2h grace = 2026-07-04 06:00 (cases below straddle it)
+    fd, tmp = tempfile.mkstemp(suffix="_DAILY_BRIEFING.md")
+    os.close(fd)
+    try:
+        DAILY_BRIEFING_PATH = Path(tmp)
+        cases = [
+            # (label, mtime, expect_ok)
+            ("at-expected 08:01", datetime(2026, 7, 4, 8, 1), True),
+            ("overnight regen 03:26 (the false-flag case)", datetime(2026, 7, 5, 3, 26), True),
+            ("at floor 06:00", datetime(2026, 7, 4, 6, 0), True),
+            ("one sec below floor 05:59", datetime(2026, 7, 4, 5, 59), False),
+            ("two-days stale (real skip)", datetime(2026, 7, 3, 8, 1), False),
+        ]
+        failures = 0
+        for label, mtime, want in cases:
+            ts = mtime.timestamp()
+            os.utime(tmp, (ts, ts))
+            ok, msg = _check_morning_brief(exp, now)
+            status = "PASS" if ok == want else "FAIL"
+            if ok != want:
+                failures += 1
+            print(f"  [{status}] {label}: ok={ok} (want {want}) — {msg}")
+        # missing-file case
+        DAILY_BRIEFING_PATH = Path(tmp + ".nope")
+        ok, msg = _check_morning_brief(exp, now)
+        status = "PASS" if not ok else "FAIL"
+        if ok:
+            failures += 1
+        print(f"  [{status}] missing file: ok={ok} (want False) — {msg}")
+        print("SELFTEST OK" if failures == 0 else f"SELFTEST FAILED ({failures})")
+        return 1 if failures else 0
+    finally:
+        DAILY_BRIEFING_PATH = real
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def main(argv: list[str]) -> int:
+    if "--selftest" in argv:
+        return _selftest()
     now = datetime.now()
     # Allow callers to skip checking the pre-brief job itself (we ARE the
     # pre-brief — our log hasn't been written yet at run-time).
