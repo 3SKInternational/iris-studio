@@ -22,8 +22,10 @@ fabrication this tool exists to stop.
 Usage:
   vo_wordcount.py SCRIPT.md            # print per-scene table, total, runtime, spine
   vo_wordcount.py SCRIPT.md --check    # gate: exit 1 on any mismatch OR missing value
+  vo_wordcount.py SCRIPT.md --fix      # rewrite drifted values to the computed spine (in place)
   vo_wordcount.py --selftest           # hermetic self-check
 """
+import os
 import re
 import sys
 
@@ -154,6 +156,68 @@ def check(text: str):
     return bad
 
 
+def _sub_frontmatter(text: str, total: int, runtime: str) -> str:
+    """Rewrite word-count-vo-only / runtime-target inside the frontmatter block
+    only (present keys, values only) — never touches the body or adds keys."""
+    m = re.match(r'^(---\s*\n)(.*?)(\n---\s*(?:\n|$))', text, re.S)
+    if not m:
+        return text
+    head, body, tail = m.group(1), m.group(2), m.group(3)
+    body = re.sub(r'(?m)^(word-count-vo-only:\s*)\d+',
+                  lambda mm: mm.group(1) + str(total), body)
+    body = re.sub(r'(?m)^(runtime-target:\s*"?)\d+:\d+',
+                  lambda mm: mm.group(1) + runtime, body)
+    return head + body + tail + text[m.end():]
+
+
+def fix(text: str):
+    """Rewrite the drift-prone values (frontmatter total/runtime, scene header
+    spans, Timestamps chapter marks) to the computed spine. Deterministic and
+    idempotent. NEVER fabricates missing structure (a missing Timestamps section,
+    a missing frontmatter key, a scene with no span, or a chapter-count/scene-count
+    mismatch is left for a human). Returns (new_text, residual_mismatches)."""
+    counts = scene_counts(text)
+    if not counts:
+        return text, check(text)
+    wpm = parse_rate(text)
+    rows, total, runtime = derive(counts, wpm)
+    derived = {n: (s, e) for n, w, s, e in rows}
+    starts = [s for _, _, s, _ in rows]
+
+    text = _sub_frontmatter(text, total, runtime)
+    trailing_nl = text.endswith("\n")
+    lines = text.splitlines()
+
+    # scene header spans — swap only the two time tokens; preserve the author's
+    # separator (en/em-dash vs hyphen — all equivalent to check()) and any title,
+    # so a correct header is never cosmetically churned.
+    for i, ln in enumerate(lines):
+        mh = SCENE_HDR_TS_RE.match(ln)
+        if mh and int(mh.group(1)) in derived:
+            s, e = derived[int(mh.group(1))]
+            lines[i] = re.sub(
+                r'\[(\s*)\d+:\d+(\s*[–—-]\s*)\d+:\d+(\s*)\]',
+                lambda m: f'[{m.group(1)}{s}{m.group(2)}{e}{m.group(3)}]', ln, count=1)
+
+    # Timestamps chapter marks — only the FIRST Timestamps section (mirror check(),
+    # which validates only the first), and only if the count already matches so a
+    # stale duplicate section is never churned.
+    in_ts, seen_ts, chap_idx = False, False, []
+    for i, ln in enumerate(lines):
+        if re.match(r'^##\s', ln):  # any h2 heading opens the first Timestamps / closes any section
+            in_ts = re.match(r'^##\s*Timestamps\b', ln, re.I) is not None and not seen_ts
+            seen_ts = seen_ts or in_ts
+            continue
+        if in_ts and CHAPTER_RE.match(ln):
+            chap_idx.append(i)
+    if len(chap_idx) == len(starts):
+        for k, i in enumerate(chap_idx):
+            lines[i] = re.sub(r'\d+:\d+', starts[k], lines[i], count=1)
+
+    new_text = "\n".join(lines) + ("\n" if trailing_nl else "")
+    return new_text, check(new_text)
+
+
 def _selftest():
     sample = (
         '---\nrate-wpm: 180\nword-count-vo-only: 12\nruntime-target: "0:04"\n---\n'
@@ -202,12 +266,46 @@ def _selftest():
     assert main(['prog', '--bogus']) == 2
     assert main(['prog', 'x', '--chek']) == 2
 
+    # --fix repairs span + chapter drift to the computed spine, and is idempotent
+    drifted = sample.replace('0:02 second', '0:03 second').replace('[0:02-0:04]', '[0:02-0:05]')
+    assert check(drifted), "sanity: drifted sample should fail check"
+    fixed, residual = fix(drifted)
+    assert residual == [], residual
+    assert check(fixed) == [], check(fixed)
+    assert fix(fixed)[0] == fixed, "fix must be idempotent"
+
+    # --fix repairs frontmatter total/runtime drift, in the frontmatter only
+    fm_drift = sample.replace('word-count-vo-only: 12', 'word-count-vo-only: 11') \
+                     .replace('runtime-target: "0:04"', 'runtime-target: "0:05"')
+    ff, r3 = fix(fm_drift)
+    assert r3 == [] and check(ff) == [], (r3, check(ff))
+    assert 'word-count-vo-only: 12' in ff and 'runtime-target: "0:04"' in ff
+
+    # --fix never fabricates missing structure — leaves it as residual for a human
+    noheader = re.sub(r'## Timestamps.*', '', sample, flags=re.S)
+    _, r4 = fix(noheader)
+    assert any('Timestamps' in b for b in r4), r4
+
+    # --fix preserves the author's span separator (en-dash) — no cosmetic churn
+    endash = sample.replace('[0:00-0:02]', '[0:00–0:02]').replace('[0:02-0:04]', '[0:02–0:04]')
+    assert check(endash) == [], check(endash)      # en-dash spans are valid to check()
+    assert fix(endash)[0] == endash, "fix must not rewrite a correct en-dash span"
+
+    # duplicate Timestamps sections: fix() touches only the FIRST (mirror check),
+    # never churns a stale duplicate, and still surfaces the count residual.
+    dup = (sample.replace('0:00 cold open\n0:02 second\n', '0:00 cold open\n')
+                 + '## Timestamps\n0:07 stale duplicate\n')
+    assert any('chapter-list count' in b for b in check(dup)), check(dup)
+    dfixed, dres = fix(dup)
+    assert '0:07 stale duplicate' in dfixed, "must not rewrite a stale duplicate mark"
+    assert any('chapter-list count' in b for b in dres), dres
+
     print("selftest OK")
 
 
 def main(argv):
     flags = [a for a in argv[1:] if a.startswith('--')]
-    unknown = [f for f in flags if f not in ('--check', '--selftest')]
+    unknown = [f for f in flags if f not in ('--check', '--fix', '--selftest')]
     if unknown:
         print(f"unknown flag(s): {' '.join(unknown)}", file=sys.stderr)
         return 2
@@ -231,6 +329,26 @@ def main(argv):
                 print("  -", b)
             return 1
         print("OK: counts + timestamp spine consistent")
+        return 0
+    if '--fix' in flags:
+        new_text, residual = fix(text)
+        if new_text != text:
+            bak = args[0] + '.bak-pre-vofix'
+            with open(bak, 'w', encoding='utf-8') as f:
+                f.write(text)
+            tmp = args[0] + '.tmp-vofix'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(new_text)
+            os.replace(tmp, args[0])  # atomic
+            print(f"FIXED {args[0]} (backup: {bak})")
+        else:
+            print("no drift to fix")
+        if residual:
+            print("RESIDUAL (needs a human — not auto-fixable):")
+            for b in residual:
+                print("  -", b)
+            return 1
+        print("OK: spine now consistent")
         return 0
     print(report(text))
     return 0
