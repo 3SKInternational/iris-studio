@@ -779,13 +779,125 @@ def _resolve_image(asset_dir: Path, images_rel: str, vid: str,
     unless a fallback was used.
     """
     primary = f"{images_rel}/{vid}_Shot_{sid}.png"
-    if (asset_dir / primary).is_file():
+    # Prefer a card_overlay-composited `_text` sibling when present — that is the
+    # FINISHED frame (a blank data pill/card with its crisp figure burned in). The
+    # blank-pill guard (enforce_pill_overlays) burns these right before assembly,
+    # and the thumbnail/CTA card burns write the same `_text` convention. Guard
+    # against a STALE `_text`: if the base backplate was re-rendered AFTER the burn
+    # (`_text` older than its `.png`), fall back to the base so a leftover stale
+    # composite can't silently ship the old frame — mirrors enforce_pill_overlays'
+    # own freshness check, but for every shot, not only detected pills.
+    burned = f"{images_rel}/{vid}_Shot_{sid}_text.png"
+    bpath, ppath = asset_dir / burned, asset_dir / primary
+    if bpath.is_file() and (not ppath.is_file()
+                            or bpath.stat().st_mtime >= ppath.stat().st_mtime):
+        return burned, None
+    if ppath.is_file():
         return primary, None
     if allow_fallback:
         north_star = f"Raw_Assets/{vid}/{vid}_Scene_{scene:02d}.png"
         if (asset_dir / north_star).is_file():
             return north_star, f"{vid}_Shot_{sid} absent from {images_rel} -> north-star {vid}_Scene_{scene:02d}.png"
     return primary, None
+
+
+# --- blank data-pill guard -------------------------------------------------
+# A "blank data pill" shot is a CHARACTER shot whose prompt deliberately leaves
+# the on-screen data pill EMPTY ("blank ... no readable text or digits") so a
+# crisp figure can be composited later by card_overlay.py — the model renders
+# garbled digits, PIL burns clean ones. V9 (2026-07-06) shipped a draft with two
+# blank pills ($10,200 / $844,000) because that composite step was flagged by the
+# image-reviewer but never run before --assemble, and nothing enforced it.
+#
+# Convention (authors: scene-image-prompt-generator agent def + the packaging
+# canon): a blank-pill shot's prompt says the data pill is "blank" AND every
+# blank pill MUST have a card entry in
+#   Raw_Assets/Image_Factory/manifests/video_<NN>_pill_overlay.json
+# The figure is then burned to a `<name>_text.png` sibling (which _resolve_image
+# prefers over the blank `<name>.png`). enforce_pill_overlays runs that burn
+# automatically at --assemble and makes a missing spec/coverage FATAL, so a blank
+# pill can never reach the cut without its figure.
+def blank_pill_shots(shots: list[dict]) -> list[dict]:
+    """Shots whose prompt declares a BLANK data pill needing a composited figure.
+
+    Deterministic phrase match: the prompt mentions a 'data pill' AND calls it
+    'blank'. Data CARDS ('a clean flat 2D card ...', which bake their own text and
+    contain no 'pill') are intentionally NOT flagged."""
+    out = []
+    for s in shots:
+        p = s["prompt"].lower()
+        if "data pill" in p and "blank" in p:
+            out.append(s)
+    return out
+
+
+def _pil_python() -> str:
+    """A Pillow-capable interpreter (card_overlay needs PIL). build_video may run
+    under a python without Pillow, so prefer the repo .venv like the contact-sheet
+    stage does; fall back to the current interpreter."""
+    venv = REPO / ".venv" / "bin" / "python"
+    return str(venv) if venv.exists() else sys.executable
+
+
+def enforce_pill_overlays(shots: list[dict], vid: str, nn: str, vlt: Path,
+                          images_rel: str) -> None:
+    """Assembly preflight — no blank data pill reaches the cut without its figure.
+
+    For every blank-pill shot (blank_pill_shots): require a covering card entry in
+    `video_<NN>_pill_overlay.json`, then ensure a fresh burned `<name>_text.png`
+    exists in the image set. Missing/stale burns are (re)composited automatically
+    via card_overlay (the same auto-run pattern as the thumbnail title burn);
+    a missing spec or an uncovered pill is FATAL. Idempotent: a `_text` that is
+    already newer than its backplate is left untouched (so V9's in-place-burned
+    pills are never double-burned), and a re-rendered blank backplate makes its
+    stale `_text` re-burn (auto-heal)."""
+    blanks = blank_pill_shots(shots)
+    if not blanks:
+        return
+    names = [f"{vid}_Shot_{s['id']}" for s in blanks]
+    spec = (vlt / "Raw_Assets" / "Image_Factory" / "manifests"
+            / f"video_{nn}_pill_overlay.json")
+    if not spec.is_file():
+        die(f"blank data-pill shot(s) {names} need composited figures but no overlay "
+            f"spec exists at {spec}. Author it — one card entry per blank pill, e.g. "
+            f'{{"cards": {{"{names[0]}": [{{"text": "$10,200", "x": 0.5, "y": 0.5, '
+            f'"size": 76}}]}}}} — then it is burned automatically at --assemble. Run '
+            f"card_overlay.py first.")
+    try:
+        data = json.loads(spec.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"pill overlay spec is not valid JSON ({spec}): {e}")
+    if not isinstance(data, dict):
+        die(f"pill overlay spec must be a JSON object with a 'cards' map ({spec}).")
+    cards = data.get("cards", {})
+    uncovered = [n for n in names if n not in cards]
+    if uncovered:
+        die(f"blank pill(s) {uncovered} have no burned figure — add a card entry for "
+            f"each to {spec.name} (the figure text + x/y), then run card_overlay.py "
+            f"first. Assembly is blocked until every blank pill is covered.")
+    img_dir = vlt / images_rel
+    stale = []
+    for n in names:
+        base = img_dir / f"{n}.png"
+        text = img_dir / f"{n}_text.png"
+        if not text.is_file():
+            stale.append(n)
+        elif base.is_file() and text.stat().st_mtime < base.stat().st_mtime:
+            stale.append(n)  # backplate re-rendered after the burn -> figure is stale
+    if stale:
+        cmd = [_pil_python(), str(REPO / "image_factory" / "card_overlay.py"),
+               str(spec), "--base-dir", str(img_dir), "--out-dir", str(img_dir)]
+        for n in stale:
+            cmd += ["--only", n]
+        if run(cmd, label="STAGE pill figures (free)"):
+            die("card_overlay failed to burn the blank-pill figures (see output "
+                "above) — refusing to assemble a video with blank data pills.")
+        ungenerated = [n for n in stale if not (img_dir / f"{n}_text.png").is_file()]
+        if ungenerated:
+            die(f"pill burn exited 0 but produced no composited frame for {ungenerated} "
+                f"in {img_dir} — check the overlay spec's card names/base_dir.")
+    print(f"pill figures: {len(names)} blank pill(s) covered + burned "
+          f"({'re-burned ' + str(len(stale)) if stale else 'all fresh'}).")
 
 
 def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict[int, dict],
@@ -1267,6 +1379,11 @@ def main() -> None:
             if want and _missing("vo", want):
                 rc |= 1
     if do_assemble:
+        # Hard guard: a blank data pill can never assemble without its figure. Runs
+        # BEFORE the re-author below so the burned `<name>_text.png` siblings exist
+        # when _resolve_image picks each shot's frame. Fatal on a missing/uncovered
+        # overlay spec (the exact V9 2026-07-06 miss).
+        enforce_pill_overlays(shots, vid, nn, vlt, images_rel)
         # Re-author the edit manifest now that VO clips should exist (exact
         # durations). With --align this is where local forced alignment runs, so
         # the cut times use real spoken-word boundaries instead of the estimate.

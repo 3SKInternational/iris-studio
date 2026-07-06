@@ -252,5 +252,195 @@ class TestBuildVideoArtifactVerify(unittest.TestCase):
                 os.environ.pop("SK_VAULT", None)
 
 
+class TestBlankPillDetection(unittest.TestCase):
+    """The deterministic detector that decides which shots need a composited
+    figure. A 'blank data pill' character shot must be flagged; a data CARD that
+    bakes its own text must NOT (it contains no 'pill')."""
+
+    def test_detects_blank_pill_and_ignores_data_card(self):
+        bv = _load_build_video()
+        shots = [
+            {"id": "05b", "prompt": "Three pointing to a flat data pill that is "
+             "blank with no readable text or digits, quiet smile."},
+            {"id": "05c", "prompt": "No character. A clean flat 2D card headed "
+             "LEVEL 1, rows NET WORTH $10,200, gold accent on the total."},
+            {"id": "10b", "prompt": "Three beside a flat blank data pill displayed "
+             "prominently, satisfied expression."},
+            {"id": "01a", "prompt": "Three at a desk reviewing a ledger, warm light."},
+        ]
+        got = [s["id"] for s in bv.blank_pill_shots(shots)]
+        self.assertEqual(got, ["05b", "10b"])
+
+
+class TestBlankPillGuard(unittest.TestCase):
+    """The headline invariant: a blank data pill can NEVER assemble without its
+    burned figure. A blank-pill shot with no covering overlay spec must abort
+    --assemble; with the spec present AND a fresh burned `_text` sibling it must
+    proceed. Exercised through build_video.main() with the gen/assemble
+    subprocesses stubbed, so it is hermetic (no ffmpeg, no PIL, no billed call)."""
+
+    def _vault(self, td: Path, *, image_set: str = "Raw_Assets/Video_98_HD"):
+        (td / "Scene_Image_Prompts").mkdir(parents=True)
+        (td / "Voice_Files" / "Video_98").mkdir(parents=True)
+        (td / "Scene_Image_Prompts" / "Video_98_Shot_List.md").write_text(
+            textwrap.dedent(
+                """\
+                # Video_98 Shot List
+
+                ## Scene 5
+
+                ### Shot 5b — blank pill
+                ```text
+                Three pointing to a flat data pill that is blank with no readable
+                text or digits, quiet smile, gold arrow accent on the pill.
+                ```
+                """
+            ),
+            encoding="utf-8",
+        )
+        (td / "Voice_Files" / "Video_98" / "_VO_Session_B_Kit.md").write_text(
+            textwrap.dedent(
+                """\
+                # Video_98 VO Kit
+
+                ## Scene 5 -> `Video_98_VO_Scene_05.mp3` (level one)
+
+                Your net worth crosses ten thousand two hundred dollars.
+
+                ---
+                """
+            ),
+            encoding="utf-8",
+        )
+        img_dir = td / image_set
+        img_dir.mkdir(parents=True)
+        (img_dir / "Video_98_Shot_05b.png").write_bytes(b"\x89PNG\r\n\x1a\n")  # blank backplate
+        return img_dir
+
+    def _spec_path(self, td: Path) -> Path:
+        d = td / "Raw_Assets" / "Image_Factory" / "manifests"
+        d.mkdir(parents=True)
+        return d / "video_98_pill_overlay.json"
+
+    def _run_assemble(self, td: Path, *, stub_burn, use_image_set=True):
+        """Drive `build_video Video_98 --assemble [--image-set ...]` with run() and
+        write_json() stubbed. `stub_burn` receives the card_overlay argv and may
+        create the `_text` sibling to simulate a successful burn. use_image_set
+        False exercises the DEFAULT `_gen` flow (assets under Raw_Assets/Video_98_gen)."""
+        bv = _load_build_video()
+        orig_run, orig_write = bv.run, bv.write_json
+
+        def fake_run(cmd, *, label):
+            if "card_overlay.py" in " ".join(cmd):
+                return stub_burn(cmd)
+            return 0  # image/vo/assemble subprocesses "succeed"
+
+        bv.run = fake_run
+        bv.write_json = lambda *a, **k: None
+        # Make the post-assemble artifact check pass so a proceed reaches the end
+        # instead of failing on a missing mp4.
+        (td / "Footage_and_Edits").mkdir(parents=True, exist_ok=True)
+        (td / "Footage_and_Edits" / "Video_98_v2.mp4").write_bytes(b"\x00")
+        argv = sys.argv
+        sys.argv = ["build_video.py", "Video_98", "--assemble", "--no-cta"]
+        if use_image_set:
+            sys.argv += ["--image-set", "Raw_Assets/Video_98_HD"]
+        os.environ["SK_VAULT"] = str(td)
+        try:
+            buf = io.StringIO()
+            exc = None
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    bv.main()
+                except SystemExit as e:
+                    exc = e
+            return exc, buf.getvalue()
+        finally:
+            bv.run, bv.write_json = orig_run, orig_write
+            sys.argv = argv
+            os.environ.pop("SK_VAULT", None)
+
+    def test_blank_pill_no_spec_aborts(self):
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td)  # blank-pill shot present, but NO overlay spec
+            exc, out = self._run_assemble(
+                td, stub_burn=lambda cmd: 0)
+            self.assertIsNotNone(exc, f"expected SystemExit; out={out}")
+            self.assertNotIn(exc.code, (0, None))
+            self.assertIn("no overlay spec", out)
+
+    def test_blank_pill_spec_uncovered_aborts(self):
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td)
+            # Spec exists but covers the WRONG card -> the blank pill is uncovered.
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_98_Shot_99z": [{"text": "$0", "x": 0.5, '
+                '"y": 0.5, "size": 60}]}}',
+                encoding="utf-8")
+            exc, out = self._run_assemble(td, stub_burn=lambda cmd: 0)
+            self.assertIsNotNone(exc, f"expected SystemExit; out={out}")
+            self.assertNotIn(exc.code, (0, None))
+            self.assertIn("no burned figure", out)
+
+    def test_blank_pill_spec_present_burns_and_proceeds(self):
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            img_dir = self._vault(td)
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_98_Shot_05b": [{"text": "$10,200", "x": 0.5, '
+                '"y": 0.5, "size": 60}]}}',
+                encoding="utf-8")
+
+            def stub_burn(cmd):
+                # Simulate card_overlay writing the burned _text sibling.
+                (img_dir / "Video_98_Shot_05b_text.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                return 0
+
+            exc, out = self._run_assemble(td, stub_burn=stub_burn)
+            self.assertIsNone(exc, f"unexpected abort; out={out}")
+            self.assertTrue((img_dir / "Video_98_Shot_05b_text.png").is_file())
+            self.assertIn("blank pill(s) covered + burned", out)
+
+    def test_blank_pill_default_gen_flow_burns_and_proceeds(self):
+        # The DEFAULT flow (no --image-set) reads Raw_Assets/Video_98_gen. The guard
+        # must fire there too — the reviewer noted the other cases only cover
+        # --image-set. Put the blank backplate in the _gen dir and confirm the burn
+        # lands there (where the assembler reads) and assembly proceeds.
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td, image_set="Raw_Assets/Video_98_gen")
+            gen = td / "Raw_Assets" / "Video_98_gen"
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_98_Shot_05b": [{"text": "$10,200", "x": 0.5, '
+                '"y": 0.5, "size": 60}]}}',
+                encoding="utf-8")
+
+            def stub_burn(cmd):
+                # burn dir == the assembler's _gen dir (resolved; /var -> /private/var)
+                self.assertIn(str(gen.resolve()), cmd)
+                (gen / "Video_98_Shot_05b_text.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                return 0
+
+            exc, out = self._run_assemble(td, stub_burn=stub_burn, use_image_set=False)
+            self.assertIsNone(exc, f"unexpected abort; out={out}")
+            self.assertTrue((gen / "Video_98_Shot_05b_text.png").is_file())
+
+    def test_blank_pill_burn_failure_aborts(self):
+        # Spec covers the pill, but card_overlay itself fails -> must not assemble.
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td)
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_98_Shot_05b": [{"text": "$10,200", "x": 0.5, '
+                '"y": 0.5, "size": 60}]}}',
+                encoding="utf-8")
+            exc, out = self._run_assemble(td, stub_burn=lambda cmd: 1)  # burn fails
+            self.assertIsNotNone(exc, f"expected SystemExit; out={out}")
+            self.assertNotIn(exc.code, (0, None))
+            self.assertIn("card_overlay failed", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
