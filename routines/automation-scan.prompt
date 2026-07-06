@@ -25,6 +25,7 @@ Perform these four passes:
    - Iris-stack drift: duplicate scripts, routines firing but invisible to Steve, files growing unbounded, manual steps Steve takes between Iris-runs
    - New tech additions that could be auto-monitored or auto-maintained
    - Cowork pitches in Claude Code's lane (per the Pitch_Log read above)
+   - **Bridge "pipeline gaps to harden" / "flagged, not fixed" sections** — production-marathon bridge entries routinely end with an explicit list of gaps the session hit but deliberately deferred (e.g. "Pipeline gaps to harden (flagged, not fixed): (a)… (b)…"). These are pre-triaged, engineer-authored automation candidates in exactly Claude Code's lane — the single richest new-candidate vein (added 2026-07-06 12th scan: 3 of the 3 new candidates that run came from here). Grep the last 7 bridge entries for "gaps to harden" / "flagged, not fixed" / "harden (flagged" and turn each open gap into a candidate row (after the standard verify-not-already-shipped grep).
 
    Add each as a new candidate row in `Automation_Backlog.md` with: manual-today, proposed automation, saves, effort, dependencies, priority tag.
 
