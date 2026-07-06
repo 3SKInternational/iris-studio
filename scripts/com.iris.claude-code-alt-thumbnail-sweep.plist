@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-alt-thumbnail-sweep</string>
+	<!-- Alternate-thumbnail auto-send sweep (go-live-aware, idempotent).
+	     Runs scripts/sweep_alt_thumbnails.py HOURLY. For every video with an upload
+	     receipt it does a cheap videos.list(status) (~1 unit): if the receipt already
+	     has alt_thumbs_sent it SKIPS; if the video is public and has B/reserve
+	     thumbnails on disk that were not yet sent, it Telegram-pushes each via
+	     notify.sh --photo and stamps alt_thumbs_sent; a still-private/scheduled video
+	     is a no-op left for a later pass.
+
+	     Why HOURLY (matches comment-sweep): videos publish on a SCHEDULE, so the
+	     alternates can't be pushed when publish_video.py *schedules* the release —
+	     only once YouTube flips the video public. Hourly catches each video within
+	     ~1h of go-live so Steve can A/B test early via YouTube "Test & Compare", then
+	     skips it forever (idempotent). "Public" is read from the LIVE API status, not
+	     the clock, so a manual publish or delayed rollout is handled correctly.
+
+	     Routed through run_job.sh: sweep_alt_thumbnails.py exits 1 only on a real
+	     per-video API error — that becomes a 🔴 Telegram alert + retry marker.
+	     pre-go-live / no-alts / transient exit 0 (benign, no alert). JOB_QUIET_OK=1
+	     suppresses the routine ✅ so the hourly steady-state stays silent; the sweep
+	     itself pushes the actual thumbnail photos on a send.
+
+	     Interpreter: the repo .venv python3 (NOT system) — imports
+	     google-api-python-client / google-auth. OAuth token read from
+	     REPO_ROOT/youtube_token.json (gitignored, 0600), resolved from module path;
+	     cwd irrelevant, WorkingDirectory set for parity. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
+		<string>alt-thumbnail-sweep</string>
+		<string>/Volumes/AI_Workspace/iris_studio/.venv/bin/python3</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/sweep_alt_thumbnails.py</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Volumes/AI_Workspace/iris_studio</string>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Silence the routine hourly ✅; failures (exit 1) still alert via run_job.
+		     A real send still pushes the thumbnail photos to Steve directly. -->
+		<key>JOB_QUIET_OK</key>
+		<string>1</string>
+	</dict>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-alt-thumbnail-sweep.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-alt-thumbnail-sweep.stdout.log</string>
+	<!-- Hourly — catch each scheduled video within ~1h of go-live. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<!-- Parity with the suite: google-api client + fd use can exceed launchd's
+	     default soft RLIMIT_NOFILE of 256. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+</dict>
+</plist>
