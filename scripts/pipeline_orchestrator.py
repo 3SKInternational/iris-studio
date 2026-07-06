@@ -1196,6 +1196,33 @@ def run_script_review_loop(video: int) -> tuple[str, str, str]:
     return verdict, vrel, detail
 
 
+def run_script_wordcount_check(video: int) -> tuple[str, str]:
+    """Deterministic front-gate for stage-2: verify the script's VO word counts +
+    timestamp spine are internally consistent (scripts/vo_wordcount.py --check)
+    BEFORE spending the LLM script review. This is the fix for the class of defect
+    that bounced the V10 script gate three times — a fabricated/stale word count or
+    a timestamp that doesn't match the VO. Returns ('pass'|'mismatch'|'error', detail):
+      - 'mismatch' → the numbers lie; block the gate ($0, deterministic, exact cells).
+      - 'error'    → the tool or script itself could not be checked; degrade GRACEFULLY
+                     to the LLM review (which still backstops count errors, as it did
+                     before this check existed) rather than block the pipeline on a tool
+                     hiccup. NOT a silent quality pass — the LLM gate still runs."""
+    tool = Path(__file__).resolve().parent / "vo_wordcount.py"
+    script_abs = vault_abs(f"{VAULT_REL}/Scripts/Video_{nn(video)}_Script.md")
+    if not tool.exists() or script_abs is None or not script_abs.exists():
+        return "error", f"skipped (missing: tool={tool.exists()} script={script_abs})"
+    try:
+        proc = subprocess.run([sys.executable, str(tool), str(script_abs), "--check"],
+                              capture_output=True, text=True, timeout=60)
+    except (subprocess.SubprocessError, OSError) as e:
+        return "error", f"could not run: {e}"
+    if proc.returncode == 0:
+        return "pass", (proc.stdout or "").strip()
+    if proc.returncode == 1:
+        return "mismatch", (proc.stdout or "").strip()
+    return "error", f"exit {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[:300]}"
+
+
 def run_script_review_gate(video: int) -> tuple[bool, str]:
     """Stage-2 executor under the BINARY policy: run the review→fix→re-review loop
     and advance ONLY on a clean SHIP. UNAVAILABLE (the reviewer could not RUN —
@@ -1206,6 +1233,20 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
     never advances; Steve can --force if he must. REVISE (or any non-SHIP
     surviving the fix budget) parks: returns False so the stage goes needs-steve.
     Returns the (ok, out) the dispatcher expects."""
+    wc_state, wc_detail = run_script_wordcount_check(video)
+    if wc_state == "mismatch":
+        return False, ("script word-count / timestamp spine is inconsistent "
+                       "(deterministic vo_wordcount.py --check) — refusing to advance. "
+                       "Correct the frontmatter word-count-vo-only/runtime-target, the "
+                       "per-scene [mm:ss-mm:ss] headers, and the Timestamps chapter list, "
+                       f"then re-run /pipeline {video}.\n{wc_detail}")
+    if wc_state == "error":
+        # force=True: the hourly --advance-all sweep sets SUPPRESS_NOTIFY, so a
+        # broken front-gate would degrade invisibly without it. A genuinely broken
+        # deterministic gate warrants the ping (bounded to only-while-broken).
+        notify(f"⚠️ Video {video}: vo_wordcount pre-check could not run ({wc_detail}); "
+               f"falling through to LLM script review (count still backstopped there).",
+               force=True)
     verdict, vrel, detail = run_script_review_loop(video)
     if verdict == "SHIP":
         return True, f"script-reviewer SHIP ({vrel}). {detail}"
