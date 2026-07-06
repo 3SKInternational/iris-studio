@@ -3,9 +3,19 @@
 
 For a given Video NN, reads per-video state, runs the SINGLE next ready
 non-gate stage, updates state, emits one Telegram line, and STOPS at the next
-human/billed gate. It sequences the 11 already-built stages. It is a
+human/billed gate. It sequences the already-built stages. It is a
 sequencer, NOT a swarm: no agent-to-agent messaging, no autonomous spend, no
 autonomous publish, no autonomous VO.
+
+The 12_leadmagnet phase (added 2026-07-06) drafts the video's free lead-magnet
+companion (lead-magnet-writer) and clears it through its BINARY reviewer gate
+(lead-magnet-reviewer) as an ordinary $0 orchestrator-owned agent stage — the
+same produce→review→fix→re-review→advance-on-SHIP framework as 7_packaging. Only
+the DRAFT+review is automatable: the downstream PDF render → Drive host →
+[LEAD_MAGNET_URL] fill stays manual/out-of-pipeline, so 12_leadmagnet is
+deliberately NOT a dep of 10_publish and a REVISE-park on the magnet never wedges
+publish. Only videos --init'd AFTER 2026-07-06 carry the stage; legacy state
+files (V1-V9) predate it and are tolerated-as-absent, never retro-added.
 
 The no-autonomous-action invariant is STRUCTURAL (not configured): the stage
 selector draws ONLY from {ready AND gate==false AND owner==orchestrator AND in
@@ -128,6 +138,7 @@ RUN_TABLE: dict[str, dict] = {
     "5_images":      {"kind": "billed", "agent": None,                       "timeout": 3600},
     "6_assemble":    {"kind": "script", "agent": None,                       "timeout": 1800},
     "7_packaging":   {"kind": "agent",  "agent": "packaging-strategist",     "timeout": 480},
+    "12_leadmagnet": {"kind": "agent",  "agent": "lead-magnet-writer",       "timeout": 900},
     "8_thumbnail":   {"kind": "script", "agent": None,                       "timeout": 600},
     "9_description": {"kind": "agent",  "agent": "video-description-writer",  "timeout": 600},
     "11_analyze":    {"kind": "agent",  "agent": "channel-analyst",          "timeout": 720},
@@ -157,15 +168,21 @@ GATE_ARTIFACTS: dict[str, dict] = {
 STAGE_LABEL = {
     "1_script": "script", "2_review": "review", "3_vo_expand": "vo-expand",
     "4_vo_record": "vo-record", "5_images": "images", "6_assemble": "assemble",
-    "7_packaging": "packaging", "8_thumbnail": "thumbnail", "9_description": "description",
+    "7_packaging": "packaging", "12_leadmagnet": "lead-magnet",
+    "8_thumbnail": "thumbnail", "9_description": "description",
     "10_publish": "publish", "11_analyze": "analyze",
 }
 
 STAGE_ORDER = [
     "1_script", "2_review", "3_vo_expand", "4_vo_record", "5_images",
-    "6_assemble", "7_packaging", "8_thumbnail", "9_description",
+    "6_assemble", "7_packaging", "12_leadmagnet", "8_thumbnail", "9_description",
     "10_publish", "11_analyze",
 ]
+# NOTE on the "12_" key wedged between 7 and 8: the numeric prefix is a COSMETIC
+# label only — nothing in the orchestrator sorts stages by it (every ordering is
+# driven by this explicit list + each stage's `deps`). 12 was chosen because 8-11
+# were already taken; its physical slot here (right after packaging) is what sets
+# its lowest-first selection order. See default_stages()["12_leadmagnet"].
 
 
 # === Small helpers =========================================================
@@ -331,6 +348,18 @@ def default_stages() -> dict:
         "5_images":      _stage("steve",        True,  ["2_review"]),
         "6_assemble":    _stage("orchestrator", False, ["4_vo_record", "5_images"]),
         "7_packaging":   _stage("orchestrator", False, ["2_review"]),
+        # Lead-magnet DRAFT + its binary reviewer gate — an orchestrator-owned $0
+        # agent stage (auto-runs via --advance, mirrors 7_packaging). Deps: the
+        # script's number-spine (2_review = the reviewed script) AND the packaging's
+        # declared magnet name/archetype (7_packaging). It is deliberately NOT a dep
+        # of 10_publish: only the DRAFT+review is automatable here — the downstream
+        # PDF render → Drive host → [LEAD_MAGNET_URL] fill stays manual/out-of-pipeline
+        # (Drive hosting isn't automatable in-pipeline). So a REVISE-park on the magnet
+        # must never wedge publish. Only videos --init'd AFTER 2026-07-06 carry this
+        # stage; legacy in-flight state files (V1-V9) predate it, already have magnets,
+        # and are NOT retro-added — the STAGE_ORDER loops tolerate its absence (see
+        # effective_status / select_next / cmd_status).
+        "12_leadmagnet": _stage("orchestrator", False, ["2_review", "7_packaging"]),
         # Thumbnail ART renders in the stage-5 billed batch (Video_NN_Thumbnail_A/_B
         # entries in video_NN_hd.json, already cleared by the stage-5 RENDERS gate);
         # this stage is the $0 deterministic title-text burn (card_overlay.py). Needs
@@ -380,8 +409,14 @@ def cmd_init(video: int, title: str | None, force: bool) -> int:
 # === Resolver ==============================================================
 
 def effective_status(key: str, stages: dict) -> str:
-    """done (terminal) | running (preserved) | needs-steve (advisory) | ready | blocked."""
-    s = stages[key]
+    """done (terminal) | running (preserved) | needs-steve (advisory) | ready | blocked.
+
+    A key absent from `stages` (a legacy state file predating a later-added stage,
+    e.g. 12_leadmagnet on V1-V9) reads as 'blocked' — never ready, never selected,
+    never counted as done — so the stage is inert on files that predate it."""
+    s = stages.get(key)
+    if s is None:
+        return "blocked"
     stored = s.get("status")
     if stored == "done":
         return "done"
@@ -540,7 +575,9 @@ def select_next(stages: dict) -> str | None:
     stage that is ready AND gate==false AND owner==orchestrator AND in RUN_TABLE.
     Billed/human gates are never members of this set."""
     for key in STAGE_ORDER:
-        s = stages[key]
+        s = stages.get(key)
+        if s is None:  # legacy state file predating this stage — absent, skip
+            continue
         if (effective_status(key, stages) == "ready"
                 and not s.get("gate")
                 and s.get("owner") == "orchestrator"
@@ -687,6 +724,13 @@ def _stage_prompt(key: str, video: int) -> str:
         "7_packaging": f"Build the packaging for {v}: 8-10 titles, 2 cold-open hooks, 3 thumbnail "
                        f"text overlays + CTR rationale, from the script's Thumbnail Concept. "
                        f"Write to BRANDS/3SK_Finance/Packaging/.",
+        "12_leadmagnet": f"Draft the free lead-magnet companion for {v} from its script "
+                         f"(BRANDS/3SK_Finance/Scripts/{v}_Script.md) + packaging "
+                         f"(BRANDS/3SK_Finance/Packaging/), per the lead-magnet-writer "
+                         f"instructions: RECONCILE to the outro/Scene-18 VO's verbatim magnet "
+                         f"promise, trace every dollar figure VERBATIM to the script's "
+                         f"number-spine (never invent), NO affiliate links. Write the DRAFT to "
+                         f"BRANDS/3SK_Finance/Lead_Magnets/{v}_<Magnet_Name>_DRAFT.md.",
         "9_description": f"Draft the YouTube upload pack for {v} from BRANDS/3SK_Finance/Scripts/"
                          f"{v}_Script.md: description, chapter timestamps, disclosure, hashtags, "
                          f"pinned comment. Write to BRANDS/3SK_Finance/Video_Descriptions/.",
@@ -1450,6 +1494,34 @@ STAGE_REVIEW: dict[str, dict] = {
             "packaging back to the same path(s)."
         ),
     },
+    "12_leadmagnet": {
+        "reviewer": "lead-magnet-reviewer",
+        "fixer": "lead-magnet-writer",
+        "verdict_tmpl": f"{VAULT_REL}/Lead_Magnets/_REVIEW/Video_NN_LeadMagnet_Review.md",
+        "review_prompt": (
+            "Review the lead-magnet draft for {v} (BRANDS/3SK_Finance/Lead_Magnets/"
+            "{v}_*_DRAFT.md) against its video script "
+            "(BRANDS/3SK_Finance/Scripts/{v}_Script.md) and packaging. Verify all six "
+            "dimensions: (1) the magnet's name AND form match the outro/Scene-18 VO's "
+            "verbatim promise, (2) every dollar figure traces VERBATIM to the script's "
+            "number-spine — a single fabricated or mis-traced figure is an automatic "
+            "REVISE, (3) NO affiliate links / product CTAs in the magnet, (4) Brand Bible "
+            "voice, (5) print-and-write PDF format with the promised fill-in fields, (6) "
+            "frontmatter. WRITE your verdict to {verdict_rel} including a one-line "
+            "'VERDICT:' line. The verdict is BINARY: SHIP (every dimension is 100% good to "
+            "go) or REVISE (anything less — list every fix under REVISE). There is no 'ship "
+            "with fixes': if it is not all good to go, none of it goes."
+        ),
+        "fix_prompt": (
+            "lead-magnet-reviewer flagged the {v} lead-magnet draft as not yet shippable. "
+            "Read its review at {verdict_rel} and FIX the draft in BRANDS/3SK_Finance/"
+            "Lead_Magnets/{v}_*_DRAFT.md IN PLACE: apply every fix it lists (VO-promise "
+            "reconciliation, figure integrity vs the script number-spine, remove any "
+            "affiliate link, Brand Bible voice, print-format/fill-in fields, frontmatter). "
+            "PRESERVE every already-passing element UNCHANGED and NEVER invent a figure — "
+            "trace each to the script. Write the corrected draft back to the same path."
+        ),
+    },
     "9_description": {
         "reviewer": "description-reviewer",
         "fixer": "video-description-writer",
@@ -1866,7 +1938,9 @@ def cmd_status(sf: StateFile) -> int:
     print(f"{'stage':<14} {'effective':<12} {'gate':<5} {'owner':<12} artifact")
     print("-" * 78)
     for key in STAGE_ORDER:
-        s = stages[key]
+        s = stages.get(key)
+        if s is None:  # legacy state file predating this stage — absent, skip the row
+            continue
         eff = effective_status(key, stages)
         if eff == "running" and _looks_orphaned(s, key):
             eff = "running?"  # likely orphaned/stale — advance will reconcile it
