@@ -67,8 +67,11 @@ DEFAULT_SIMILARITY = 0.75  # channel-identity floor for long-form; was 0.28 (too
 DEFAULT_STYLE = 0.15       # light emotional micro-variation, avoids monotone; keep <0.30 (set 2026-06-29)
 DEFAULT_SPEED = 1.1   # ElevenLabs voice_settings.speed; valid 0.7-1.2, 1.0 = native pace (Steve 2026-06-29).
 
-# ElevenLabs bills ~1 credit per character of the submitted text (break tags
-# included). Used only for the offline --dry-run estimate.
+# ElevenLabs meters ~1 char-count per character of the submitted text (break
+# tags included, context previous_text/next_text excluded) against the monthly
+# character quota -- for BOTH flash and v2 (the flash "0.5" in vo_budget_config
+# is a dollar-pricing notion, not a quota unit). This is the pre-spend upper-bound
+# estimate AND the post-render booked unit: we book real submitted chars * this.
 CREDITS_PER_CHAR = 1.0
 
 
@@ -214,18 +217,15 @@ def check_key(key: str) -> None:
     print(f"  resets     : {sub.get('next_character_count_reset_unix')}")
 
 
-def subscription_count(key: str) -> int | None:
-    """Current billing-cycle usage (credits) from ElevenLabs, or None.
-
-    Used for subscription-delta reconciliation: capture before + after the batch
-    and book (after - before) as the REAL credits charged. Version-proof -- no
-    dependence on a response header name ElevenLabs may rename."""
-    try:
-        sub = json.loads(_request(f"{API_BASE}/user/subscription", key=key))
-        v = sub.get("character_count")
-        return int(v) if isinstance(v, (int, float)) else None
-    except Exception:  # noqa: BLE001 -- reconciliation is best-effort
-        return None
+# Money-integrity note (2026-07-06): we do NOT reconcile spend by differencing
+# the /user/subscription character_count before/after a batch. That counter is
+# eventually-consistent -- read right after the last synth call it has only
+# partially caught up, so `after - before` collapsed to ~1/19th of the real
+# characters (V6 booked 1,124 of 21,289 real chars; V9 922 of 17,870), badly
+# under-reporting VO cost in the ledger the books rely on. ElevenLabs meters
+# exactly 1 char-count per SUBMITTED character (context previous_text/next_text
+# excluded), and we already know how many billable chars each run rendered, so
+# we book that client-side truth directly (see the render loop's `made_chars`).
 
 
 @contextlib.contextmanager
@@ -677,10 +677,10 @@ def main() -> None:
     # Pre-flight: warn (don't block) if this batch nears/exceeds the balance.
     make_chars = sum(len(b["text"]) for b in to_make)
     preflight_credits(key, make_chars)
-    before = subscription_count(key)   # subscription-delta baseline
 
     out_dir.mkdir(parents=True, exist_ok=True)
     made = failed = 0
+    made_chars = 0  # billable chars of scenes that actually rendered -> the real spend
     for b in to_make:
         dest = out_dir / b["filename"]
         try:
@@ -699,6 +699,7 @@ def main() -> None:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             made += 1
+            made_chars += len(b["text"])  # only successful scenes are billed
             print(f"  [ok ] scene {b['scene']:>2}  {b['filename']}  ({len(audio)} bytes)")
         except urllib.error.HTTPError as e:
             failed += 1
@@ -719,16 +720,18 @@ def main() -> None:
     # are already on disk, so a budget-write error is logged and swallowed.
     if ma is not None and made > 0 and args.limit is None:
         try:
-            after = subscription_count(key)
-            actual = (max(after - before, 0)
-                      if (before is not None and after is not None) else None)
-            # A 0 (or negative) delta after a real billable batch means the
-            # account-wide usage endpoint LAGGED or was skewed by a concurrent
-            # run -- it does NOT mean the run was free. Treat it as unreliable and
-            # fall back to the estimate (marked unreconciled in the log) so the
-            # cap can't be defeated by a lagging endpoint reading zero.
-            if actual is not None and actual <= 0 and make_chars > 0:
-                actual = None
+            # REAL spend = the billable characters we actually submitted for the
+            # scenes that rendered this run, at 1 char-count/char (CREDITS_PER_CHAR).
+            # This is the authoritative unit ElevenLabs meters -- the same counter
+            # `--check` reads (character_count) moves by exactly this. We book it
+            # client-side rather than differencing that counter before/after,
+            # because the counter is eventually-consistent and, read right after a
+            # batch, under-reports (the ~19x under-count this replaced). make_chars
+            # is the whole batch; made_chars excludes any scene that failed/402'd,
+            # so we never book audio we didn't get. Always a real number when
+            # made > 0, so the estimate fallback below is effectively dead code kept
+            # only for the impossible made>0/made_chars==0 case.
+            actual = int(round(made_chars * CREDITS_PER_CHAR)) if made_chars > 0 else None
             video_id = kit_path.parent.name
             bcfg = cfg if cfg is not None else ma.load_config()
             with budget_lock(script_dir / ".vo_budget.lock"):
@@ -746,28 +749,23 @@ def main() -> None:
                 # even WITH --force) -- both add, never supersede.
                 replace = bool(args.force) and not args.only
                 if dec is not None:
-                    # When there's no real delta (`actual is None`), fall back to
-                    # an estimate for THIS run's scenes only -- `dec.credits_est`
-                    # covers the WHOLE kit, so booking it on an additive top-up
-                    # (replace=False) would over-count by the already-rendered
-                    # remainder. make_chars is exactly the scenes rendered now
-                    # (full kit on --force, only the missing ones otherwise), so
-                    # it's the correct per-run estimate either way.
+                    # est_override only matters if `actual` is None (never, when
+                    # made>0); kept as a conservative per-run upper bound at
+                    # CREDITS_PER_CHAR so the ledger can't silently book 0.
                     est_override = None
                     if actual is None:
-                        rate = bcfg["models"][dec.model_key]["credits_per_char"]
-                        est_override = int(math.ceil(make_chars * rate))
+                        est_override = int(math.ceil(make_chars * CREDITS_PER_CHAR))
                     ma.commit(state, dec, bcfg, note=video_id, actual_credits=actual,
                               replace=replace, est_override=est_override)
                 else:
                     # Allocator was unavailable for the DECISION (fell back to a
-                    # fixed model); still book an estimate from real chars.
-                    ma.commit_fallback(state, bcfg, model, make_chars,
+                    # fixed model); still book the real chars rendered this run.
+                    ma.commit_fallback(state, bcfg, model, made_chars,
                                        note=video_id, actual_credits=actual,
                                        replace=replace)
                 ma.save_state(state)
             booked = actual if actual is not None else (state["log"][-1]["credits"] if state.get("log") else 0)
-            src = "real" if actual is not None else "estimate"
+            src = "real chars" if actual is not None else "estimate"
             print(f"allocator: booked {booked} cr ({src}) for {video_id}; "
                   f"cycle {state['credits_used']:,}/{int(ma.usable_budget(bcfg)):,} usable, "
                   f"v2 {state['v2_count']}/{bcfg['allocation']['max_v2_per_cycle']}")

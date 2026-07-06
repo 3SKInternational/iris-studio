@@ -230,5 +230,103 @@ class TestCommitFallback(unittest.TestCase):
         self.assertEqual(s["credits_used"], 2500)
 
 
+class TestGenerateVoBooksRealChars(unittest.TestCase):
+    """The reconciliation fix (2026-07-06 money-integrity bug): generate_vo books
+    the REAL billable characters of the scenes it rendered (1 char-count/char),
+    NOT the eventually-consistent /user/subscription character_count delta, which
+    read right after a batch under-reported ~19x (V6 booked 1,124 of 21,289 real
+    chars). This exercises generate_vo.main end-to-end with the network mocked —
+    the commit-level tests above can't catch it because commit() faithfully books
+    whatever number the caller computes; the bug was in the number the caller fed.
+    """
+
+    def _run_and_get_state(self, scene_chars, force=True):
+        import os
+        import sys
+        import contextlib as _ctx
+        import tempfile as _tmp
+        from pathlib import Path as _P
+
+        sys.path.insert(0, str(_REPO / "vo_factory"))
+        import generate_vo as gv
+
+        holder = {}
+        flash_id = CFG["models"]["flash"]["id"]
+
+        def fake_choose_model(text, state, cfg):
+            return gv.ma.Decision(
+                model_key="flash", model_id=flash_id, voice_id="testvoice",
+                score=0.1, credits_est=99999, reason="test",
+                would_exceed_budget=False, chars=len(text))
+
+        # Isolate all allocator I/O + the network + repo side effects. These patch
+        # SHARED module objects (gv, gv.ma), so restore every one in `finally` below
+        # or a later in-process test would silently inherit a mock (e.g. a save_state
+        # that writes nowhere).
+        patches = {
+            (gv.ma, "load_config"): lambda *a, **k: CFG,
+            (gv.ma, "load_state"): lambda *a, **k: _fresh(),
+            (gv.ma, "save_state"): lambda state, *a, **k: holder.__setitem__("state", state),
+            (gv.ma, "choose_model"): fake_choose_model,
+            (gv, "synthesize_scene"): lambda *a, **k: b"FAKEMP3",
+            (gv, "preflight_credits"): lambda *a, **k: None,
+            (gv, "preflight_numbers"): lambda *a, **k: None,
+            (gv, "budget_lock"): lambda *a, **k: _ctx.nullcontext(),
+        }
+        originals = {(obj, name): getattr(obj, name) for (obj, name) in patches}
+        for (obj, name), fn in patches.items():
+            setattr(obj, name, fn)
+
+        try:
+            return self._run_main(gv, scene_chars, force, holder, _tmp, _P)
+        finally:
+            for (obj, name), orig in originals.items():
+                setattr(obj, name, orig)
+
+    def _run_main(self, gv, scene_chars, force, holder, _tmp, _P):
+        import os
+        import sys
+        with _tmp.TemporaryDirectory() as td:
+            kit_dir = _P(td) / "Video_TT"
+            kit_dir.mkdir()
+            lines = []
+            for i, n in enumerate(scene_chars, 1):
+                # Body of exactly n chars (ASCII, no markdown/dual-form) so the
+                # parsed b["text"] length is exactly n — the billable unit.
+                lines.append(f"## Scene {i} -> `Video_TT_VO_Scene_{i:02d}.mp3`")
+                lines.append("x" * n)
+                lines.append("")
+            (kit_dir / "kit.md").write_text("\n".join(lines), encoding="utf-8")
+
+            argv = ["generate_vo.py", str(kit_dir / "kit.md"), "--voice-id", "testvoice"]
+            if force:
+                argv.append("--force")
+            old_argv, old_key = sys.argv, os.environ.get("ELEVENLABS_API_KEY")
+            sys.argv = argv
+            os.environ["ELEVENLABS_API_KEY"] = "dummy-key-for-test"
+            try:
+                gv.main()
+            finally:
+                sys.argv = old_argv
+                if old_key is None:
+                    os.environ.pop("ELEVENLABS_API_KEY", None)
+                else:
+                    os.environ["ELEVENLABS_API_KEY"] = old_key
+        return holder.get("state")
+
+    def test_books_full_submitted_chars_not_collapsed_delta(self):
+        # Two scenes of 5000 + 4000 real chars. The ledger MUST book 9000 (1/char),
+        # the true metered spend — regressing to a collapsed subscription delta
+        # (the ~19x-too-low bug) would book a fraction of this and fail here.
+        state = self._run_and_get_state([5000, 4000])
+        self.assertIsNotNone(state, "generate_vo never committed a booking")
+        self.assertEqual(state["credits_used"], 9000)
+        self.assertEqual(len(state["log"]), 1)
+        entry = state["log"][0]
+        self.assertEqual(entry["credits"], 9000)
+        self.assertTrue(entry["reconciled"], "booked chars must be marked reconciled (real)")
+        self.assertEqual(entry["note"], "Video_TT")
+
+
 if __name__ == "__main__":
     unittest.main()
