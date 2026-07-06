@@ -3,7 +3,7 @@
   "tier": "creator",
   "monthly_credits": 100000,
   "buffer_pct": 0.10,
-  "billing_cycle_day": 1,
+  "billing_cycle_day": 22,
 
   "models": {
     "v2": {
