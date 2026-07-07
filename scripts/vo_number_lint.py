@@ -33,6 +33,8 @@ narration-only, so it won't false-flag round millions sitting in titles/chapters
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import re
 import sys
 from pathlib import Path
@@ -40,6 +42,21 @@ from pathlib import Path
 # A grouped number with >= 2 comma-groups is >= 1,000,000 (millions scale).
 # Optional leading $; the magnitude misread happens with or without the symbol.
 _GROUPED_MILLIONS = re.compile(r"\$?\d{1,3}(?:,\d{3}){2,}\b")
+
+# --- spoken-region model (mirrors generate_vo.parse_kit / clean_vo_text) --------
+# The VO engine speaks ONLY the narration parse_kit extracts: the text BETWEEN a
+# `## Scene N -> ` header and that block's first `---` footer. Everything else —
+# the preamble before Scene 1, the header-label `(LEVEL 6 — $1,000,000)`, per-block
+# footers, blockquote author-notes, and the caption (right) side of a dual-form
+# {{spoken|$1,000,000}} token — is NEVER read aloud, so a figure there is a false
+# positive (it forced hand-mangling headings on V10/V11 to pass this gate). We track
+# the spoken region the SAME way parse_kit does rather than enumerating line shapes,
+# so a new non-spoken shape (e.g. a footer note) can't slip a false flag back in.
+# ponytail: keep these patterns in sync with generate_vo._BLOCK_RE / _DUAL_RE.
+_SCENE_HEADER = re.compile(r"^\s*##\s+Scene\s+\d+\s*(?:->|→)")  # "## Scene 6 → `x.mp3` (LEVEL TWO — $52,000)"
+_FOOTER = re.compile(r"^---\s*$")                              # block footer; parse_kit cuts narration here
+_BLOCKQUOTE = re.compile(r"^\s*>")                             # "> Auto-built from ..." author note
+_DUAL_FORM = re.compile(r"\{\{\s*([^|{}]+?)\s*\|\s*[^{}]+?\s*\}\}")  # {{spoken|CAPTION}} -> keep spoken
 
 
 def _safe_rewrite(raw: str) -> str:
@@ -79,8 +96,25 @@ def lint_text(text: str, path: Path) -> int:
     # Split on "\n" only (not str.splitlines, which also breaks on VT/FF/U+2028
     # etc.) so reported line numbers match what the editor/grep shows. rstrip "\r"
     # handles CRLF files.
-    for lineno, line in enumerate(text.split("\n"), 1):
-        line = line.rstrip("\r")
+    lines = [ln.rstrip("\r") for ln in text.split("\n")]
+    # A VO kit has `## Scene N -> ...` headers and only the text between a header and
+    # that block's `---` footer is spoken (parse_kit's contract). A plain script has
+    # no such structure, so fall back to scanning every line raw — a script isn't the
+    # billed text but the docstring lets you point at one, and blanking it all would
+    # silently pass any hazard. Kit detection = presence of at least one scene header.
+    is_kit = any(_SCENE_HEADER.match(ln) for ln in lines)
+    in_narration = False
+    for lineno, line in enumerate(lines, 1):
+        if is_kit:
+            if _SCENE_HEADER.match(line):
+                in_narration = True   # the header line itself is a scene tag, not spoken
+                continue
+            if _FOOTER.match(line):
+                in_narration = False  # block footer -> narration ends until the next header
+                continue
+            if not in_narration or _BLOCKQUOTE.match(line):
+                continue              # preamble / inter-block prose / author note — not spoken
+            line = _DUAL_FORM.sub(r"\1", line)  # keep the spoken (left) form, drop caption digits
         for raw, fix in find_hazards(line):
             findings += 1
             print(f'{path}:{lineno}: {raw} -> say "{fix}"')
@@ -102,6 +136,28 @@ def selftest() -> int:
     raw, fix = find_hazards("$1,234,567")[0]
     assert fix.startswith("$1.235 million (approx"), fix
     assert "approx" not in find_hazards("$1,043,000")[0][1]
+    # --- spoken-region model: in a KIT, only text between a scene header and that
+    # block's `---` footer is spoken. All 4 non-spoken regions must lint clean, and a
+    # million planted INSIDE narration must still flag. (redirect finding prints so
+    # --selftest output stays clean.)
+    kit = (
+        "# VO Kit\n"                                              # 1
+        "> Auto-built; thumbnail flag $2,500,000\n"               # 2 blockquote note
+        "- preamble bullet: pot could reach $1,840,000\n"         # 3 preamble prose (before Scene 1)
+        "## Scene 1 → `v.mp3` (LEVEL 6 — $1,000,000)\n"           # 4 header label
+        "Reach {{one million dollars|$1,000,000}} this year.\n"   # 5 spoken (dual-form -> left)
+        "But the screen showed $1,043,000 out loud.\n"            # 6 spoken hazard -> FLAG
+        "---\n"                                                    # 7 footer -> narration ends
+        "footer note: fund holds $3,200,000\n"                    # 8 post-footer prose
+    )
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        n = lint_text(kit, Path("k.md"))
+    assert n == 1, f"expected exactly 1 spoken hazard, got {n}"
+    assert "k.md:6:" in buf.getvalue(), buf.getvalue()  # only the in-narration million
+    # a plain script (no scene headers) has no spoken-region structure -> scan raw so
+    # a real hazard is never silently passed:
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert lint_text("plain script line with $1,043,000\n", Path("s.md")) == 1
     print("vo_number_lint selftest: OK")
     return 0
 
