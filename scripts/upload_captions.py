@@ -54,6 +54,7 @@ from upload_video import (  # noqa: E402
     normalize_id,
     upsert_captions,
     vault,
+    video_processing_status,
     write_receipt,
 )
 
@@ -76,6 +77,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--srt", help="Override the .srt path (vault-relative or absolute).")
     p.add_argument("--lang", default="en", help="Caption language code (default: en).")
     p.add_argument("--name", default="English", help="Caption track name (default: English).")
+    p.add_argument("--replace", action="store_true",
+                   help="Delete any existing track and re-insert (heals a stuck, "
+                        "non-servable track — an in-place update does NOT un-stick it).")
+    p.add_argument("--allow-processing", action="store_true",
+                   help="Attach even if the video is still processing (NOT recommended — "
+                        "a mid-processing track sticks permanently non-servable).")
     p.add_argument("--token", help="Override path to youtube_token.json.")
     p.add_argument("--dry-run", action="store_true",
                    help="Validate inputs + print the plan; touch no network.")
@@ -107,7 +114,9 @@ def main() -> None:
     print(f"captions   : {srt}  ({srt.stat().st_size} bytes)")
     print(f"track      : {args.name} [{args.lang}]  (sync=false — keep our timing)")
     print(f"receipt    : {receipt_path}")
-    print("mode       : captions.list → update-in-place if our track exists, else insert")
+    mode = ("captions.list → DELETE existing + re-insert (heal stuck track)" if args.replace
+            else "captions.list → update-in-place if our track exists, else insert")
+    print(f"mode       : {mode}")
 
     if args.dry_run:
         print("\n--- DRY RUN (no network, nothing changed). Drop --dry-run to upload. ---")
@@ -121,9 +130,25 @@ def main() -> None:
 
     from googleapiclient.errors import HttpError
 
+    # Gate on processing: attaching a track while the video is still processing
+    # creates a permanently non-servable track (the V9 bug). Confirm it's done
+    # unless the operator explicitly overrides. We ALWAYS read the real status (even
+    # under --allow-processing) so the receipt trust stamp below is honest.
+    try:
+        pstatus = video_processing_status(youtube, video_id)
+    except HttpError as exc:
+        die(f"could not read processing status for {video_id} "
+            f"(HTTP {getattr(getattr(exc, 'resp', None), 'status', '?')}): {exc}", code=3)
+    processed = pstatus == "succeeded"
+    if not processed and not args.allow_processing:
+        die(f"video {video_id} is not ready ({pstatus}); attaching captions now "
+            "would create a permanently non-servable track. Wait until processing "
+            "finishes, or pass --allow-processing to override.", code=4)
+
     print(f"\n>>> attaching captions to {video_id}…")
     try:
-        action = upsert_captions(youtube, video_id, srt, lang=args.lang, name=args.name)
+        action = upsert_captions(youtube, video_id, srt, lang=args.lang, name=args.name,
+                                 replace=args.replace)
     except HttpError as exc:
         status = getattr(getattr(exc, "resp", None), "status", "?")
         hint = ""
@@ -132,10 +157,15 @@ def main() -> None:
                     "youtube.force-ssl scope; re-run youtube_authorize.py --force if "
                     "the scope was widened.")
         die(f"caption upload failed (HTTP {status}){hint}: {exc}", code=3)
-    verb = "inserted" if action == "insert" else "updated"
+    verb = {"insert": "inserted", "update": "updated",
+            "replace": "re-inserted (healed stuck track)"}.get(action, action)
     print(f"  ✅ captions {verb}: {srt.name}  →  https://youtu.be/{video_id}")
 
     # --- stamp the receipt (keep prior fields). ---
+    # captions_post_processing is the TRUST stamp (see _caption_trusted): write it
+    # True ONLY when the attach genuinely happened post-processing. Under an
+    # --allow-processing override on a still-processing video the track may be stuck,
+    # so we mark it untrusted → the sweep will re-insert it once processing finishes.
     out = dict(receipt or {})
     out.update({
         "video": vid,
@@ -145,8 +175,13 @@ def main() -> None:
         "captions_name": args.name,
         "captions_action": action,
         "captions_source": str(srt),
+        "captions_post_processing": processed,
         "captions_updated_at": datetime.now(timezone.utc).isoformat(),
     })
+    if not processed:
+        print(f"  ⚠ attached while {pstatus} (--allow-processing) — marked UNTRUSTED; "
+              "the caption sweep will re-insert it once processing finishes.",
+              file=sys.stderr)
     write_receipt(receipt_path, out)
     print(f"\n✅ receipt → {receipt_path}")
 

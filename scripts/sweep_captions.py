@@ -21,7 +21,7 @@ Skipping already-captioned videos keeps a full sweep cheap.
 Usage:
   python3 scripts/sweep_captions.py --dry-run     # report state, change nothing
   python3 scripts/sweep_captions.py               # add where missing, skip present
-  python3 scripts/sweep_captions.py --force       # update even where a track exists
+  python3 scripts/sweep_captions.py --force       # delete + re-insert even where a track exists (heals stuck tracks)
   python3 scripts/sweep_captions.py --only Video_02
 """
 
@@ -48,7 +48,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--only", help="Limit to one video, e.g. Video_02 or 02.")
     p.add_argument("--force", action="store_true",
-                   help="Update captions even if a track already exists (default: skip present).")
+                   help="Delete + re-insert captions even where a track already exists "
+                        "(heals a stuck track; ~8x the quota of an update; default: skip present).")
     p.add_argument("--dry-run", action="store_true",
                    help="Report what would change (still LISTS tracks); makes no writes.")
     p.add_argument("--token", help="Override path to youtube_token.json.")
@@ -71,8 +72,9 @@ def main() -> None:
                              dry_run=args.dry_run)
     print(
         f"\nsummary: {summary['checked']} checked · {summary['added']} added · "
-        f"{summary['updated']} updated · {summary['skipped']} present/skipped · "
-        f"{summary['no_srt']} missing-srt · {summary['gone']} gone-404 · "
+        f"{summary['updated']} updated · {summary['repaired']} repaired · "
+        f"{summary['skipped']} present/skipped · {summary['no_srt']} missing-srt · "
+        f"{summary['processing']} processing · {summary['gone']} gone-404 · "
         f"{summary['transient']} transient · {summary['errors']} errors"
     )
     # Non-zero exit on any per-video error so a scheduled run surfaces a real problem

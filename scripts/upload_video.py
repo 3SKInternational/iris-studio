@@ -314,14 +314,22 @@ def find_managed_caption_track(youtube, video_id: str, lang: str = "en",
 
 
 def upsert_captions(youtube, video_id: str, srt: Path, lang: str = "en",
-                    name: str = "English") -> str:
+                    name: str = "English", replace: bool = False) -> str:
     """Idempotently attach the timed SRT as the video's caption track.
 
     captions.list first → captions.update the existing owned track in place (no
     duplicate) or captions.insert a new one. sync=False: our SRT is already timed,
-    so YouTube must NOT re-sync it. Returns "insert" or "update". Raises HttpError
-    on an API failure and FileNotFoundError if the SRT is missing — callers decide
-    whether that is fatal.
+    so YouTube must NOT re-sync it.
+
+    replace=True heals a STUCK track: a track inserted while the video was still
+    processing reports 'serving' in captions.list but is permanently non-servable
+    (the V9 bug) and an in-place update does NOT un-stick it — only delete +
+    re-insert POST-processing makes it servable. So with replace=True an existing
+    track is DELETED and a fresh one inserted (returns "replace"). Callers that
+    heal must first confirm the video finished processing (video_processing_status).
+
+    Returns "insert" | "update" | "replace". Raises HttpError on an API failure and
+    FileNotFoundError if the SRT is missing — callers decide whether that is fatal.
     """
     from googleapiclient.http import MediaFileUpload
 
@@ -329,6 +337,11 @@ def upsert_captions(youtube, video_id: str, srt: Path, lang: str = "en",
     if not srt.is_file():
         raise FileNotFoundError(f"caption file not found: {srt}")
     existing = find_managed_caption_track(youtube, video_id, lang=lang, name=name)
+    replaced = False
+    if existing and replace:
+        youtube.captions().delete(id=existing).execute()
+        existing = None
+        replaced = True
     media = MediaFileUpload(str(srt), mimetype="application/octet-stream")
     if existing:
         youtube.captions().update(
@@ -351,22 +364,33 @@ def upsert_captions(youtube, video_id: str, srt: Path, lang: str = "en",
         media_body=media,
         sync=False,
     ).execute()
-    return "insert"
+    return "replace" if replaced else "insert"
 
 
 def set_captions(youtube, video_id: str, srt: Path) -> bool:
     """Non-fatal idempotent caption attach for the upload/publish flows.
 
+    Gates on processing FIRST: a caption track inserted while the video is still
+    processing is permanently non-servable (the V9 bug), so if processing has NOT
+    succeeded this DEFERS (returns False) and leaves the attach to the
+    post-processing caption sweep. A fresh upload is essentially never processed
+    yet, so the inline attach normally defers — which is correct.
+
     A caption failure must NEVER sink a successful video upload/publish — including
-    a transient network error from the captions.list/insert/update calls (which are
-    NOT HttpError), so this catches broadly and only warns. Returns True iff the
-    track was attached, so callers record the real result rather than assuming it.
-    The standalone upload_captions.py wraps upsert_captions() directly and DOES
-    surface errors with a non-zero exit.
+    a transient network error from the videos/captions calls (which are NOT
+    HttpError), so this catches broadly and only warns. Returns True iff the track
+    was actually attached post-processing, so callers record the real result. The
+    standalone upload_captions.py wraps upsert_captions() directly and DOES surface
+    errors with a non-zero exit.
     """
     try:
+        if video_processing_status(youtube, video_id) != "succeeded":
+            print("  ⏳ captions deferred — video still processing; the caption sweep "
+                  "attaches them post-processing (a mid-processing track sticks non-servable).")
+            return False
         action = upsert_captions(youtube, video_id, srt)
-        verb = "inserted" if action == "insert" else "updated"
+        verb = {"insert": "inserted", "update": "updated",
+                "replace": "re-inserted"}.get(action, action)
         print(f"  ✅ captions {verb} from {Path(srt).name}")
         return True
     except Exception as exc:  # best-effort side channel — never crash the run.
@@ -531,6 +555,49 @@ def _caption_error_bucket(exc: Exception) -> str:
     return "transient" if _is_transient_api_error(exc) else "errors"
 
 
+def video_processing_status(youtube, video_id: str) -> str:
+    """Return the video's processing status: 'succeeded' once YouTube has finished
+    processing, else 'processing' / 'failed' / 'terminated' / 'unknown'.
+
+    A caption track inserted BEFORE this reads 'succeeded' gets stuck permanently
+    non-servable — captions.list reports it 'serving' but the player renders nothing
+    (the V9 bug: the track was inserted the same second the upload returned). So
+    every caption attach/repair must gate on this first. Uses the authoritative
+    processingDetails.processingStatus, falling back to status.uploadStatus
+    ('processed' == done) when processingDetails isn't populated.
+    """
+    resp = youtube.videos().list(part="processingDetails,status", id=video_id).execute()
+    items = resp.get("items") or []
+    if not items:
+        # videos.list returns HTTP 200 + empty items for a deleted / not-owned id
+        # (NOT a 404). Report it as terminal 'gone' so the sweep buckets it as gone
+        # instead of deferring it into 'processing' forever.
+        return "gone"
+    proc = (items[0].get("processingDetails") or {}).get("processingStatus")
+    if proc:
+        return proc
+    upload = (items[0].get("status") or {}).get("uploadStatus")
+    return "succeeded" if upload == "processed" else (upload or "unknown")
+
+
+def _caption_trusted(data: dict) -> bool:
+    """True iff the receipt PROVES this video's caption track was inserted (or
+    delete+re-inserted) POST-processing — the only state known to be servable.
+
+    Trust requires the explicit ``captions_post_processing`` flag, which is written
+    ONLY on a confirmed post-processing attach (set_captions gates on processing;
+    the sweep/upload_captions gate too). The legacy ``captions_updated_at`` stamp is
+    deliberately NOT trusted: per this fix's own doctrine an in-place UPDATE does not
+    un-stick a track, and several legacy stamps came from a post-processing *update*
+    over a track that was originally inserted mid-processing — so that stamp does not
+    prove servability. Consequence: on the FIRST post-fix sweep every legacy video
+    (none carry the flag yet) is re-inserted once post-processing → guaranteed
+    servable → then flagged and skipped thereafter. This deterministically heals the
+    whole existing fleet instead of trusting unproven legacy tracks.
+    """
+    return bool(data.get("captions_post_processing"))
+
+
 def iter_upload_receipts(vlt: Path):
     """Yield (video_label, video_id, receipt_path, receipt_dict) for every upload
     receipt that carries a YouTube video_id. These receipts are the canonical map
@@ -564,14 +631,41 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
     for the next sweep to heal) so an unattended run never pages on a hiccup.
     Returns a summary dict.
     """
-    summary = {"checked": 0, "added": 0, "updated": 0, "skipped": 0,
-               "no_srt": 0, "gone": 0, "transient": 0, "errors": 0}
+    summary = {"checked": 0, "added": 0, "updated": 0, "repaired": 0, "skipped": 0,
+               "no_srt": 0, "processing": 0, "gone": 0, "transient": 0, "errors": 0}
     only_label = normalize_id(only)[0] if only else None
     for label, video_id, rp, data in iter_upload_receipts(vlt):
         if only_label and label != only_label:
             continue
         summary["checked"] += 1
         srt = vlt / "Footage_and_Edits" / f"{label}_v2.srt"
+
+        # Gate on processing FIRST: inserting/repairing a caption track before the
+        # video finishes processing is exactly what creates a permanently
+        # non-servable track (the V9 bug). Still cooking → defer to a later sweep.
+        try:
+            pstatus = video_processing_status(youtube, video_id)
+        except Exception as exc:  # API/network failure — skip this one, keep sweeping.
+            kind = _caption_error_bucket(exc)
+            tag = {"transient": "transient ", "gone": "gone-404 "}.get(kind, "")
+            print(f"  ⚠ {label} ({video_id}): processing check failed "
+                  f"({tag}{type(exc).__name__}: {exc})", file=sys.stderr)
+            summary[kind] += 1
+            continue
+        if pstatus in ("gone", "failed", "terminated", "rejected", "deleted"):
+            # Terminal: the video is gone or its upload failed — captions can NEVER
+            # attach, and this never becomes possible, so bucket as gone (logged, no
+            # page, no repair attempt) rather than defer or page every run.
+            print(f"  ⚠ {label} ({video_id}): video {pstatus} — captions impossible, skip",
+                  file=sys.stderr)
+            summary["gone"] += 1
+            continue
+        if pstatus != "succeeded":
+            print(f"  ⏳ {label} ({video_id}): still processing ({pstatus}) — "
+                  "deferring captions (a mid-processing track sticks non-servable)")
+            summary["processing"] += 1
+            continue
+
         try:
             existing = find_managed_caption_track(youtube, video_id)
         except Exception as exc:  # API/network failure — skip this one, keep sweeping.
@@ -581,22 +675,38 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
                   f"({tag}{type(exc).__name__}: {exc})", file=sys.stderr)
             summary[kind] += 1
             continue
-        if existing and not force:
-            print(f"  ✓ {label} ({video_id}): captions present — skip")
+
+        trusted = _caption_trusted(data)
+        if existing and trusted and not force:
+            print(f"  ✓ {label} ({video_id}): captions present + servable — skip")
             summary["skipped"] += 1
             continue
+        # Present-but-untrusted (stuck-suspect: captioned only by the old inline
+        # path, no post-processing stamp) OR --force → delete + re-insert, because
+        # an in-place update does NOT un-stick a non-servable track. A repair/force
+        # both delete+insert; a fresh video with no track just inserts.
+        repairing = bool(existing) and not trusted
+        replace = bool(existing)
+        # ponytail: re-inserts ~400 quota units each, but the untrusted set is tiny
+        # and self-clearing (each becomes trusted after one repair). Add a
+        # --max-repairs cap here if the library ever grows enough to threaten quota.
         if not srt.is_file():
             print(f"  ⚠ {label} ({video_id}): no SRT at {srt.name} — can't add captions",
                   file=sys.stderr)
             summary["no_srt"] += 1
             continue
         if dry_run:
-            verb = "update" if existing else "add"
+            if not existing:
+                verb, key = "add", "added"
+            elif repairing:
+                verb, key = "repair (re-insert stuck track)", "repaired"
+            else:
+                verb, key = "force-replace", "updated"
             print(f"  • {label} ({video_id}): would {verb} captions from {srt.name}")
-            summary["updated" if existing else "added"] += 1
+            summary[key] += 1
             continue
         try:
-            action = upsert_captions(youtube, video_id, srt)
+            action = upsert_captions(youtube, video_id, srt, replace=replace)
         except Exception as exc:
             kind = _caption_error_bucket(exc)
             tag = {"transient": "transient ", "gone": "gone-404 "}.get(kind, "")
@@ -604,13 +714,19 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
                   f"({tag}{type(exc).__name__}: {exc})", file=sys.stderr)
             summary[kind] += 1
             continue
-        verb = "updated" if action == "update" else "added"
+        if not existing:
+            verb, key = "added", "added"
+        elif repairing:
+            verb, key = "re-inserted (repaired stuck track)", "repaired"
+        else:
+            verb, key = "force-replaced", "updated"
         print(f"  ✅ {label} ({video_id}): captions {verb} from {srt.name}")
-        summary["updated" if action == "update" else "added"] += 1
+        summary[key] += 1
         data.update({
             "captions_set": True,
             "captions_action": action,
             "captions_source": str(srt),
+            "captions_post_processing": True,
             "captions_updated_at": datetime.now(timezone.utc).isoformat(),
         })
         try:
@@ -851,7 +967,14 @@ def main() -> None:
     write_receipt(receipt, receipt_data)
 
     if have_srt and not args.no_captions:
-        receipt_data["captions_set"] = set_captions(youtube, video_id, srt)
+        # set_captions gates on processing: a fresh upload is essentially never
+        # processed yet, so this normally DEFERS to the post-processing caption sweep
+        # (below + the daily caption-sweep cron, 04:20). It returns True only on an actual post-processing
+        # attach, so stamp the receipt as trusted-servable only then.
+        if set_captions(youtube, video_id, srt):
+            receipt_data["captions_set"] = True
+            receipt_data["captions_post_processing"] = True
+            receipt_data["captions_updated_at"] = datetime.now(timezone.utc).isoformat()
     elif not have_srt:
         print(f"  ⚠ no captions ({srt.name} missing) — add manually.")
     if thumb and not args.no_thumbnail:
@@ -875,9 +998,9 @@ def main() -> None:
         try:
             s = sweep_captions(youtube, vlt)
             print(f"  caption sweep: {s['checked']} checked · {s['added']} added · "
-                  f"{s['updated']} updated · {s['skipped']} present · "
-                  f"{s['no_srt']} missing-srt · {s['gone']} gone-404 · "
-                  f"{s['transient']} transient · {s['errors']} errors")
+                  f"{s['updated']} updated · {s['repaired']} repaired · {s['skipped']} present · "
+                  f"{s['no_srt']} missing-srt · {s['processing']} processing · "
+                  f"{s['gone']} gone-404 · {s['transient']} transient · {s['errors']} errors")
         except Exception as exc:  # never let the sweep sink a good upload.
             print(f"  ⚠ caption sweep skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)

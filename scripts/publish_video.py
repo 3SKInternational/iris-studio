@@ -319,6 +319,7 @@ def main() -> None:
     })
     if captions_set:
         out["captions_updated_at"] = datetime.now(timezone.utc).isoformat()
+        out["captions_post_processing"] = True  # set_captions only attaches post-processing.
     write_receipt(receipt_path, out)
     print(f"\n✅ receipt → {receipt_path}")
 
