@@ -960,6 +960,31 @@ def enforce_pill_overlays(shots: list[dict], vid: str, nn: str, vlt: Path,
           f"({'re-burned ' + str(len(stale)) if stale else 'all fresh'}).")
 
 
+MIN_DWELL_S = 8.0   # Steve 2026-07-08: every image on screen ≥8s, no flashes.
+MAX_DWELL_S = 12.0  # …and ≤~12s, no over-holds. The standard dwell band.
+
+
+def clamp_scene_dwell(cuts, dur, k, min_d=MIN_DWELL_S, max_d=MAX_DWELL_S):
+    """Standard shot-pacing guard (Steve 2026-07-08). `cuts` are the k-1 internal
+    cut times (seconds, strictly inside (0, dur)) that split a scene's clip into
+    k shots. If those cuts would make ANY shot flash (<min_d) or over-hold
+    (>max_d), AND an EQUAL split of the scene lands in the dwell band, return
+    even cut times (uniform dur/k per shot) + True. Otherwise return `cuts`
+    unchanged + False — so a scene whose aligned cuts already pace well keeps its
+    word-alignment, and a scene that is inherently too dense/sparse (equal split
+    itself out of band, can't be fixed without changing the shot count) is left
+    as the best available. Pure + testable; timing only, never touches images."""
+    if not cuts or dur is None or k < 2:
+        return cuts, False
+    b = [0.0, *list(cuts), dur]
+    if all(min_d <= b[i + 1] - b[i] <= max_d for i in range(k)):
+        return cuts, False
+    eq = dur / k
+    if min_d <= eq <= max_d:
+        return [round(eq * (j + 1), 3) for j in range(k - 1)], True
+    return cuts, False
+
+
 def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict[int, dict],
                          vid: str, asset_dir: Path, images_rel: str, vo_rel: str,
                          output_dir: Path, output_name: str,
@@ -1050,6 +1075,15 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
                 align_notes.append(
                     f"scene {scene}: real-speech cut timing ({k} shots)" if align_cuts is not None
                     else f"scene {scene}: alignment unavailable/low-confidence — kept proportional timing")
+        # Standard dwell guard (Steve 2026-07-08): even-split any scene whose
+        # aligned/anchored cuts would flash (<8s) or over-hold (>12s) a shot;
+        # scenes already in-band keep their word-alignment.
+        _src = anchor_cuts if anchor_cuts is not None else align_cuts
+        if _src is not None:
+            _clamped, _did = clamp_scene_dwell(_src, dur, k)
+            if _did:
+                anchor_cuts, align_cuts, anchor_caps = _clamped, None, None
+                align_notes.append(f"scene {scene}: dwell-clamped to even {dur / k:.1f}s/shot (anchors would flash/over-hold)")
         cum = 0.0  # cumulative fraction of the clip consumed by prior shots
         for i, s in enumerate(scene_shots):
             text, weight = cap_parts[i]
