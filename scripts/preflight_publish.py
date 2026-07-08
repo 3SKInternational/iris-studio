@@ -192,11 +192,18 @@ def resolve_thumbnail(vlt: Path, vid: str) -> Path | None:
     passes the thumb it already resolved (honoring --thumbnail); this is only the
     fallback for the standalone CLI.
     """
-    for cand in sorted(vlt.glob(f"Thumbnails/{vid}*.png")) + sorted(
-        vlt.glob(f"Thumbnails/{vid}*.jpg")
+    # Organized layout (2026-07-08): Thumbnails/<vid>/final/* is preferred; the
+    # legacy flat Thumbnails/<vid>*.{png,jpg} is the fallback. Keep in sync with
+    # resolve_thumbnail() in upload_video.py.
+    for pat in (
+        f"Thumbnails/{vid}/final/*.png",
+        f"Thumbnails/{vid}/final/*.jpg",
+        f"Thumbnails/{vid}*.png",
+        f"Thumbnails/{vid}*.jpg",
     ):
-        if cand.is_file():
-            return cand
+        for cand in sorted(vlt.glob(pat)):
+            if cand.is_file():
+                return cand
     return None
 
 
@@ -300,7 +307,7 @@ def check_publish_ready(
     if thumb is None:
         failures.append(
             f"no thumbnail resolves for {vid} — the uploader would ship with no "
-            f"custom thumbnail (tanks CTR). Place one under {vlt}/Thumbnails/{vid}* "
+            f"custom thumbnail (tanks CTR). Place one under {vlt}/Thumbnails/{vid}/final/ "
             "or pass --thumbnail."
         )
     elif not Path(thumb).is_file():

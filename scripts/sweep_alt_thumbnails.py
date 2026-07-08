@@ -56,17 +56,23 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 def find_alt_thumbnails(vlt: Path, label: str) -> list[Path]:
     """Return the alternate (B / reserve) thumbnail image files for a video, sorted.
 
-    Matches `Thumbnails/Video_NN_Thumbnail_B*` and keeps only image files — so the
+    Matches `_Thumbnail_B*` image files and keeps only image files — so the
     `_B_FINAL.jpg` and any `_B_reserve_*.jpg` are included, while sidecar briefs
     (`_B_regen_brief.md`) are filtered out by extension. The PRIMARY `Thumbnail_A_*`
-    is the live thumbnail and is intentionally excluded."""
+    is the live thumbnail and is intentionally excluded.
+
+    Organized layout (2026-07-08): alts live under `Thumbnails/<label>/working/`;
+    the legacy flat `Thumbnails/<label>_Thumbnail_B*` is kept as a fallback."""
     tdir = vlt / "Thumbnails"
     if not tdir.is_dir():
         return []
-    return sorted(
-        p for p in tdir.glob(f"{label}_Thumbnail_B*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-    )
+    found: dict[str, Path] = {}
+    for pat in (f"{label}/working/{label}_Thumbnail_B*",
+                f"{label}_Thumbnail_B*"):
+        for p in tdir.glob(pat):
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                found.setdefault(p.name, p)  # first location (working/) wins
+    return sorted(found.values())
 
 
 def _send_photo(path: Path, caption: str) -> bool:
@@ -291,10 +297,13 @@ def _selftest() -> None:
         rp.write_text(json.dumps({"video": label, "video_id": "TESTID123",
                                   "title": "Self Test"}), encoding="utf-8")
         # Two B alternates + a sidecar brief (must be ignored) + the primary A (excluded).
-        (vlt / "Thumbnails" / f"{label}_Thumbnail_B_FINAL.jpg").write_bytes(b"jpg")
-        (vlt / "Thumbnails" / f"{label}_Thumbnail_B_reserve_X.jpg").write_bytes(b"jpg")
-        (vlt / "Thumbnails" / f"{label}_Thumbnail_B_regen_brief.md").write_text("brief")
-        (vlt / "Thumbnails" / f"{label}_Thumbnail_A_FINAL.jpg").write_bytes(b"jpg")
+        # Organized layout: alts live under Thumbnails/<label>/working/.
+        work = vlt / "Thumbnails" / label / "working"
+        work.mkdir(parents=True)
+        (work / f"{label}_Thumbnail_B_FINAL.jpg").write_bytes(b"jpg")
+        (work / f"{label}_Thumbnail_B_reserve_X.jpg").write_bytes(b"jpg")
+        (work / f"{label}_Thumbnail_B_regen_brief.md").write_text("brief")
+        (work / f"{label}_Thumbnail_A_FINAL.jpg").write_bytes(b"jpg")
 
         assert [p.name for p in find_alt_thumbnails(vlt, label)] == [
             f"{label}_Thumbnail_B_FINAL.jpg", f"{label}_Thumbnail_B_reserve_X.jpg"

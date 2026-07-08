@@ -12,7 +12,7 @@ Resolution from a video id (under the 3SK Finance vault; override $SK_VAULT):
   video       : Footage_and_Edits/Video_NN_v2.mp4        (--video-file to override)
   captions    : Footage_and_Edits/Video_NN_v2.srt        (--captions to override)
   desc pack   : Video_Descriptions/Video_NN_Description.md (--desc to override)
-  thumbnail   : Thumbnails/Video_NN*.png|jpg (best-effort; --thumbnail to override)
+  thumbnail   : Thumbnails/Video_NN/final/*.png|jpg (legacy flat Thumbnails/Video_NN*.png|jpg as fallback; --thumbnail to override)
   receipt out : Production_Kits/Video_NN_youtube_upload.json
 
 Title precedence: --title  >  desc-pack frontmatter `youtube_title:`. There is no
@@ -226,11 +226,18 @@ def resolve_thumbnail(vlt: Path, vid: str, override: str | None) -> Path | None:
         if not p.is_file():
             die(f"--thumbnail not found: {p}")
         return p
-    for cand in sorted(vlt.glob(f"Thumbnails/{vid}*.png")) + sorted(
-        vlt.glob(f"Thumbnails/{vid}*.jpg")
+    # Organized layout (2026-07-08): Thumbnails/<vid>/final/*.{png,jpg} is preferred;
+    # the legacy flat Thumbnails/<vid>*.{png,jpg} is kept as a fallback. First match wins,
+    # png before jpg in each location (prepare_thumbnail_for_upload converts/sizes anyway).
+    for pat in (
+        f"Thumbnails/{vid}/final/*.png",
+        f"Thumbnails/{vid}/final/*.jpg",
+        f"Thumbnails/{vid}*.png",
+        f"Thumbnails/{vid}*.jpg",
     ):
-        if cand.is_file():
-            return cand
+        for cand in sorted(vlt.glob(pat)):
+            if cand.is_file():
+                return cand
     return None
 
 
