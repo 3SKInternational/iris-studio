@@ -703,6 +703,65 @@ def author_image_manifest(shots: list[dict], vid: str, images_out: Path) -> dict
     }
 
 
+def apply_reuse_map(reuse_map: str, vlt: Path, vid: str, images_out: Path,
+                    force: bool) -> int:
+    """Reuse-first spend control (Steve 2026-07-08, $8/video cap): copy already-
+    rendered PNGs named by an asset-librarian `reuse_map.json` into the per-video
+    image dir BEFORE the billed render, so generate_images' skip-if-exists skips
+    them and only genuinely-new shots bill.
+
+    Map format: {"<shot_id>": "<png path>"} — shot_id is the manifest shot id
+    (e.g. "01a"); the path is absolute or vault-relative. Fail-open by design:
+    a missing/unreadable map or a missing source PNG just falls through to a
+    normal render of that shot (never blocks the build). `--force` disables reuse
+    (re-render everything). Returns the count actually copied in."""
+    import shutil
+    if force:
+        print("  ⚠ --force set — ignoring --reuse-map (re-rendering all shots).")
+        return 0
+    p = Path(reuse_map).expanduser()
+    if not p.is_file():
+        print(f"  ⚠ --reuse-map not found: {p} — skipping reuse (all shots render).")
+        return 0
+    try:
+        m = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:  # noqa: BLE001
+        print(f"  ⚠ --reuse-map unreadable ({e}) — skipping reuse (all shots render).")
+        return 0
+    if not isinstance(m, dict):
+        print("  ⚠ --reuse-map is not a {shot_id: path} object — skipping reuse.")
+        return 0
+    n = 0
+    for shot_id, src_rel in m.items():
+        sid = str(shot_id)
+        # Trust boundary: shot_id is an agent-authored JSON key. Reject anything
+        # that could escape images_out via path components, mirroring the guard in
+        # image_factory/generate_images.py. Keeps `dst` strictly a leaf file.
+        if "/" in sid or "\\" in sid or sid.startswith("."):
+            print(f"  ⚠ reuse-map: unsafe shot id {sid!r} — skipping.")
+            continue
+        src = Path(str(src_rel)).expanduser()
+        if not src.is_absolute():
+            src = vlt / str(src_rel)
+        dst = images_out / f"{vid}_Shot_{sid}.png"
+        if dst.exists():
+            continue  # already on disk (prior render or reuse) — leave it
+        if not src.is_file():
+            print(f"  ⚠ reuse source missing for shot {sid}: {src} — will render instead.")
+            continue
+        try:
+            images_out.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError as e:  # noqa: BLE001 — fail-open: never abort the build on a copy error
+            print(f"  ⚠ reuse copy failed for shot {sid} ({e}) — will render instead.")
+            continue
+        n += 1
+    if n:
+        print(f"  ♻ reuse-map: dropped in {n} existing shot(s) (~${n * 0.13:.2f} saved) "
+              f"— only new shots will bill.")
+    return n
+
+
 _MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left", "pan_up", "pan_down"]
 
 
@@ -735,8 +794,9 @@ CTA_SEGMENTS = {
         "image": f"{CTA_DIR}/CTA_outro.png",
         "vo_clip": f"{CTA_DIR}/CTA_outro.mp3",
         "motion": "zoom_in",
-        "caption_text": ("And before you go, if this helped, like it and "
-                         "subscribe so the next one finds you."),
+        "caption_text": ("And before you go, if this helped, like it, "
+                         "subscribe, and tell me one thing in the comments, "
+                         "so the next one finds you."),
     },
 }
 
@@ -1118,6 +1178,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vo-source", help="Vault-relative dir of existing VO mp3s to assemble from (e.g. Voice_Files/Video_01).")
     p.add_argument("--image-set", help="Vault-relative dir of existing image PNGs to assemble from (e.g. Raw_Assets/Video_01_HD). Mutually exclusive with --images.")
     p.add_argument("--force", action="store_true", help="Pass --force to the billed stages (re-render existing).")
+    p.add_argument("--reuse-map", help="Path to an asset-librarian reuse_map.json "
+                   "{shot_id: existing_png_path}. Listed shots are copied into the "
+                   "per-video image dir BEFORE the billed render so generate_images "
+                   "skip-if-exists skips them — only genuinely-new shots bill (the "
+                   "$8/video-cap reuse-first workflow). Ignored under --force.")
     p.add_argument("--align", action=argparse.BooleanOptionalAction, default=True,
                    help="Cut multi-shot scenes at REAL spoken-word boundaries via local "
                         "forced alignment (fixes within-scene A/V drift). Local, free, no API. "
@@ -1278,6 +1343,8 @@ def main() -> None:
         return gone
 
     rc = 0
+    if do_images and args.reuse_map:
+        apply_reuse_map(args.reuse_map, vlt, vid, images_out, args.force)
     if do_images:
         cmd = [sys.executable, str(img_gen), str(img_manifest_path)]
         if args.force:
