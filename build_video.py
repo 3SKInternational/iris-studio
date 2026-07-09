@@ -132,6 +132,52 @@ def parse_shot_list(path: Path) -> tuple[list[dict], dict[int, float]]:
     return shots, cadence
 
 
+# HD render-manifest image name -> scene/sub (e.g. "Video_09_Shot_01a" -> 9,"a").
+# Thumbnails ("..._Thumbnail_A") and reference entries don't match and are
+# skipped — exactly the by-hand derivation the V9 assembly used.
+_HD_SHOT_RE = re.compile(r"_Shot_(\d+)([a-z])\b", re.IGNORECASE)
+
+
+def derive_shots_from_hd_manifest(path: Path, vid: str) -> list[dict]:
+    """Fallback for a video whose scene prompts went straight to the image
+    manifest and never produced a `<vid>_Shot_List.md` (Video_09 did this — its
+    assembly died until the list was hand-derived from the HD manifest).
+
+    Rebuilds the same `shots` list parse_shot_list returns, from the HD render
+    manifest's `images` entries: scene/sub from each shot NAME, prompt verbatim.
+    Deterministic, no spend. Returns shots only — the manifest carries no cadence
+    table, and cadence is merely a no-mp3 timing fallback, so assemble (which has
+    the VO mp3s) derives timing from the audio and never needs it.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:  # noqa: BLE001
+        die(f"could not read HD manifest {path.name}: {e}")
+    images = data.get("images") if isinstance(data, dict) else None
+    if not isinstance(images, list):
+        die(f"HD manifest {path.name} has no 'images' list to derive shots from.")
+    shots: list[dict] = []
+    for entry in images:
+        name = str(entry.get("name", "")) if isinstance(entry, dict) else ""
+        m = _HD_SHOT_RE.search(name)
+        if not m:
+            continue  # thumbnail / reference / non-shot entry
+        scene = int(m.group(1))
+        sub = m.group(2).lower()
+        prompt = re.sub(r"\s+", " ", str(entry.get("prompt", ""))).strip()
+        shots.append({
+            "scene": scene,
+            "sub": sub,
+            "id": f"{scene:02d}{sub}",
+            "prompt": prompt,
+            "no_char": bool(re.search(r"\bno character\b", prompt, re.I)),
+        })
+    if not shots:
+        die(f"HD manifest {path.name} has no '{vid}_Shot_NNx' image entries to derive shots from.")
+    shots.sort(key=lambda s: (s["scene"], s["sub"]))
+    return shots
+
+
 # --- editorial cut-anchor directive (optional) -----------------------------
 # A shot list may carry an explicit, machine-read cut-anchor line per multi-shot
 # scene so picture cuts land on the editorially intended narrative beats instead
@@ -1264,8 +1310,10 @@ def main() -> None:
     vlt = vault()
     shot_list = vlt / "Scene_Image_Prompts" / f"{vid}_Shot_List.md"
     vo_kit = vlt / "Voice_Files" / vid / "_VO_Session_B_Kit.md"
-    if not shot_list.is_file():
-        die(f"shot list not found: {shot_list}")
+    hd_manifest = vlt / "Raw_Assets" / "Image_Factory" / "manifests" / f"video_{nn}_hd.json"
+    if not shot_list.is_file() and not hd_manifest.is_file():
+        die(f"shot list not found: {shot_list}\n"
+            f"       and no HD render manifest to derive it from: {hd_manifest}")
 
     def _vault_rel(flag: str, raw: str) -> str:
         """Validate a user dir is vault-relative and stays inside the vault."""
@@ -1283,8 +1331,16 @@ def main() -> None:
     images_out = vlt / f"Raw_Assets/{vid}_gen"
     vo_out = vlt / f"Voice_Files/{vid}_gen"
 
-    shots, cadence = parse_shot_list(shot_list)
-    edit_anchors = parse_cut_anchors(shot_list.read_text(encoding="utf-8"))
+    if shot_list.is_file():
+        shots, cadence = parse_shot_list(shot_list)
+        edit_anchors = parse_cut_anchors(shot_list.read_text(encoding="utf-8"))
+    else:
+        print(f"  ⚠ shot list absent — deriving shots from {hd_manifest.name} "
+              f"(the RENDERS-gated HD manifest). No cadence table or cut-anchors, "
+              f"so multi-shot scenes use VO-driven even-split timing.")
+        shots = derive_shots_from_hd_manifest(hd_manifest, vid)
+        cadence = {}
+        edit_anchors = {}
     for w in lint_cut_anchors(shots, edit_anchors):
         print(f"  ⚠ {w}")
     kit = parse_kit(vo_kit)
