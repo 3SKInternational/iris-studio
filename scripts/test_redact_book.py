@@ -4,9 +4,13 @@
 # `iris[_.]\w` residual check flagged it -> fail-closed on an un-rewritten path).
 # Runs the real script as a subprocess on a temp file (the script executes at import time,
 # so subprocess is the honest way to exercise it). No frameworks.
-import subprocess, sys, tempfile, os
+import subprocess, sys, tempfile, os, glob
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redact-book.py")
+# The redact gate now builds its video-ID set from the channel's upload receipts and fails
+# loud if none are present (Mini-bound). Off-Mac the whole suite skips honestly rather than
+# reporting spurious failures for the pre-existing identity/cred cases.
+RECEIPTS = glob.glob("/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Production_Kits/*_youtube_upload.json")
 
 
 def run(text):
@@ -23,6 +27,10 @@ def run(text):
 
 
 def main():
+    if not RECEIPTS:
+        print("test_redact_book: SKIP — no upload receipts on this machine (redact gate is Mini-bound)")
+        return
+
     # 1) The exact regression: an _Iris_Memory path must redact clean (was the hard-fail).
     code, out, msg = run("See _Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md for the bridge.")
     assert code == 0, f"_Iris_Memory path still fails redaction: {msg!r}"
@@ -64,7 +72,14 @@ def main():
     code, _, msg = run("This text has nothing to redact.")
     assert code == 0 and "REDACTION OK" in msg, f"clean text should pass: {msg!r}"
 
-    print("test_redact_book: 5/5 pass")
+    # 6) Video-ID redaction (receipts-derived): a real V09 id and a youtu.be URL form both scrub
+    #    (DY2RVnuUb64 = V09, LWWGbGUFFNk = V10 — both live receipt ids on the Mini).
+    code, out, msg = run("watch DY2RVnuUb64 or https://youtu.be/LWWGbGUFFNk today")
+    assert code == 0, f"video-id doc should redact clean: {msg!r}"
+    assert "DY2RVnuUb64" not in out and "LWWGbGUFFNk" not in out, f"video id survived: {out!r}"
+    assert "[VIDEO_ID]" in out, f"video id not scrubbed to token: {out!r}"
+
+    print("test_redact_book: 6/6 pass")
 
 
 if __name__ == "__main__":

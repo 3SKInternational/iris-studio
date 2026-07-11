@@ -16,8 +16,14 @@
 # fail-closed a clean book. Added an IGNORECASE mirror sub (test case 4c). Same pass also
 # made the CRED_PATTERNS substitution loop IGNORECASE (its residual check was already
 # IGNORECASE), closing the last instance of the drift class for credentials too (case 4d).
+# Hardened 2026-07-11 (book-update editors hand-caught a live video ID two nights running):
+# added receipts-derived VIDEO-ID redaction — the flagship editor caught `DY2RVnuUb64` (a real
+# V09 YouTube id) in changelog prose that the static token list didn't know. Video ids are a
+# mechanically-detectable class, so a deterministic gate must own it (not the LLM editor). Set
+# is built dynamically from the channel's own upload receipts (self-updating), fail-loud if the
+# receipts glob is empty. Case-sensitive replace + check (YouTube ids are case-sensitive).
 # Regression test: scripts/test_redact_book.py.
-import re, sys
+import re, sys, json, glob
 
 # Target book path: first CLI arg if given, else the flagship (backward compatible with
 # any caller that runs this bare). The nightly multi-book pipeline passes each maintained
@@ -30,6 +36,40 @@ try:
 except OSError as e:
     print(f"REDACTION FAIL — cannot read book source {P}: {e}")
     sys.exit(1)
+
+# 0) Video-ID redaction set — built from the channel's own upload receipts (receipts-win:
+#    machine-written + self-updating as videos publish) plus a small supplement of dead
+#    re-upload ids no receipt records anymore. The books are sellable + anonymized; a live
+#    YouTube video id ties the build story to the real channel, and this class is mechanically
+#    detectable, so a deterministic gate must own it (not the LLM editor).
+#    ponytail: Mini-coupled — RECEIPTS_GLOB is an absolute vault path; this gate is Mini-bound
+#    (matches DEFAULT_P). Missing receipts fail LOUD by design — an empty set would silently
+#    stop scrubbing ids, the exact leak class this closes. Upgrade path if it ever runs
+#    elsewhere: derive the vault root from DEFAULT_P / an env var.
+RECEIPTS_GLOB = "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Production_Kits/*_youtube_upload.json"
+VIDEO_ID_SUPPLEMENT = ["FJljsipxTkA", "n8l84_UBLUc"]  # dead re-upload ids no receipt records
+
+def _collect_video_ids():
+    ids = set(VIDEO_ID_SUPPLEMENT)
+    receipts = glob.glob(RECEIPTS_GLOB)
+    if not receipts:
+        print(f"REDACTION FAIL — no upload receipts matched {RECEIPTS_GLOB}; "
+              "refusing to run with an empty video-ID set.")
+        sys.exit(1)
+    for r in receipts:
+        try:
+            with open(r, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"REDACTION FAIL — cannot parse upload receipt {r}: {e}")
+            sys.exit(1)
+        for key in ("video_id", "deleted_video_id"):
+            v = d.get(key)
+            if isinstance(v, str) and v.strip():
+                ids.add(v.strip())
+    return sorted(ids)
+
+VIDEO_IDS = _collect_video_ids()
 
 # 1) Ordered, case-SENSITIVE structural replacements. Paths + compound tokens appear in
 #    fixed forms in the sources; longest/most-specific first so a short token never
@@ -82,6 +122,12 @@ s = re.sub(r"\bste(?:ven?s?|phens?)\b", "[AUTHOR]", s, flags=re.IGNORECASE)
 # scrub never rewrote. Mirror the check exactly so replace-set and check-set can't drift.
 s = re.sub(r"iris(?=[_.]\w)", "[ASSISTANT]", s, flags=re.IGNORECASE)
 s = re.sub(r"\biris\b", "[ASSISTANT]", s, flags=re.IGNORECASE)
+
+# Video ids: exact-substring scrub (also kills every URL form — youtu.be/<id>, watch?v=<id>,
+# youtube.com/embed/<id> — since the id substring itself is replaced). Case-SENSITIVE, since a
+# different casing is a different YouTube video; the residual check below mirrors this exactly.
+for _vid in VIDEO_IDS:
+    s = s.replace(_vid, "[VIDEO_ID]")
 
 # 2b) CREDENTIAL redaction. These are high-precision secret shapes that don't match prose.
 #     Each (pattern, flags) here is applied as a substitution AND re-scanned in the
@@ -139,6 +185,10 @@ for c in checks:
     bad += re.findall(c, s, flags=re.IGNORECASE)
 # the assignment pattern returns tuples (groups); normalize for display
 bad = [b if isinstance(b, str) else (b[0] if isinstance(b, tuple) else str(b)) for b in bad]
+# Video ids checked case-SENSITIVELY (exact str, mirroring the str.replace above) so the
+# replace-set and check-set can't drift — the same single-source-of-truth invariant the
+# identity/credential passes enforce.
+bad += [v for v in VIDEO_IDS if v in s]
 if bad:
     print("REDACTION FAIL — identifiers or credentials survived:", sorted(set(bad)))
     sys.exit(1)
