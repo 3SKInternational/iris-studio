@@ -30,6 +30,7 @@ Exit: 0 = pack written (a caption-less keyless video still ships frames-only,
 noted in INDEX.md) | 1 = real failure (download/extract error, bad args).
 Prints the pack path + file list last so the calling agent knows what to Read.
 """
+from __future__ import annotations  # PEP-604 unions (str | None) as lazy strings → imports clean on <3.10 (A-48)
 import argparse
 import json
 import os
