@@ -161,7 +161,11 @@ RUN_TABLE: dict[str, dict] = {
 #   path_tmpl: vault-relative, "NN" is the zero-padded video number
 #   kind: "dir" (≥1 file of `ext`, total size>0) | "file" (size>0)
 GATE_ARTIFACTS: dict[str, dict] = {
-    "4_vo_record": {"path_tmpl": f"{VAULT_REL}/Voice_Files/Video_NN", "kind": "dir", "ext": ".mp3"},
+    # A-44: automated VO renders to Voice_Files/Video_NN_gen (generate_vo.py /
+    # build_video.py default out); the base Voice_Files/Video_NN dir holds only the
+    # VO kit + legacy hand-recorded sets, so checking it never auto-promoted an
+    # automated render. Gate + stage-6 --vo-source (below) both point at _gen.
+    "4_vo_record": {"path_tmpl": f"{VAULT_REL}/Voice_Files/Video_NN_gen", "kind": "dir", "ext": ".mp3"},
 }
 
 # Short human labels for Telegram lines.
@@ -776,7 +780,7 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     cmd = [
         PYTHON, "build_video.py", vid, "--assemble",
         "--image-set", f"Raw_Assets/{vid}_HD",
-        "--vo-source", f"Voice_Files/{vid}",
+        "--vo-source", f"Voice_Files/{vid}_gen",  # A-44: automated VO lands in _gen
         "--align",
     ]
     try:
@@ -1915,7 +1919,8 @@ def _gate_note(key: str, video: int) -> str:
     v = f"Video_{nn(video)}"
     notes = {
         "3_vo_expand": "Draft/expand the VO script. Hand-edit this stage to status:done when ready.",
-        "4_vo_record": f"Record the VO in ElevenLabs (Brian) → BRANDS/3SK_Finance/Voice_Files/{v}/ "
+        "4_vo_record": f"Render the VO (build_video.py --vo, ElevenLabs Brian) → "
+                       f"BRANDS/3SK_Finance/Voice_Files/{v}_gen/ "
                        f"(auto-promotes when ≥1 fresh .mp3 lands).",
         "5_images": f"BILLED image batch. Confirm the scene manifest exists, then authorize: "
                     f"/pipeline {video} spend-ok (or --spend-ok).",
