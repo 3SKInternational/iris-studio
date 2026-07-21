@@ -238,6 +238,12 @@ def parse_inbox_steve_items() -> list[dict[str, str]]:
     Convention: TODAY items may carry per-line `🧍` markers; THIS WEEK section
     uses heading-level `## 🧍 THIS WEEK` and treats all its list items as
     Steve-required. Heading lines themselves are never captured.
+
+    Only the openers' *direct* list items count. Any deeper heading nested
+    inside (e.g. `### 🌙 Cowork pulse (…)`, `### 🌅 Pre-brief sweep`) is digest
+    narration by contract and ENDS ingestion — otherwise every pulse/sweep
+    bullet under THIS WEEK is ingested as if it were a pending Steve action
+    (the 2026-07-20 C2-noise root cause: ~75% of rows were pulse telemetry).
     """
     if not INBOX.exists():
         return []
@@ -253,8 +259,10 @@ def parse_inbox_steve_items() -> list[dict[str, str]]:
         if re.match(r"^##\s+🧍\s+THIS\s+WEEK", line):
             section = "THIS_WEEK"
             continue
-        if line.startswith("## ") and section is not None:
-            # Any other ## heading ends the action surface
+        if re.match(r"^#{2,6}\s", line) and section is not None:
+            # Any other heading — a sibling `##` OR a nested `###` digest
+            # subsection — ends the action surface. The two openers above are
+            # already `continue`d, so this only fires on non-action headings.
             section = None
             continue
         if section is None:
@@ -281,12 +289,22 @@ def _update_seen_and_compute_days(
     seen: dict[str, dict[str, str]],
     today: str,
 ) -> list[dict[str, str]]:
-    """Tag each INBOX item with a slug + days-pending; updates the seen dict."""
+    """Tag each INBOX item with a slug + days-pending; updates the seen dict.
+
+    Dedup by slug: two list items that normalize to the same slug are the same
+    item and collapse to one row (belt-and-suspenders for identical action
+    lines regardless of source — the section fix already excludes the digest
+    subsections that produced the 7 duplicate `Pulse fired` rows on 2026-07-20).
+    """
     out = []
+    emitted: set[str] = set()
     for item in inbox_items:
         slug = _slugify(item["text"])
         if not slug:
             continue
+        if slug in emitted:
+            continue
+        emitted.add(slug)
         if slug in seen:
             seen[slug]["last_seen"] = today
             # If text drifted, keep the freshest wording
@@ -417,8 +435,59 @@ def write_inbox(section: str) -> str:
     return f"INBOX.md {action}"
 
 
+def _selftest() -> int:
+    """Guard the C2-noise fix: nested `###` digest bullets excluded, direct
+    TODAY/THIS WEEK bullets kept, identical bullets deduped. Uses a temp INBOX."""
+    import tempfile
+
+    global INBOX
+    sample = (
+        "---\n"
+        "## 📌 TODAY\n"
+        "1. **🎬 V13 spend-ok** — release renders\n"
+        "2. 🤝 One word to apply the rewrites\n"
+        "## 🧍 THIS WEEK\n"
+        "- 🔎 Monthly contradiction audit: 4 items need your call\n"
+        "- 🔎 Monthly contradiction audit: 4 items need your call\n"  # dup
+        "### 🌙 Cowork pulse (2026-07-20)\n"
+        "- ⏱️ Pulse fired ~03:05\n"
+        "- 🏁 MILESTONE: Phase 5 complete\n"
+        "### 🌅 Pre-brief sweep (2026-07-20)\n"
+        "- ⏱️ Pulse fired ~03:05\n"
+        "## ⚖️ DECISION QUEUE\n"
+        "- this must never be captured\n"
+    )
+    orig = INBOX
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
+        fh.write(sample)
+        INBOX = Path(fh.name)
+    try:
+        items = parse_inbox_steve_items()
+        texts = [i["text"] for i in items]
+        # Direct openers' bullets are kept
+        assert any("V13 spend-ok" in t for t in texts), texts
+        assert any("One word" in t for t in texts), texts
+        assert any("contradiction audit" in t for t in texts), texts
+        # Nested ### digest bullets are excluded
+        assert not any("Pulse fired" in t for t in texts), texts
+        assert not any("MILESTONE" in t for t in texts), texts
+        # Sibling ## section past THIS WEEK is excluded
+        assert not any("never be captured" in t for t in texts), texts
+        # Dedup: identical contradiction-audit bullet collapses to one row
+        rows = _update_seen_and_compute_days(items, {}, _today_iso())
+        audit_rows = [r for r in rows if "contradiction audit" in r["text"]]
+        assert len(audit_rows) == 1, audit_rows
+    finally:
+        os.unlink(INBOX)
+        INBOX = orig
+    print("stale_on_you selftest: PASS")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
+    if "--selftest" in args:
+        return _selftest()
     write_mode = "--write-inbox" in args
 
     today = _today_iso()
