@@ -79,7 +79,18 @@ STAGE_REVIEW_GLOB = {
 
 # A deliberate human "this gate is closed" marker in review frontmatter. Anchored
 # so `resolution-prior-revise:` (an intermediate note) is NOT matched.
-RESOLUTION_RE = re.compile(r"^resolution:\s*\S", re.MULTILINE)
+# `[^\S\n]*` is horizontal whitespace ONLY. `\s*` also matched newlines, so a
+# valueless `resolution:` followed by the frontmatter's `---` read as a close and
+# this lint reported a stale-open finding that wasn't real — phantom work.
+#
+# DELIBERATELY BROADER than pipeline_orchestrator's A-51 gate, which additionally
+# requires the stamp to sit in FRONTMATTER, to read `closed-fix-applied*`, and to
+# post-date the deps. This lint therefore counts as "closed" some files the gate
+# will refuse to act on (e.g. `overtaken-by-publish`, or a stamp quoted in a body).
+# That asymmetry is the safe direction for a REPORTER — it over-reports a possible
+# stale-open for a human to eyeball, where the gate must never over-promote. Do not
+# "sync" them by loosening the gate.
+RESOLUTION_RE = re.compile(r"^resolution:[^\S\n]*\S", re.MULTILINE)
 
 
 def nn(video):

@@ -682,7 +682,7 @@ def run_agent_stage(key: str, video: int, stages: dict) -> tuple[bool, str]:
     if key == "2_review":
         return run_script_review_gate(video)
     if key in STAGE_REVIEW:
-        return run_stage_review_gate(key, video)
+        return run_stage_review_gate(key, video, stages)
     return _dispatch_stage_agent(key, video)
 
 
@@ -1578,6 +1578,185 @@ def _stage_review_verdict_rel(key: str, video: int) -> str:
     return STAGE_REVIEW[key]["verdict_tmpl"].replace("NN", nn(video))
 
 
+# A-51 / DQ-39 — the "this gate is closed" marker, written into the review
+# file's frontmatter per the resolution-stamp convention.
+#
+# Anchored to a line start with a non-space value, so `resolution-prior-revise:`
+# (an intermediate note about an EARLIER pass, not a close) can never impersonate
+# a final sign-off. Identical semantics to pipeline_stage_truth_lint.RESOLUTION_RE,
+# which is the READ-side detector for the same convention — that lint reports the
+# mismatch, this honours it.
+#
+# `[^\S\n]*` is horizontal whitespace ONLY — deliberately not `\s*`, which matches
+# newlines and made a valueless `resolution:` followed by the frontmatter's `---`
+# read as a close. That is a false PROMOTE: a half-typed stamp would advance a
+# stage. Caught by test_empty_resolution_value_is_not_a_close.
+_RESOLUTION_RE = re.compile(r"^resolution:[^\S\n]*(\S[^\n]*)", re.MULTILINE)
+
+# CLAUDE.md defines three stamp values. Only ONE means "the fix landed and a
+# re-review passed clean" — the only thing that may advance a stage:
+#   closed-fix-applied ......... fixed + re-reviewed clean       -> HONOURED
+#   closed-by-steve-decision ... Steve shipped it as-is          -> NOT honoured
+#   overtaken-by-publish ....... video shipped WITHOUT the fix   -> NOT honoured
+# The latter two record that a gate stopped mattering; they are not evidence the
+# artifact passed. Auto-producing downstream work off them builds on an artifact
+# nobody ever approved.
+_HONOURED_RESOLUTION = "closed-fix-applied"
+
+
+def _frontmatter(text: str) -> str:
+    """The leading `---` … `---` block, or "" when there isn't one.
+
+    The convention puts `resolution:` in FRONTMATTER. Scanning the whole file
+    promoted a REVISE'd stage whose BODY merely quoted the convention — including
+    inside a ``` fence, which reviewers do write when telling a human how to close
+    a gate. Frontmatter-only is both the documented contract and a far smaller
+    surface.
+    """
+    text = text.lstrip("﻿")
+    if not text.startswith("---"):
+        return ""
+    end = text.find("\n---", 3)
+    return text[:end] if end != -1 else ""
+
+
+def _stage_review_files(key: str, video: int) -> list[Path]:
+    """Every review file that could carry this stage's close, newest mtime first.
+
+    Humans stamp the OPERATIVE pass, which is rarely the base filename — the vault
+    holds `Video_01_Packaging_Review_v3.md`, `Video_13_Description_Review_v8_
+    2026-07-16.md`, `..._Pass3.md`. Reading only `verdict_tmpl` made this fix inert
+    for the exact workflow it was built for.
+
+    The glob is the verdict template's own stem + a wildcard, so it stays derived
+    from STAGE_REVIEW (no retyped path map) yet stays tight enough to exclude a
+    DIFFERENT review sharing the video number: `Video_Descriptions/_REVIEW/` holds
+    both `Video_01_Description_Review.md` and `Video_01_Search_Rewrite_Review.md`,
+    and a loose `*Video_01*` glob would promote off the wrong one.
+
+    A reordered name (`Packaging_Video_13_Review.md`) is deliberately NOT matched —
+    a false negative costing one unnecessary gate run, which is the safe direction.
+    """
+    try:
+        rel = _stage_review_verdict_rel(key, video)
+    except KeyError:
+        return []
+    p = vault_abs(rel)
+    if p is None:
+        return []
+    try:
+        cands = [f for f in p.parent.glob(p.stem + "*.md") if f.is_file()]
+        return sorted(cands, key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def _honoured_stamp(f: Path) -> str | None:
+    """This file's `resolution:` value if it is an honoured close, else None.
+
+    Frontmatter only, and only `closed-fix-applied*` — see _frontmatter and
+    _HONOURED_RESOLUTION for why each of those is load-bearing. Any read error,
+    missing frontmatter, absent stamp, or non-honoured value is None (= block).
+    """
+    try:
+        fm = _frontmatter(f.read_text(encoding="utf-8", errors="replace")[:8000])
+    except OSError:
+        return None
+    if not fm:
+        return None
+    m = _RESOLUTION_RE.search(fm)
+    if not m:
+        return None
+    val = m.group(1).strip().strip('"').strip()
+    return val[:80] if val.lower().startswith(_HONOURED_RESOLUTION) else None
+
+
+def _resolution_closed_stage(key: str, video: int,
+                        newer_than: float | None = None) -> tuple[bool, str]:
+    """Is this stage's review gate closed — cleanly, and since the deps ran?
+
+    NOTE: a `resolution:` stamp is usually written by a REVIEWER AGENT, not by
+    Steve — description-/image-/vo-reviewer.md all instruct stamping the old
+    verdict file on a clean re-review. So this is "the convention says this gate
+    is closed", NOT "a human personally approved this". Do not over-trust it;
+    that is why the honoured value, the frontmatter scan and the freshness
+    bound are all narrow.
+
+    Root cause this fixes (A-51): run_stage_review_gate is RE-ENTRANT — it
+    re-derives its verdict from scratch on every hourly sweep. Once an artifact was fixed,
+    an artifact, got a clean re-review, and stamped `resolution:` on the review
+    file, the gate could not see that stamp, so it re-dispatched the producer AND
+    the reviewer, re-graded, and parked the stage right back at needs-steve. The
+    close was silently overwritten every hour, re-spending two opus calls
+    per sweep on already-approved work.
+
+    `newer_than` (the deps' freshness threshold) is what stops a stamp being
+    permanently sticky. A stamp is evidence about the artifact that existed WHEN it
+    was written; one older than the upstream work it supposedly approved proves
+    nothing. Without it, `--force-init` — which rewrites state but leaves review
+    files on disk — would auto-promote every gated stage to done having produced
+    nothing, and a hand-reset stage would publish a stale artifact against a
+    rewritten script.
+
+    Every failure mode — no file, unreadable, no frontmatter, wrong stamp value,
+    stale, or an open REVISE — returns False and runs the full gate. No error path
+    promotes.
+    """
+    cands = _stage_review_files(key, video)
+    if not cands:
+        return False, ""
+
+    # A newer OPEN verdict always beats an older close. Without this the scan
+    # simply walks past an unstamped REVISE to whatever older file happens to
+    # carry a stamp — and the vault's real convention makes that the common case,
+    # not an edge case: the human stamps the file that RECORDED the problem (the
+    # base Video_NN_..._Review.md, whose own VERDICT line still reads REVISE),
+    # while the clean re-reviews land in newer _v2.._v8 siblings. So "is anything
+    # currently open?" has to be answered from the NEWEST file, independently of
+    # where the stamp lives.
+    #
+    # ...OR there is exactly ONE review file and it carries the close. That is the
+    # single-file shape CLAUDE.md documents ("add `resolution:` to that verdict
+    # file's frontmatter + a top ✅ RESOLUTION blockquote"): one review, VERDICT
+    # still REVISE, closed in place. A SHIP-only veto left A-51 unfixed for the
+    # very workflow the convention prescribes.
+    #
+    # `len(cands) == 1` is load-bearing, NOT belt-and-braces. Without it the
+    # STAMP-BUMP ordering promotes a stage with an open re-review: the reviewer
+    # agent defs (description-/image-/vo-reviewer.md) instruct stamping the OLD
+    # verdict file, and writing that stamp last bumps the old REVISE-bearing file's
+    # mtime ABOVE the re-review that superseded it — so the newest candidate is a
+    # stamped REVISE while a sibling REVISE is still open. That ordering is present
+    # in live data (Video_13_Description_Review.md 07:38 stamped-REVISE vs its
+    # _v2 re-review 07:37); V13 escapes only because _v3.._v8 landed later.
+    #
+    # The rule: the stamped-but-REVISE escape hatch exists solely for "there is
+    # only one review and it was closed in place." Once a second review file
+    # exists, SHIP-on-the-newest is the only thing that says nothing is still open,
+    # and a stamp cannot substitute for it.
+    #
+    # Fail-safe: _parse_image_verdict returns None when it can't find a token, and
+    # None is not SHIP, so an unreadable or unparseable newest review blocks.
+    try:
+        newest = _parse_image_verdict(
+            cands[0].read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return False, ""
+    if newest != "SHIP" and not (len(cands) == 1 and _honoured_stamp(cands[0])):
+        return False, ""
+
+    for f in cands:
+        try:
+            if newer_than is not None and f.stat().st_mtime <= newer_than:
+                continue
+        except OSError:
+            continue
+        stamp = _honoured_stamp(f)
+        if stamp:
+            return True, stamp
+    return False, ""
+
+
 def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
     """Dispatch a producer stage's dedicated reviewer and read back its BINARY
     verdict. Returns (verdict, vrel, detail): SHIP (clean → advance), REVISE
@@ -1660,7 +1839,8 @@ def run_stage_review_loop(key: str, video: int) -> tuple[str, str, str]:
     return verdict, vrel, detail
 
 
-def run_stage_review_gate(key: str, video: int) -> tuple[bool, str]:
+def run_stage_review_gate(key: str, video: int,
+                          stages: dict | None = None) -> tuple[bool, str]:
     """PRODUCE-THEN-REVIEW executor for a producer stage under the BINARY policy.
     Step 1: dispatch the producer (the bare stage agent). If it fails to run, return
     that failure unchanged — no point reviewing a non-existent artifact. Step 2: run
@@ -1669,7 +1849,36 @@ def run_stage_review_gate(key: str, video: int) -> tuple[bool, str]:
     left 'ready' and retried next sweep (self-heals on a transient reviewer/auth
     outage; parks after MAX_INFRA). The whole produce-then-review gate re-runs on
     retry — acceptable: these stages bill nothing. REVISE (or any non-SHIP surviving
-    the fix budget) parks: returns False so the stage goes needs-steve."""
+    the fix budget) parks: returns False so the stage goes needs-steve.
+
+    Step 0 (A-51 / DQ-39): if `resolution: closed-fix-applied` is stamped
+    on this stage's review file SINCE the deps completed, that close WINS — advance
+    without re-dispatching producer or reviewer. Without this the gate re-opens a
+    resolution-closed stage every sweep. `stages` is required for the freshness check;
+    when it is None (a direct call outside the normal path) Step 0 is skipped
+    entirely — no stages, no freshness proof, no promote."""
+    if stages is not None:
+        threshold, deps_incomplete = deps_freshness_threshold(key, stages)
+        # deps_incomplete => an upstream stage is not actually done, so nothing
+        # downstream may auto-promote off it. Same fail-closed rule the other
+        # auto-promotions in this file already enforce.
+        if not deps_incomplete:
+            closed, stamp = _resolution_closed_stage(key, video, newer_than=threshold)
+            if closed:
+                # Secondary sanity check only. It is NOT a strong guard: for
+                # 7_packaging / 11_analyze the declared artifact is a channel-wide
+                # DIRECTORY (true for any video, even one that never ran) and for
+                # 12_leadmagnet there is no declared path at all. The real
+                # protections are the frontmatter-only scan, the closed-fix-applied
+                # requirement, and the freshness threshold above.
+                ok_art, why = _producer_artifact_ok(key, video)
+                if ok_art:
+                    return True, (f"resolution-closed: `resolution: {stamp}` (post-deps) — "
+                                  f"honouring the close, producer + "
+                                  f"{STAGE_REVIEW[key]['reviewer']} NOT re-dispatched "
+                                  f"(A-51).")
+                print(f"  {key}: review is resolution-stamped but {why} — ignoring "
+                      f"the stamp and running the full gate.", file=sys.stderr)
     ok, out = _dispatch_stage_agent(key, video)
     if not ok:
         return False, out
