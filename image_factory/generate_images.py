@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import difflib
 import json
 import os
 import re
@@ -352,6 +354,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input-fidelity", choices=VALID_FIDELITY, help="Reference fidelity (edits endpoint). 'high' holds the character.")
     p.add_argument("--output", help="Override the manifest's output_dir.")
     p.add_argument("--limit", type=int, help="Generate at most N images (smoke test).")
+    p.add_argument("--only", action="append", metavar="NAME[,NAME...]",
+                   help="Render ONLY these shot names (repeatable, or comma-separated). "
+                        "For a RENDERS-gate re-roll of specific failed shots. An "
+                        "unmatched name is a fatal error, never a silent no-op. "
+                        "Note: existing PNGs are skipped by default, so a re-roll "
+                        "also needs --force (or delete those PNGs first).")
     p.add_argument("--force", action="store_true", help="Re-render images whose PNG already exists.")
     p.add_argument("--dry-run", action="store_true", help="Plan + cost estimate; no API calls, no writes.")
     # Runaway-spend guardrail. A real flagship batch is ~40-80 shots (~$8-9). A
@@ -423,6 +431,85 @@ def main() -> None:
         if not rp.exists():
             die(f"reference image not found: {rp}")
         ref_paths.append(rp)
+
+    # --only: restrict the batch to named shots (RENDERS-gate re-roll). Applied
+    # HERE, once, before validation / cost estimate / spend guard / the billed
+    # loop, so the dry-run estimate and the actual spend cannot diverge — on the
+    # billed path that divergence would be a lying cost estimate under the $8 cap.
+    #
+    # An unmatched name is FATAL, never a silent no-op: the failure mode we
+    # refuse is a typo'd shot quietly rendering nothing (Steve reads "done: 0
+    # generated" as success and ships a stale PNG) or, worse, falling through to
+    # the full batch and re-paying for shots we already own — which is the exact
+    # spend DQ-33 exists to stop.
+    if args.only:
+        if args.limit is not None:
+            # --limit slices by MANIFEST order, so it would silently bill a
+            # re-roll of a shot you did not ask for (--only B,A --limit 1
+            # renders A). Both are "render less"; requiring one is unambiguous.
+            die("--only and --limit cannot be combined: --limit slices by manifest "
+                "order, so it would silently drop or substitute shots you named. "
+                "Use --only alone to pick exact shots.")
+        wanted = [n.strip() for spec in args.only for n in spec.split(",") if n.strip()]
+        if not wanted:
+            # An empty/whitespace/comma-only value (classic unset `--only "$SHOTS"`)
+            # must NOT fall through to "0 rendered, exit 0" — that reads as success
+            # and ships stale PNGs, the exact failure this flag exists to prevent.
+            die("--only: no shot names given (empty value). Omit --only to render "
+                "the whole manifest.")
+        have = [str(i.get("name") or "") for i in images if isinstance(i, dict)]
+        have_set = set(have)
+        missing = [n for n in wanted if n not in have_set]
+        if missing:
+            # Suggest for the first few missing names, not just the first — with
+            # one typo among several, suggestions that silently cover only one of
+            # them read as "the rest are fine".
+            near = []
+            for _m in missing[:3]:
+                for _c in difflib.get_close_matches(_m, sorted(have_set), n=3, cutoff=0.5):
+                    if _c not in near:
+                        near.append(_c)
+            if not near:
+                near = sorted(h for h in have_set if any(n.lower() in h.lower() for n in missing))
+            shown = ", ".join(missing[:10]) + (f" (+{len(missing) - 10} more)" if len(missing) > 10 else "")
+            die(f"--only: shot(s) not in this manifest: {shown}"
+                + (f"\n  did you mean: {', '.join(near[:8])}" if near else "")
+                + f"\n  manifest has {len(have_set)} shot(s).")
+        # Duplicate names are real in this corpus (Video_01_orchestrated.json has
+        # 6), and they are NOT copy-paste dupes — the paired entries carry
+        # DIFFERENT prompts (e.g. Shot_04c is both a dining-table scene and a
+        # split-screen). A full batch renders both to the same dest, so os.replace
+        # leaves the LAST entry on disk and the earlier render is money burned.
+        #
+        # Therefore --only must keep the LAST entry per name: that is the image
+        # actually on disk, and a re-roll exists to replace what is on disk.
+        # Keeping the FIRST would spend ~$0.13 to silently swap a shipped,
+        # reviewed frame for a different scene, and report success doing it.
+        keep, dropped = set(wanted), 0
+        by_name = {}
+        for i in images:
+            if not isinstance(i, dict):
+                continue
+            nm = str(i.get("name") or "")
+            if nm not in keep:
+                continue
+            if nm in by_name:
+                dropped += 1
+            by_name[nm] = i          # last wins, matching the full batch
+        images = list(by_name.values())
+        if dropped:
+            print(f"--only  : WARNING — {dropped} duplicate manifest entr(ies) for the "
+                  f"named shot(s); using the LAST of each (the one a full batch leaves "
+                  f"on disk). Rename them in the manifest.")
+        print(f"--only  : {len(images)} of {len(have_set)} shot(s) — {', '.join(wanted)}\n")
+
+    _dups = sorted(n for n, c in collections.Counter(
+        str(i.get("name") or "") for i in images if isinstance(i, dict)).items() if c > 1)
+    if _dups:
+        print(f"WARNING: duplicate shot name(s) in this batch: {', '.join(_dups[:8])}"
+              f"{f' (+{len(_dups) - 8} more)' if len(_dups) > 8 else ''}\n"
+              f"  Each duplicate BILLS TWICE and the later render overwrites the earlier "
+              f"PNG. Rename them in the manifest.\n", file=sys.stderr)
 
     if args.limit is not None:
         images = images[: args.limit]
@@ -531,12 +618,24 @@ def main() -> None:
 
         dest = out_dir / f"{name}.png"
         est = estimate_cost(model, quality, size, full_prompt, len(these_refs))
-        est_total += est
 
-        if dest.exists() and not args.force and not args.dry_run:
-            print(f"  = {name}  (exists, skipped)")
+        # Dry-run honours skip-existing too. It used to ignore it, so the
+        # estimate counted images the real run would skip — harmless when you
+        # dry-ran a fresh batch, actively misleading now that --only exists,
+        # since a re-roll targets shots whose PNGs already exist BY DEFINITION.
+        # (The pre-flight spend guard always excluded them; only this display
+        # path disagreed. Over-estimate, never a surprise bill — but a dry run
+        # that says $0.25 for a run that bills $0.00 is a lying estimate, and
+        # the $8 cap is enforced on the strength of these numbers.)
+        if dest.exists() and not args.force:
+            print(f"  = {name}  (exists, {'would skip — needs --force' if args.dry_run else 'skipped'})")
             skipped += 1
             continue
+
+        # Counted only once the shot is known to actually bill, so the run total
+        # can never exceed what the run spends (it fed the "estimated ~$X total"
+        # summary that the $8/video cap is judged against).
+        est_total += est
 
         ref_tag = f"/{len(these_refs)}ref:{b_fidelity}" if fidelity_active else f"/{len(these_refs)}ref"
         tag = f"{quality}/{size}" + (ref_tag if these_refs else "/no-ref")
@@ -616,7 +715,11 @@ def main() -> None:
 
     print()
     if args.dry_run:
-        print(f"dry run: {len(images)} image(s), estimated ~${est_total:.2f} total")
+        # Report what would BILL, not what was walked — "12 image(s), ~$0.00"
+        # invites reading the count as the spend. Skipped shots are named above.
+        print(f"dry run: {len(images) - skipped - failed} of {len(images)} image(s) would bill, "
+              f"estimated ~${est_total:.2f} total"
+              + (f" ({skipped} already exist — add --force to re-render)" if skipped else ""))
     else:
         line = f"done: {made} generated, {skipped} skipped, {failed} failed"
         if saw_usage:
