@@ -6,7 +6,8 @@
   Proactive early-warning probe for the failure modes that silently break EVERY
   headless `claude --print` launchd job at once:
     1. AUTH (primary)  — stale Claude CLI OAuth token / out of credits (401).
-                         Human-only fix: `claude login`. Tested via the real
+                         Human-only fix: `claude auth login` (NOT `claude login` —
+                         no such subcommand). Tested via the real
                          claude binary, so it is high-confidence.
     2. VAULT (proxy)   — a scheduled job can't read the INTERNAL-disk vault
                          (broad FDA revocation for background jobs).

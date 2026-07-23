@@ -5,8 +5,13 @@
 #   1. AUTH  (primary, high-confidence) — the Claude CLI OAuth token (Claude Max
 #            login) goes stale and the CLI returns "401 Invalid authentication
 #            credentials" (or runs out of credits). The fix is manual + human-only:
-#            `claude login` (a.k.a. `/login` inside the TUI) on the Mini. Nothing
-#            can auto-fix it. This probe runs the REAL `claude` binary, so it is a
+#            `claude auth login` on the Mini (NOT `claude login` — no such
+#            subcommand; the CLI parses it as a prompt and appears to do nothing.
+#            This header said `claude login` until 2026-07-22 and cost a real
+#            outage's worth of confusion). `claude auth status` is NOT proof: it
+#            reports loggedIn:true off a merely-present credential without
+#            validating expiry. Nothing can auto-fix a dead token if the stored
+#            refreshToken is empty. This probe runs the REAL `claude` binary, so it is a
 #            direct, trustworthy test of the exact thing the scheduled jobs do.
 #
 #   2. VAULT (internal-disk proxy) — can a scheduled job READ the vault at all? This
@@ -256,7 +261,12 @@ if [ -n "$effective_bad" ]; then
     # ---- BROKEN (one or more dimensions are/remain down) ----
     reason="$(printf '%s' "$effective_bad" | tr ' ' '+')"
     body=""
-    _has "$effective_bad" "auth"  && body="${body}• AUTH: run \`claude login\` (or \`/login\` in the TUI) in a Terminal on the Mini — a 401 = stale OAuth token (or out of Max credits). Blocks EVERY headless claude job until cleared."$'\n'
+    # The command is `claude auth login` — there is NO `claude login` subcommand.
+    # This text said `claude login` until 2026-07-22: the CLI parses that as a
+    # PROMPT (it answers the word "login" as a question, then 401s on the dead
+    # token), so following the alert looked like it silently did nothing.
+    # Verified against `claude auth --help` on 2.1.176.
+    _has "$effective_bad" "auth"  && body="${body}• AUTH: run \`claude auth login\` in a Terminal on the Mini. NOT \`claude login\` — that is not a command, it gets parsed as a prompt and appears to do nothing. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
     _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't read the vault (EPERM). Re-grant Full Disk Access to the background job's binary (System Settings ▸ Privacy & Security)."$'\n'
     _has "$effective_bad" "mount" && body="${body}• AI_WORKSPACE MOUNT: scheduled jobs can't READ /Volumes/AI_Workspace (EPERM) — the iris_studio repo + every job script live there, so the WHOLE fleet is down. Fix (~2 min): System Settings ▸ Privacy & Security ▸ Full Disk Access ▸ remove + re-add /opt/homebrew/bin/claude. A \`brew upgrade claude-code\` revokes it. Durable fix: relocate iris_studio to the internal disk (DQ-17)."$'\n'
 
