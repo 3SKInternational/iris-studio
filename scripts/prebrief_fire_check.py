@@ -12,6 +12,12 @@ not a hand-maintained table — so newly-added scheduled routines get silent-ski
 detection automatically instead of firing uncovered. Interval/manual jobs are
 listed as a coverage note (the daily/weekly model doesn't fit them yet).
 
+The iris.py APScheduler dispatch fires (chief-of-staff-weekly, market-researcher-
+monthly, decision-feeder-deadline-watch) are likewise auto-derived from the
+daemon's own AUTONOMOUS_DISPATCHES list (`collect_dispatch_expected`) instead of a
+re-typed schedule — same single-source-of-truth reason, and it closed the gap
+where decision-feeder had no silent-skip coverage at all.
+
 Catches the silent-skip class — the 2026-06-01 App Nap miss where the morning
 brief + chief-of-staff-weekly + market-researcher-monthly all skipped with
 zero error signal because APScheduler logged "missed by 7:54:35" and moved
@@ -239,6 +245,99 @@ def _last_fire_monthly(
     return cand
 
 
+# === Auto-derive iris.py APScheduler dispatch coverage from the daemon itself ===
+# The two dispatch checks below (chief-of-staff-weekly / market-researcher-monthly)
+# used to re-type iris.py's schedule by hand — the same drift class that made the
+# old youtube-research {WED} check and the morning-brief-hour check phantom-alert
+# (a schedule moved in the daemon, the hand-typed copy here rotted). This reads
+# iris.py's OWN `AUTONOMOUS_DISPATCHES` list, so the daemon is the single source of
+# truth. It also picked up decision-feeder-deadline-watch, which had NO coverage
+# at all. Verified every entry writes a `dispatches` row on fire (decision-feeder
+# records one daily even on its skip-on-empty nights), so all are detectable.
+IRIS_PY_PATH = Path(__file__).resolve().parent.parent / "iris.py"
+
+# APScheduler day_of_week names → Python weekday() ints (both use Mon=0).
+_DOW_NAMES = {"mon": MON, "tue": TUE, "wed": WED, "thu": THU,
+              "fri": FRI, "sat": SAT, "sun": SUN}
+
+
+def _parse_dow(spec) -> set[int]:
+    """APScheduler day_of_week ('mon', 'mon,thu', or 0-6 Mon=0) → weekday set."""
+    out: set[int] = set()
+    for tok in str(spec).split(","):
+        tok = tok.strip().lower()
+        if tok in _DOW_NAMES:
+            out.add(_DOW_NAMES[tok])
+        elif tok.isdigit():
+            out.add(int(tok) % 7)  # APScheduler numeric dow is Mon=0 too
+    return out
+
+
+def _load_autonomous_dispatches(path: Path = IRIS_PY_PATH) -> list[dict]:
+    """AST-extract iris.py's AUTONOMOUS_DISPATCHES without importing the daemon
+    (importing iris.py would pull telegram/apscheduler/anthropic + run side
+    effects). Returns [] on any read/parse failure — degrade safe, never crash the
+    pre-brief. Adjacent-string prompts fold to one Constant at parse time, so
+    literal_eval handles each entry; a non-literal entry is skipped, not fatal."""
+    import ast
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    for node in tree.body:
+        # The real declaration is annotated (`AUTONOMOUS_DISPATCHES: list[dict] =
+        # [...]` → ast.AnnAssign), so accept both AnnAssign and plain Assign.
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = node.targets
+        else:
+            continue
+        if not isinstance(node.value, ast.List):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "AUTONOMOUS_DISPATCHES"
+                   for t in targets):
+            continue
+        out: list[dict] = []
+        for elt in node.value.elts:
+            try:
+                val = ast.literal_eval(elt)
+            except (ValueError, SyntaxError, TypeError):
+                continue  # a non-literal entry — skip, don't crash
+            if isinstance(val, dict):
+                out.append(val)
+        return out
+    return []
+
+
+def collect_dispatch_expected(now: datetime, path: Path = IRIS_PY_PATH) -> list[Expected]:
+    """Derive the autonomous-dispatch fires straight from iris.py's own schedule."""
+    expected: list[Expected] = []
+    for entry in _load_autonomous_dispatches(path):
+        agent = entry.get("agent_name")
+        name = entry.get("name")
+        tk = entry.get("trigger_kwargs") or {}
+        if not agent or not name or not isinstance(tk, dict):
+            continue
+        try:
+            hour = int(tk.get("hour", 0))
+            minute = int(tk.get("minute", 0))
+        except (TypeError, ValueError):
+            continue
+        if "day_of_week" in tk:
+            t = _last_fire_weekly(now, _parse_dow(tk["day_of_week"]), hour, minute)
+        elif "day" in tk:
+            try:
+                t = _last_fire_monthly(now, int(tk["day"]), hour, minute)
+            except (TypeError, ValueError):
+                continue
+        else:
+            t = _last_fire_daily(now, hour, minute)
+        if t:
+            expected.append(Expected(name, t, "dispatch", agent_name=agent))
+    return expected
+
+
 def collect_expected(now: datetime) -> list[Expected]:
     """Build the list of fires that *should* have happened in (now-24h, now]."""
     expected: list[Expected] = []
@@ -293,19 +392,12 @@ def collect_expected(now: datetime) -> list[Expected]:
         expected.append(Expected(
             "expense_categorizer_sweep", t, "expense_run",
         ))
-    if (t := _last_fire_weekly(now, {MON}, 5, 30)):
-        expected.append(Expected(
-            "chief-of-staff-weekly", t, "dispatch",
-            agent_name="chief-of-staff",
-        ))
-    # youtube-researcher-weekly's hardcoded dispatch check lived here until
-    # 2026-07-22 — deleted, now covered by auto-derive off its plist. See the
-    # _AUTODERIVE_SKIP comment for why the dispatch signal stopped existing.
-    if (t := _last_fire_monthly(now, 1, 2, 0)):
-        expected.append(Expected(
-            "market-researcher-monthly", t, "dispatch",
-            agent_name="market-researcher",
-        ))
+    # chief-of-staff-weekly / market-researcher-monthly / decision-feeder-daily
+    # are auto-derived from iris.py's AUTONOMOUS_DISPATCHES (see collect_dispatch_
+    # expected) — single source of truth, no re-typed schedule to rot. youtube-
+    # researcher-weekly used to be hand-typed here too; it moved to a launchd plist
+    # (now covered by collect_launchd_expected off the plist, per _AUTODERIVE_SKIP).
+    expected += collect_dispatch_expected(now)
 
     return expected
 
@@ -466,6 +558,95 @@ def _selftest_youtube_coverage() -> int:
     return failures
 
 
+def _selftest_dispatch_coverage() -> int:
+    """Pins the iris.py dispatch auto-derive (the drift-rot fix). Two parts:
+    (1) HERMETIC — parse a fixture AUTONOMOUS_DISPATCHES (weekly/monthly/daily,
+        with an adjacent-string prompt like the real entries) and assert each
+        maps to an Expected at fire-time and to nothing off-schedule.
+    (2) LIVE — read the real iris.py; skip if unavailable; else assert every
+        entry is structurally coverable (agent_name + name + a trigger we map),
+        so a schedule that stops being parseable/coverable fails loudly here."""
+    import os
+    import tempfile
+    failures = 0
+
+    fixture = (
+        'AUTONOMOUS_DISPATCHES = [\n'
+        '    {\n'
+        '        "name": "cos-weekly",\n'
+        '        "agent_name": "chief-of-staff",\n'
+        '        # a comment between keys, like the real entries\n'
+        '        "trigger_kwargs": {"day_of_week": "mon", "hour": 5, "minute": 30},\n'
+        '        "prompt": (\n'
+        '            "line one "\n'
+        '            "line two"\n'
+        '        ),\n'
+        '    },\n'
+        '    {\n'
+        '        "name": "mr-monthly",\n'
+        '        "agent_name": "market-researcher",\n'
+        '        "trigger_kwargs": {"day": 1, "hour": 2, "minute": 0},\n'
+        '        "prompt": "x",\n'
+        '    },\n'
+        '    {\n'
+        '        "name": "df-daily",\n'
+        '        "agent_name": "decision-feeder",\n'
+        '        "trigger_kwargs": {"hour": 3, "minute": 40},\n'
+        '        "prompt": "y",\n'
+        '    },\n'
+        ']\n'
+    )
+    fd, tmp = tempfile.mkstemp(suffix="_iris_fixture.py")
+    os.close(fd)
+    try:
+        Path(tmp).write_text(fixture, encoding="utf-8")
+        tp = Path(tmp)
+        # Mon 2026-07-20 06:00 — weekly + daily fired in last 24h, monthly did not.
+        got = {e.agent_name for e in collect_dispatch_expected(datetime(2026, 7, 20, 6, 0), tp)}
+        for want_agent, want_in in [
+            ("chief-of-staff", True),   # Mon 05:30 < now, within 24h
+            ("decision-feeder", True),  # 03:40 today < now, within 24h
+            ("market-researcher", False),  # monthly 1st — not near 7/20
+        ]:
+            ok = (want_agent in got) == want_in
+            if not ok:
+                failures += 1
+            print(f"  [{'PASS' if ok else 'FAIL'}] dispatch fixture {want_agent} "
+                  f"emitted={want_agent in got} (want {want_in})")
+        # 1st of month 03:00 — monthly fired (02:00 < now, <24h); weekly (Mon) did
+        # not unless the 1st is a Monday. 2026-07-01 is a Wednesday, so weekly off.
+        got2 = {e.agent_name for e in collect_dispatch_expected(datetime(2026, 7, 1, 3, 0), tp)}
+        for want_agent, want_in in [("market-researcher", True), ("chief-of-staff", False)]:
+            ok = (want_agent in got2) == want_in
+            if not ok:
+                failures += 1
+            print(f"  [{'PASS' if ok else 'FAIL'}] dispatch fixture(1st) {want_agent} "
+                  f"emitted={want_agent in got2} (want {want_in})")
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    # (2) live coverage pin — the source-of-truth is only useful if it parses.
+    live = _load_autonomous_dispatches()
+    if not live:
+        print("  [SKIP] live dispatch coverage: iris.py unreadable / no entries")
+        return failures
+    for entry in live:
+        name = entry.get("name", "<unnamed>")
+        tk = entry.get("trigger_kwargs")
+        coverable = (
+            bool(entry.get("agent_name")) and bool(entry.get("name"))
+            and isinstance(tk, dict)
+            and ("day_of_week" in tk or "day" in tk or "hour" in tk)
+        )
+        if not coverable:
+            failures += 1
+        print(f"  [{'PASS' if coverable else 'FAIL'}] live dispatch coverable: {name}")
+    return failures
+
+
 def _selftest() -> int:
     """Hermetic check of the directional morning-brief freshness rule (A-22 fix).
     Sets DAILY_BRIEFING.md mtime to controlled values and asserts fresh≥floor is
@@ -507,6 +688,7 @@ def _selftest() -> int:
             failures += 1
         print(f"  [{status}] missing file: ok={ok} (want False) — {msg}")
         failures += _selftest_youtube_coverage()
+        failures += _selftest_dispatch_coverage()
         print("SELFTEST OK" if failures == 0 else f"SELFTEST FAILED ({failures})")
         return 1 if failures else 0
     finally:
