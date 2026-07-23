@@ -60,6 +60,13 @@ PCT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
 PCT_WORD_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*percent\b", re.IGNORECASE)
 
 # banned image vocab (class 6) — flagged only when NOT negated within the lookback window
+# NOTE (open, 2026-07-22): canon bans "dramatic lighting", not bare "dramatic" —
+# Master_Character_Prompt.md:174 and the sibling agent_output_lint.py BANNED_STRICT
+# both say "dramatic lighting"; bare "dramatic" here dates to the original commit
+# and looks like a truncation. Narrowing it would kill this false-positive class at
+# the root but stops catching "dramatic shadows"/"dramatic contrast" — a coverage
+# call for Steve, deliberately NOT bundled into the 7/22 negation fix. Live blast
+# radius today is one false positive (Video_05_Shot_11a, already-published video).
 BANNED = ("cinematic", "realistic", "soft lighting", "dramatic", "noir")
 NEGATION_WINDOW = 30
 NEGATION_RE = re.compile(r"\b(no|not|never|avoid|without|non)\b", re.IGNORECASE)
@@ -95,8 +102,28 @@ def script_figure_sets(script):
     return dollars, pcts
 
 
+# A banned term is also negated when a negating PREFIX is fused onto it —
+# "undramatic", "nondramatic", "unrealistic". NEGATION_RE only matches negation
+# as a standalone word, so it caught "non-dramatic" (hyphen = word boundary) but
+# not "undramatic", which FAILed V13's Shot_23a on the phrase "entirely
+# undramatic" — the exact opposite of what the banned-vocab rule is protecting.
+# The house style is flat/calm/undramatic, so this false positive recurs by
+# design. Checked against the text immediately preceding the match, not the
+# 30-char window, so it cannot swallow a genuinely un-negated later use.
+# \Z not $ — Python's $ also matches immediately BEFORE a trailing newline, so a
+# lookback ending in "a\n" read the article as a fused prefix and silently passed
+# "on a\ndramatic ladder". 14 of 1,608 prompts across the manifests contain literal
+# newlines, so that false negative was reachable on every banned term.
+# Only un-/non-: those are the sole real negating prefixes for these five terms
+# (undramatic, unrealistic, uncinematic, non-noir). "a" and "in" bought zero true
+# positives and were pure false-negative surface.
+PREFIX_NEGATION_RE = re.compile(r"(?:\b|[^a-z])(?:un|non)-?\Z", re.IGNORECASE)
+
+
 def _negated(prompt, start):
-    return bool(NEGATION_RE.search(prompt[max(0, start - NEGATION_WINDOW):start]))
+    if NEGATION_RE.search(prompt[max(0, start - NEGATION_WINDOW):start]):
+        return True
+    return bool(PREFIX_NEGATION_RE.search(prompt[max(0, start - 5):start]))
 
 
 # --- the lint ---------------------------------------------------------------
@@ -331,6 +358,33 @@ def selftest():
         {"name": "V_Shot_04a", "prompt": "Three at a desk. Flat 2D, NOT realistic or cinematic, "
          "no soft lighting."}]),
         _SCRIPT, set(), set()))
+
+    # prefix negation — "undramatic" is the house style, must NOT flag banned
+    # vocab. Regression pin for the 2026-07-22 false FAIL on V13's Shot_23a
+    # ("his expression is calm and entirely undramatic"), which blocked a clean
+    # manifest that had already passed its PROMPTS review.
+    cases.append(("prefix-negation", _m([
+        {"name": "V_Shot_06a", "prompt": "Three at a window. Flat 2D. His expression is calm "
+         "and entirely undramatic. Stylized flat lighting only."}]),
+        _SCRIPT, set(), set()))
+
+    # ...but a prefix negation must NOT license a genuinely un-negated later use
+    cases.append(("prefix-negation-does-not-leak", _m([
+        {"name": "V_Shot_06b", "prompt": "Calm and undramatic throughout. Then a dramatic "
+         "push-in on the ladder."}]),
+        _SCRIPT, {"banned-vocab"}, set()))
+
+    # A hard wrap must not turn the anchor into a negation. The second clause
+    # breaks the line mid-word after "un", which is the ONLY lookback shape that
+    # still reaches the `$`-vs-`\Z` distinction now that `a|in` are dropped —
+    # so this fixture uniquely dies if `\Z` is reverted to `$`. (An earlier
+    # version used "Then a\ndramatic" and survived that mutation: with `a` gone
+    # from the alternation the lookback was unreachable, so it pinned the
+    # alternation change rather than the anchor it claimed to.) 14 of 1,608
+    # corpus prompts contain literal newlines, so the shape is real.
+    cases.append(("prefix-negation-newline-not-a-prefix", _m([
+        {"name": "V_Shot_06c", "prompt": "Calm and undramatic.\nFlat, un\ndramatic push-in."}]),
+        _SCRIPT, {"banned-vocab"}, set()))
 
     # spaced acronym in a card → WARN (tts-spacing)
     cases.append(("spaced-acronym", _m([
