@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Local overnight self-check → .activity/heartbeat.json → Drive.
+     Fires 06:55 ET, 20 min before the 07:15 ET cloud watchdog reads it.
+     launchd calendar intervals are machine-local, so no UTC conversion.
+
+     Label is deliberately com.iris.selfcheck, NOT com.iris.claude-code-*:
+     prebrief_fire_check.py auto-derives silent-skip coverage from the
+     com.iris.claude-code-*.plist glob and expects a claude tee-log this job
+     never writes, which would manufacture a daily phantom alert. This job's
+     own liveness is caught by the cloud watchdog seeing a stale heartbeat —
+     a different failure domain, which is the point. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.iris.selfcheck</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Volumes/AI_Workspace/iris_studio/scripts/overnight_selfcheck.py</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+  <key>StandardOutPath</key><string>/Users/steve/iris_studio/logs/selfcheck.log</string>
+  <key>StandardErrorPath</key><string>/Users/steve/iris_studio/logs/selfcheck.err</string>
+</dict></plist>
