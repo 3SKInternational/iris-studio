@@ -64,16 +64,24 @@ LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 CLAUDE_PLIST_GLOB = "com.iris.claude-code-*.plist"
 
 # Plists already covered by a hardcoded check below — auto-derive skips them to
-# avoid a duplicate Expected for the same fire. The 5 claude-code launchd jobs
-# keep their proven tee-log paths; youtube-research is verified more strongly by
-# the dispatch-row check (agent ran to completion) than by a log mtime.
+# avoid a duplicate Expected for the same fire. These 5 claude-code launchd jobs
+# keep their proven tee-log paths.
+#
+# youtube-research was in this set until 2026-07-22, deferring to a hardcoded
+# dispatch-row check. That check could never pass: the job left iris.py's
+# APScheduler for a launchd plist on 2026-06-20 (see iris.py's "NOT dispatched
+# here" note) and run_claude_job.sh writes no dispatches row, so its last row is
+# 2026-06-17. The hardcoded weekday had also rotted independently ({WED}, while
+# the plist is Mon+Thu). Auto-derive reads the plist itself — no retyped
+# schedule to drift again. Signal weakens from "agent completed" to "wrapper log
+# written", which beats a check that always fails; restoring the stronger signal
+# means making run_claude_job.sh write a dispatch row, a separate job.
 _AUTODERIVE_SKIP = {
     "com.iris.claude-code-nightly",
     "com.iris.claude-code-pre-brief",
     "com.iris.claude-code-hygiene",
     "com.iris.claude-code-credential-check",
     "com.iris.claude-code-automation-scan",
-    "com.iris.claude-code-youtube-research",
 }
 
 
@@ -290,11 +298,9 @@ def collect_expected(now: datetime) -> list[Expected]:
             "chief-of-staff-weekly", t, "dispatch",
             agent_name="chief-of-staff",
         ))
-    if (t := _last_fire_weekly(now, {WED}, 2, 0)):
-        expected.append(Expected(
-            "youtube-researcher-weekly", t, "dispatch",
-            agent_name="youtube-researcher",
-        ))
+    # youtube-researcher-weekly's hardcoded dispatch check lived here until
+    # 2026-07-22 — deleted, now covered by auto-derive off its plist. See the
+    # _AUTODERIVE_SKIP comment for why the dispatch signal stopped existing.
     if (t := _last_fire_monthly(now, 1, 2, 0)):
         expected.append(Expected(
             "market-researcher-monthly", t, "dispatch",
@@ -426,6 +432,40 @@ CHECKERS = {
 }
 
 
+def _selftest_youtube_coverage() -> int:
+    """Regression pin for the 2026-07-22 fix: youtube-research must be covered by
+    auto-derive off its own plist, and only on its real fire days (Mon+Thu 02:00).
+    The old hardcoded {WED} dispatch check alerted on a day the plist doesn't
+    schedule while never checking the two days it does — and no selftest case
+    existed to catch it. Reads the live plist, so it also fails if the schedule
+    changes on disk without this expectation following: that is the point.
+    Skips (0 failures) off-macOS / with no LaunchAgents dir."""
+    label = "com.iris.claude-code-youtube-research"
+    if not shutil.which("plutil") or not (LAUNCH_AGENTS_DIR / f"{label}.plist").is_file():
+        print("  [SKIP] youtube-research coverage: plist/plutil unavailable")
+        return 0
+    if label in _AUTODERIVE_SKIP:
+        print(f"  [FAIL] youtube-research coverage: {label} is back in _AUTODERIVE_SKIP "
+              "— auto-derive is its only coverage, so skipping it leaves the job unchecked")
+        return 1
+    failures = 0
+    # 2026-07-20 Mon / 2026-07-23 Thu are fire days; 2026-07-21 Tue and
+    # 2026-07-22 Wed (the old phantom-alert day) are not.
+    for label_txt, now, want in [
+        ("Mon 2026-07-20 05:00 (fire day)", datetime(2026, 7, 20, 5, 0), True),
+        ("Thu 2026-07-23 05:00 (fire day)", datetime(2026, 7, 23, 5, 0), True),
+        ("Tue 2026-07-21 05:00 (not a fire day)", datetime(2026, 7, 21, 5, 0), False),
+        ("Wed 2026-07-22 05:00 (old phantom day)", datetime(2026, 7, 22, 5, 0), False),
+    ]:
+        derived, _ = collect_launchd_expected(now)
+        got = any(e.name == "claude-code-youtube-research" for e in derived)
+        status = "PASS" if got == want else "FAIL"
+        if got != want:
+            failures += 1
+        print(f"  [{status}] youtube-research {label_txt}: expected-emitted={got} (want {want})")
+    return failures
+
+
 def _selftest() -> int:
     """Hermetic check of the directional morning-brief freshness rule (A-22 fix).
     Sets DAILY_BRIEFING.md mtime to controlled values and asserts fresh≥floor is
@@ -466,6 +506,7 @@ def _selftest() -> int:
         if ok:
             failures += 1
         print(f"  [{status}] missing file: ok={ok} (want False) — {msg}")
+        failures += _selftest_youtube_coverage()
         print("SELFTEST OK" if failures == 0 else f"SELFTEST FAILED ({failures})")
         return 1 if failures else 0
     finally:
