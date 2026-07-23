@@ -1,7 +1,8 @@
 {
   "_doc": "Budget + model-allocation config for iris_studio vo_factory. Read by model_allocator.py. Edit values here; no code changes needed.",
   "tier": "creator",
-  "monthly_credits": 100000,
+  "monthly_credits": 121000,
+  "_monthly_credits_note": "121,000 = Steve's stated RECURRING Creator allowance (confirmed 2026-07-22), corrected from a stale 100000. Deliberately NOT the 187,712 that /user/subscription reports as character_limit for the current cycle: that higher figure appears to include rollover/carryover, which is not guaranteed to recur, and budgeting against it would over-promise capacity in a month with no carry-in. Budget on the guaranteed recurring number; treat any surplus as headroom, not plan.",
   "buffer_pct": 0.10,
   "billing_cycle_day": 22,
 
