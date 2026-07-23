@@ -19,12 +19,14 @@ MINI_ROOT="/Users/steve/Documents/3SK/outputs"
 PROFILE="3sk-vault"
 SENTINEL="CLAUDE.md"          # must exist in a real vault root
 SSH_KEY="${HOME}/.ssh/id_ed25519_iris_mini_sync"
-SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
-# The Air vault root is UNVERIFIED in the docs. Resolve it here, fail closed.
-# Order matters: prefer the NON-Documents path (~/3SK/outputs) per 5/27 lesson #2
-# (~/Documents is sandbox-hostile to file tools). If BOTH exist we refuse to guess.
-AIR_ROOT_CANDIDATES=("${HOME}/3SK/outputs" "${HOME}/Documents/3SK/outputs")
+# VERIFIED 2026-07-23: the Air's canonical vault is ~/Documents/3SK/outputs
+# (9,580 files, has the sentinel). ~/3SK/outputs is the 163-file PARTIAL COPY
+# left behind by the 5/27 Syncthing incident — it has NO sentinel, so the check
+# below correctly rejects it. (CLAUDE.md's "Air is at ~/3SK/outputs" is wrong.)
+# Sentinel, not order, is what decides — but list the real one first.
+AIR_ROOT_CANDIDATES=("${HOME}/Documents/3SK/outputs" "${HOME}/3SK/outputs")
 
 die() { echo "❌ BOOTSTRAP ABORTED: $*" >&2; exit 1; }
 ok()  { echo "✅ $*"; }
@@ -33,7 +35,7 @@ echo "=== Unison Air<->Mini bootstrap (fail-closed) ==="
 
 # --- Gate 1: locate unison on the Air ---------------------------------------
 UNISON=""
-for cand in /opt/homebrew/bin/unison /usr/local/bin/unison "$(command -v unison 2>/dev/null)"; do
+for cand in "${HOME}/bin/unison" /opt/homebrew/bin/unison /usr/local/bin/unison "$(command -v unison 2>/dev/null)"; do
     [ -n "${cand}" ] && [ -x "${cand}" ] && { UNISON="${cand}"; break; }
 done
 [ -n "${UNISON}" ] || die "unison not installed on the Air. Run: brew install unison"
@@ -42,12 +44,12 @@ ok "Air unison: ${UNISON} (v${AIR_VER:-unknown})"
 
 # --- Gate 2: ssh key + Mini reachable ---------------------------------------
 [ -f "${SSH_KEY}" ] || die "missing Air->Mini ssh key ${SSH_KEY} (generate + add pubkey to Mini authorized_keys)"
-ssh ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" true 2>/dev/null || die "Mini unreachable at ${MINI_USER}@${MINI_IP} (Tailscale up? Remote Login on? key authorized?)"
+ssh -n ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" true 2>/dev/null || die "Mini unreachable at ${MINI_USER}@${MINI_IP} (Tailscale up? Remote Login on? key authorized?)"
 ok "Mini reachable over ssh"
 
 # --- Gate 3: unison present + version-matched on the Mini -------------------
-MINI_VER="$(ssh ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" \
-    'for c in /opt/homebrew/bin/unison /usr/local/bin/unison "$(command -v unison)"; do [ -x "$c" ] && { "$c" -version; break; }; done' 2>/dev/null \
+MINI_VER="$(ssh -n ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" \
+    'for c in $HOME/bin/unison /opt/homebrew/bin/unison /usr/local/bin/unison "$(command -v unison)"; do [ -x "$c" ] && { "$c" -version; break; }; done' 2>/dev/null \
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 [ -n "${MINI_VER}" ] || die "unison not found on the Mini. ssh in and: brew install unison"
 # Unison requires matching MAJOR.MINOR on both ends of a sync.
@@ -69,7 +71,7 @@ done
 ok "Air vault root: ${AIR_ROOT}"
 
 # --- Gate 5: verify the Mini vault root (sentinel) over ssh ------------------
-ssh ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" "test -f '${MINI_ROOT}/${SENTINEL}'" 2>/dev/null \
+ssh -n ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" "test -f '${MINI_ROOT}/${SENTINEL}'" 2>/dev/null \
     || die "Mini vault sentinel ${MINI_ROOT}/${SENTINEL} not found — wrong MINI_ROOT?"
 ok "Mini vault root: ${MINI_ROOT}"
 

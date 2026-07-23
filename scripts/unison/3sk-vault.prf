@@ -36,8 +36,13 @@ backuplocation = central
 backupdir = /Users/mainfolder/.unison/backups
 maxbackups = 5
 
+# Absolute path to unison ON THE MINI. Required: it's installed at ~/bin (an
+# official 2.54.0 release binary, not Homebrew) which is NOT on a non-login
+# shell's PATH, so ssh could not otherwise start the remote server.
+servercmd = /Users/steve/bin/unison
+
 # --- ssh transport (Tailscale + dedicated Air->Mini key, non-interactive) ----
-sshargs = -i /Users/mainfolder/.ssh/id_ed25519_iris_mini_sync -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+sshargs = -o IdentitiesOnly=yes -i /Users/mainfolder/.ssh/id_ed25519_iris_mini_sync -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
 
 # --- ignore patterns ---------------------------------------------------------
 # Per-machine UI state and clutter must NOT sync, or they ping-pong as conflicts.

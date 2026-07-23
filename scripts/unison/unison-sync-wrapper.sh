@@ -18,7 +18,7 @@ PROFILE_FILE="${HOME}/.unison/${PROFILE}.prf"
 MINI_IP="100.118.108.65"
 MINI_USER="steve"
 SSH_KEY="${HOME}/.ssh/id_ed25519_iris_mini_sync"
-SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 LOG="${HOME}/iris_studio/logs/unison-sync.log"
 # Data-loss tripwire: hold sync if the Air vault has shrunk below this fraction
 # of its last-synced file count (catches a partial local loss BEFORE it can
@@ -64,7 +64,7 @@ count_files() {
 
 # --- locate unison (Homebrew arm64 / intel / PATH) ---------------------------
 UNISON=""
-for cand in /opt/homebrew/bin/unison /usr/local/bin/unison "$(command -v unison 2>/dev/null)"; do
+for cand in "${HOME}/bin/unison" /opt/homebrew/bin/unison /usr/local/bin/unison "$(command -v unison 2>/dev/null)"; do
     if [ -n "${cand}" ] && [ -x "${cand}" ]; then UNISON="${cand}"; break; fi
 done
 if [ -z "${UNISON}" ]; then
@@ -76,7 +76,7 @@ fi
 log "=== unison-sync run start (bidirectional, profile=${PROFILE}) ==="
 
 # --- reachability precheck (Mini asleep/foreign-network = normal, skip clean) -
-if ! ssh ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" true 2>/dev/null; then
+if ! ssh -n ${SSH_OPTS} "${MINI_USER}@${MINI_IP}" true 2>/dev/null; then
     log "Mini unreachable (${MINI_USER}@${MINI_IP}) — skipped (normal when away). exit 0"
     log "=== unison-sync run end (skipped) ==="
     exit 0
