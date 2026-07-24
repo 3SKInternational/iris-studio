@@ -177,6 +177,17 @@ Time: $(_rq_now_et)"
     return 0
 }
 
+# ---- how many consecutive failures are on record for a job --------------------
+# Echoes a base-10 integer (0 when there is no marker). Lets a wrapper throttle its
+# own scheduled-path alert by how long the job has already been failing, the way
+# rq_record_failure throttles the retry path. Always succeeds; never errors.
+rq_attempts() {
+    local a
+    a="$(_rq_get "$(_rq_marker "$1")" attempts)"
+    case "${a:-0}" in (*[!0-9]*|'') a=0 ;; esac
+    printf '%s' "$(( 10#${a:-0} ))"
+}
+
 # ---- silently retire a marker (a run we deliberately SKIPPED, not a recovery) ----
 # Use on an exit-0 path that did NOT actually run the job because of a known,
 # self-healing infra condition (e.g. FDA/EPERM can't exec the venv interpreter).

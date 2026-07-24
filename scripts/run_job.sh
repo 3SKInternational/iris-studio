@@ -118,6 +118,30 @@ if [ "$rc" -ne 0 ] && tail -c "+$((LOG_OFF_BEFORE + 1))" "$LOG" 2>/dev/null \
     exit 0
 fi
 
+# EX_TEMPFAIL (75) = "my TARGET was unavailable, so I did nothing." Distinct from
+# success (0) and from failure (other non-zero): no work happened, nothing is broken.
+# A job signals this itself — e.g. sync-to-air when the Air laptop is asleep, which is
+# the normal case here, not a fault.
+#
+# Why (2026-07-23): sync-to-air used a bare `exit 0` for the asleep-Air skip, which is
+# indistinguishable from real success. That fired a "✅ completed" ping for a run that
+# moved zero bytes, and — the actual bug — reached rq_clear_on_success, deleting a
+# pending retry marker and sending a false "RECOVERED" for a failure never re-attempted.
+# It fired live at 22:46 on 2026-07-23: a real rsync-255 drop was cleared by a next run
+# that had merely skipped. With the routine ✅ silenced, failure/recovery is the ONLY
+# channel left, so a false all-clear there is worse than the noise it replaced.
+#
+# Drop any pending marker rather than keeping it: a skip exits 0 without bumping
+# `attempts`, so a retained marker would never reach the give-up ceiling and the 30-min
+# sweep would replay a guaranteed-skip forever — the exact storm the FDA/EPERM branch
+# above documents. Dropping is silent and safe: a still-broken job re-detects and
+# re-alerts on its next fire (hourly here), so at most one cycle of memory is lost.
+if [ "$rc" -eq 75 ]; then
+    rq_drop_marker "$JOB"
+    echo "run_job: '${JOB}' SKIPPED — target unavailable, nothing done (EX_TEMPFAIL 75); silent, retries on next schedule at ${TS}" >> "$LOG"
+    exit 0
+fi
+
 if [ "$rc" -ne 0 ]; then
     # Red alert only on the original fire; retries are throttled by rq_record_failure.
     if [ "${IRIS_RETRY:-0}" != "1" ]; then
