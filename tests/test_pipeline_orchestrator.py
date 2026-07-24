@@ -101,8 +101,11 @@ class TestSelectNextInvariant(unittest.TestCase):
     def test_returns_none_when_only_gates_remain(self):
         # Mark all orchestrator stages whose deps are satisfiable done; what's left
         # is purely gates → select_next returns None (work parked on Steve).
+        # 12_leadmagnet (added 2026-07-06, deps 2_review+7_packaging — both marked
+        # done here) is one such satisfiable orchestrator stage; omitting it left it
+        # legitimately ready, so select_next correctly returned it (not a gate bug).
         stages = _mark_done(_stages(), "1_script", "2_review", "7_packaging",
-                            "9_description")
+                            "9_description", "12_leadmagnet")
         nxt = po.select_next(stages)
         # remaining ready things should all be gates (None or a gate is acceptable,
         # but a gate must never be *returned* — so it must be None here).
