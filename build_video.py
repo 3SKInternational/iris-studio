@@ -927,8 +927,10 @@ def blank_pill_shots(shots: list[dict]) -> list[dict]:
     """Shots whose prompt declares a BLANK data pill needing a composited figure.
 
     Deterministic phrase match: the prompt mentions a 'data pill' AND calls it
-    'blank'. Data CARDS ('a clean flat 2D card ...', which bake their own text and
-    contain no 'pill') are intentionally NOT flagged."""
+    'blank'. Data CARDS ('a clean flat 2D data card ...', no 'pill') are NOT
+    flagged here — they are the OTHER blank-backplate family, guarded separately by
+    data_card_shots / enforce_card_overlays (they render blank too, they do NOT
+    bake their own text; that assumption is exactly what shipped V13 blank)."""
     out = []
     for s in shots:
         p = s["prompt"].lower()
@@ -937,12 +939,78 @@ def blank_pill_shots(shots: list[dict]) -> list[dict]:
     return out
 
 
+# A "data card" shot is a NO-CHARACTER backplate whose prompt is the canonical
+# "a clean flat 2D data card backplate ..." — the model renders the card SHAPE but
+# garbles/omits the figure, so the real number is composited from
+#   Raw_Assets/Image_Factory/<vid>_card_overlay.json
+# by card_overlay.py into a `<name>_text.png` sibling (which _resolve_image
+# prefers). This burn was a SEPARATE manual step for a long time: V13 (2026-07-23)
+# shipped all 9 ladder figure cards BLANK ($1,200 … $10,000,000) because it was
+# forgotten — enforce_pill_overlays early-returned (no blank *pills*) and nothing
+# ran the card burn. enforce_card_overlays now auto-runs it at --assemble and makes
+# a missing spec / uncovered card / absent backplate FATAL, so a data card can
+# never reach the cut blank — the exact mirror of the blank-pill guard.
+def data_card_shots(shots: list[dict]) -> list[dict]:
+    """Shots whose prompt declares a DATA CARD backplate needing a composited
+    figure. Deterministic phrase match: the prompt mentions 'data card'. Distinct
+    from blank_pill_shots (a character shot's blank 'data pill')."""
+    return [s for s in shots if "data card" in s["prompt"].lower()]
+
+
 def _pil_python() -> str:
     """A Pillow-capable interpreter (card_overlay needs PIL). build_video may run
     under a python without Pillow, so prefer the repo .venv like the contact-sheet
     stage does; fall back to the current interpreter."""
     venv = REPO / ".venv" / "bin" / "python"
     return str(venv) if venv.exists() else sys.executable
+
+
+def _burn_overlay_figures(names: list[str], spec: Path, img_dir: Path,
+                          noun: str) -> None:
+    """Shared burn engine for both overlay guards (blank pills + data cards).
+
+    Given the shot names that MUST carry a composited figure and an overlay spec
+    the caller has already confirmed exists: require the spec covers every name,
+    then (re)burn any missing/stale `<name>_text.png` into `img_dir` (the dir the
+    assembler reads) via card_overlay. `noun` is the human label ('blank pill' /
+    'data card'). Idempotent — a `_text` already newer than its backplate is left
+    untouched; a re-rendered backplate makes its stale `_text` re-burn (auto-heal).
+    A malformed spec, an uncovered name, a card_overlay failure, or a burn that
+    produces no frame (absent backplate) is FATAL."""
+    try:
+        data = json.loads(spec.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"{noun} overlay spec is not valid JSON ({spec}): {e}")
+    if not isinstance(data, dict):
+        die(f"{noun} overlay spec must be a JSON object with a 'cards' map ({spec}).")
+    cards = data.get("cards", {})
+    uncovered = [n for n in names if n not in cards]
+    if uncovered:
+        die(f"{noun}(s) {uncovered} have no burned figure — add a card entry for "
+            f"each to {spec.name} (the figure text + x/y), then run card_overlay.py "
+            f"first. Assembly is blocked until every {noun} is covered.")
+    stale = []
+    for n in names:
+        base = img_dir / f"{n}.png"
+        text = img_dir / f"{n}_text.png"
+        if not text.is_file():
+            stale.append(n)
+        elif base.is_file() and text.stat().st_mtime < base.stat().st_mtime:
+            stale.append(n)  # backplate re-rendered after the burn -> figure is stale
+    if stale:
+        cmd = [_pil_python(), str(REPO / "image_factory" / "card_overlay.py"),
+               str(spec), "--base-dir", str(img_dir), "--out-dir", str(img_dir)]
+        for n in stale:
+            cmd += ["--only", n]
+        if run(cmd, label=f"STAGE {noun} figures (free)"):
+            die(f"card_overlay failed to burn the {noun} figures (see output "
+                f"above) — refusing to assemble a video with blank {noun}s.")
+        ungenerated = [n for n in stale if not (img_dir / f"{n}_text.png").is_file()]
+        if ungenerated:
+            die(f"{noun} burn exited 0 but produced no composited frame for {ungenerated} "
+                f"in {img_dir} — check the overlay spec's card names/base_dir.")
+    print(f"{noun} figures: {len(names)} {noun}(s) covered + burned "
+          f"({'re-burned ' + str(len(stale)) if stale else 'all fresh'}).")
 
 
 def enforce_pill_overlays(shots: list[dict], vid: str, nn: str, vlt: Path,
@@ -969,41 +1037,44 @@ def enforce_pill_overlays(shots: list[dict], vid: str, nn: str, vlt: Path,
             f'{{"cards": {{"{names[0]}": [{{"text": "$10,200", "x": 0.5, "y": 0.5, '
             f'"size": 76}}]}}}} — then it is burned automatically at --assemble. Run '
             f"card_overlay.py first.")
+    _burn_overlay_figures(names, spec, vlt / images_rel, "blank pill")
+
+
+def enforce_card_overlays(shots: list[dict], vid: str, nn: str, vlt: Path,
+                          images_rel: str) -> None:
+    """Assembly preflight — no data card reaches the cut with a blank figure.
+
+    Mirror of enforce_pill_overlays for the data-card family (data_card_shots).
+    For every data-card shot: require a covering entry in
+    `<vid>_card_overlay.json`, then ensure a fresh burned `<name>_text.png` exists
+    in the image set — (re)composited automatically via card_overlay. A missing
+    spec, an uncovered card, or an absent backplate is FATAL (the V13 2026-07-23
+    miss: 9 ladder cards shipped blank because this burn was a forgotten manual
+    step and enforce_pill_overlays never covered cards)."""
+    detected = [f"{vid}_Shot_{s['id']}" for s in data_card_shots(shots)]
+    spec = vlt / "Raw_Assets" / "Image_Factory" / f"{vid}_card_overlay.json"
+    if not spec.is_file():
+        if not detected:
+            return
+        die(f"data-card shot(s) {detected} need composited figures but no overlay "
+            f"spec exists at {spec}. Author it — one card entry per data card, e.g. "
+            f'{{"cards": {{"{detected[0]}": [{{"text": "$1,200", "x": 0.5, "y": 0.5, '
+            f'"size": 150}}]}}}} — then it is burned automatically at --assemble. Run '
+            f"card_overlay.py first.")
+    # The spec is ground truth for which cards MUST be burned: union its own
+    # <vid>_Shot_* card keys with the prompt-detected shots, so a composite-needing
+    # card whose prompt phrasing drifts from "data card" still can't ship blank.
+    spec_names: list[str] = []
     try:
-        data = json.loads(spec.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        die(f"pill overlay spec is not valid JSON ({spec}): {e}")
-    if not isinstance(data, dict):
-        die(f"pill overlay spec must be a JSON object with a 'cards' map ({spec}).")
-    cards = data.get("cards", {})
-    uncovered = [n for n in names if n not in cards]
-    if uncovered:
-        die(f"blank pill(s) {uncovered} have no burned figure — add a card entry for "
-            f"each to {spec.name} (the figure text + x/y), then run card_overlay.py "
-            f"first. Assembly is blocked until every blank pill is covered.")
-    img_dir = vlt / images_rel
-    stale = []
-    for n in names:
-        base = img_dir / f"{n}.png"
-        text = img_dir / f"{n}_text.png"
-        if not text.is_file():
-            stale.append(n)
-        elif base.is_file() and text.stat().st_mtime < base.stat().st_mtime:
-            stale.append(n)  # backplate re-rendered after the burn -> figure is stale
-    if stale:
-        cmd = [_pil_python(), str(REPO / "image_factory" / "card_overlay.py"),
-               str(spec), "--base-dir", str(img_dir), "--out-dir", str(img_dir)]
-        for n in stale:
-            cmd += ["--only", n]
-        if run(cmd, label="STAGE pill figures (free)"):
-            die("card_overlay failed to burn the blank-pill figures (see output "
-                "above) — refusing to assemble a video with blank data pills.")
-        ungenerated = [n for n in stale if not (img_dir / f"{n}_text.png").is_file()]
-        if ungenerated:
-            die(f"pill burn exited 0 but produced no composited frame for {ungenerated} "
-                f"in {img_dir} — check the overlay spec's card names/base_dir.")
-    print(f"pill figures: {len(names)} blank pill(s) covered + burned "
-          f"({'re-burned ' + str(len(stale)) if stale else 'all fresh'}).")
+        d = json.loads(spec.read_text(encoding="utf-8"))
+        if isinstance(d, dict) and isinstance(d.get("cards"), dict):
+            spec_names = [k for k in d["cards"] if k.startswith(f"{vid}_Shot_")]
+    except json.JSONDecodeError:
+        pass  # _burn_overlay_figures raises the authoritative JSON error below
+    names = sorted(set(detected) | set(spec_names))
+    if not names:
+        return  # spec present but carries no data-card entries — nothing to burn
+    _burn_overlay_figures(names, spec, vlt / images_rel, "data card")
 
 
 MIN_DWELL_S = 8.0   # Steve 2026-07-08: every image on screen ≥8s, no flashes.
@@ -1554,6 +1625,7 @@ def main() -> None:
         # when _resolve_image picks each shot's frame. Fatal on a missing/uncovered
         # overlay spec (the exact V9 2026-07-06 miss).
         enforce_pill_overlays(shots, vid, nn, vlt, images_rel)
+        enforce_card_overlays(shots, vid, nn, vlt, images_rel)
         # Re-author the edit manifest now that VO clips should exist (exact
         # durations). With --align this is where local forced alignment runs, so
         # the cut times use real spoken-word boundaries instead of the estimate.

@@ -442,5 +442,204 @@ class TestBlankPillGuard(unittest.TestCase):
             self.assertIn("card_overlay failed", out)
 
 
+class TestDataCardDetector(unittest.TestCase):
+    """The data-card detector: flag no-character 'data card' backplates that need a
+    composited figure; ignore pills and ordinary character shots."""
+
+    def test_detects_data_card_and_ignores_others(self):
+        bv = _load_build_video()
+        shots = [
+            {"id": "07a", "prompt": "No character. A clean flat 2D data card "
+             "backplate: Level 1 — twelve hundred dollars. Flat charcoal field."},
+            {"id": "05b", "prompt": "Three pointing to a flat data pill that is "
+             "blank with no readable text or digits."},
+            {"id": "01a", "prompt": "Three at a desk reviewing a ledger, warm light."},
+            {"id": "30c", "prompt": "No character. A clean flat 2D data card "
+             "backplate: Level 7 — ten million dollars."},
+        ]
+        got = [s["id"] for s in bv.data_card_shots(shots)]
+        self.assertEqual(got, ["07a", "30c"])
+
+
+class TestDataCardGuard(unittest.TestCase):
+    """The card analogue of TestBlankPillGuard: a data-card shot can NEVER assemble
+    with a blank figure. No covering spec -> abort; spec present + fresh burned
+    `_text` sibling -> proceed. Same hermetic main() drive (gen/assemble stubbed)."""
+
+    def _vault(self, td: Path, *, image_set: str = "Raw_Assets/Video_97_HD"):
+        (td / "Scene_Image_Prompts").mkdir(parents=True)
+        (td / "Voice_Files" / "Video_97").mkdir(parents=True)
+        (td / "Scene_Image_Prompts" / "Video_97_Shot_List.md").write_text(
+            textwrap.dedent(
+                """\
+                # Video_97 Shot List
+
+                ## Scene 7
+
+                ### Shot 7a — level one data card
+                ```text
+                No character. A clean flat 2D data card backplate: Level 1 — twelve
+                hundred dollars. Flat charcoal field, brand-red corner accent.
+                ```
+                """
+            ),
+            encoding="utf-8",
+        )
+        (td / "Voice_Files" / "Video_97" / "_VO_Session_B_Kit.md").write_text(
+            textwrap.dedent(
+                """\
+                # Video_97 VO Kit
+
+                ## Scene 7 -> `Video_97_VO_Scene_07.mp3` (level one)
+
+                Level one is twelve hundred dollars.
+
+                ---
+                """
+            ),
+            encoding="utf-8",
+        )
+        img_dir = td / image_set
+        img_dir.mkdir(parents=True)
+        (img_dir / "Video_97_Shot_07a.png").write_bytes(b"\x89PNG\r\n\x1a\n")  # blank backplate
+        return img_dir
+
+    def _spec_path(self, td: Path) -> Path:
+        d = td / "Raw_Assets" / "Image_Factory"
+        d.mkdir(parents=True)
+        return d / "Video_97_card_overlay.json"
+
+    def _run_assemble(self, td: Path, *, stub_burn):
+        bv = _load_build_video()
+        orig_run, orig_write = bv.run, bv.write_json
+
+        def fake_run(cmd, *, label):
+            if "card_overlay.py" in " ".join(cmd):
+                return stub_burn(cmd)
+            return 0
+
+        bv.run = fake_run
+        bv.write_json = lambda *a, **k: None
+        (td / "Footage_and_Edits").mkdir(parents=True, exist_ok=True)
+        (td / "Footage_and_Edits" / "Video_97_v2.mp4").write_bytes(b"\x00")
+        argv = sys.argv
+        sys.argv = ["build_video.py", "Video_97", "--assemble", "--no-cta",
+                    "--image-set", "Raw_Assets/Video_97_HD"]
+        os.environ["SK_VAULT"] = str(td)
+        try:
+            buf = io.StringIO()
+            exc = None
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    bv.main()
+                except SystemExit as e:
+                    exc = e
+            return exc, buf.getvalue()
+        finally:
+            bv.run, bv.write_json = orig_run, orig_write
+            sys.argv = argv
+            os.environ.pop("SK_VAULT", None)
+
+    def test_data_card_no_spec_aborts(self):
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td)  # card shot present, but NO overlay spec
+            exc, out = self._run_assemble(td, stub_burn=lambda cmd: 0)
+            self.assertIsNotNone(exc, f"expected SystemExit; out={out}")
+            self.assertNotIn(exc.code, (0, None))
+            self.assertIn("no overlay spec", out)
+
+    def test_data_card_uncovered_aborts(self):
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td)
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_97_Shot_99z": [{"text": "$0", "x": 0.5, '
+                '"y": 0.5, "size": 60}]}}',
+                encoding="utf-8")
+            exc, out = self._run_assemble(td, stub_burn=lambda cmd: 0)
+            self.assertIsNotNone(exc, f"expected SystemExit; out={out}")
+            self.assertNotIn(exc.code, (0, None))
+            self.assertIn("no burned figure", out)
+
+    def test_data_card_spec_present_burns_and_proceeds(self):
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            img_dir = self._vault(td)
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_97_Shot_07a": [{"text": "$1,200", "x": 0.5, '
+                '"y": 0.5, "size": 150}]}}',
+                encoding="utf-8")
+
+            def stub_burn(cmd):
+                (img_dir / "Video_97_Shot_07a_text.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                return 0
+
+            exc, out = self._run_assemble(td, stub_burn=stub_burn)
+            self.assertIsNone(exc, f"unexpected abort; out={out}")
+            self.assertTrue((img_dir / "Video_97_Shot_07a_text.png").is_file())
+            self.assertIn("data card(s) covered + burned", out)
+
+    def test_spec_authoritative_when_prompt_phrase_drifts(self):
+        # The spec is ground truth: a composite-needing card whose PROMPT no longer
+        # says "data card" (phrase drift) is still burned because its <vid>_Shot_*
+        # key is in the spec — it must not silently ship blank.
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            (td / "Scene_Image_Prompts").mkdir(parents=True)
+            (td / "Voice_Files" / "Video_97").mkdir(parents=True)
+            (td / "Scene_Image_Prompts" / "Video_97_Shot_List.md").write_text(
+                textwrap.dedent(
+                    """\
+                    # Video_97 Shot List
+
+                    ## Scene 7
+
+                    ### Shot 7a — level one figure panel (drifted wording)
+                    ```text
+                    No character. A clean flat 2D figure panel: Level 1 — twelve
+                    hundred dollars. Flat charcoal field, brand-red corner accent.
+                    ```
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (td / "Voice_Files" / "Video_97" / "_VO_Session_B_Kit.md").write_text(
+                "# Video_97 VO Kit\n\n## Scene 7 -> `Video_97_VO_Scene_07.mp3` (one)\n\n"
+                "Level one is twelve hundred dollars.\n\n---\n",
+                encoding="utf-8")
+            img_dir = td / "Raw_Assets" / "Video_97_HD"
+            img_dir.mkdir(parents=True)
+            (img_dir / "Video_97_Shot_07a.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_97_Shot_07a": [{"text": "$1,200", "x": 0.5, '
+                '"y": 0.5, "size": 150}]}}',
+                encoding="utf-8")
+
+            def stub_burn(cmd):
+                self.assertIn("Video_97_Shot_07a", cmd)  # burned despite prompt drift
+                (img_dir / "Video_97_Shot_07a_text.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                return 0
+
+            exc, out = self._run_assemble(td, stub_burn=stub_burn)
+            self.assertIsNone(exc, f"unexpected abort; out={out}")
+            self.assertTrue((img_dir / "Video_97_Shot_07a_text.png").is_file())
+
+    def test_data_card_burn_failure_aborts(self):
+        # Spec covers the card, but card_overlay fails (e.g. absent backplate) ->
+        # must not assemble a blank card.
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            self._vault(td)
+            self._spec_path(td).write_text(
+                '{"cards": {"Video_97_Shot_07a": [{"text": "$1,200", "x": 0.5, '
+                '"y": 0.5, "size": 150}]}}',
+                encoding="utf-8")
+            exc, out = self._run_assemble(td, stub_burn=lambda cmd: 1)
+            self.assertIsNotNone(exc, f"expected SystemExit; out={out}")
+            self.assertNotIn(exc.code, (0, None))
+            self.assertIn("card_overlay failed", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
