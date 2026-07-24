@@ -2268,6 +2268,59 @@ def manifest_thumbnail_entries(manifest_abs: Path, video: int) -> list[str]:
     return sorted(names)
 
 
+def _run_manifest_spine_lint(video: int, manifest_abs) -> tuple | None:
+    """A-46 (2026-07-24, Steve-✅): deterministic $0 pre-spend spine lint, run
+    in-process. cmd_spend_ok calls it twice — before the LLM review loop (cheap
+    early block) and again after a SHIP verdict (the DECIDING pass, because the
+    loop's fixer rewrites the manifest in place). Catches the
+    money-leak classes the LLM gate has missed live — duplicate image names (V01
+    double-billed 6 dup-named shots) and card figures that trace to nothing in the
+    script — plus banned vocab / JSON structural rot. Returns (rc, verdict,
+    summary_line): rc 0 = clean or WARN-only, 1 = FAIL (caller blocks the spend),
+    2 = a lint-side missing-file. Returns None when the lint itself could not run
+    (import/read crash) — fail OPEN, same contract as the sibling suppressor and
+    thumbnail guards: guard-infra failure never blocks a human-authorized spend,
+    the LLM review gate still stands."""
+    try:
+        msl = _load_spine_lint()
+        script_abs = vault_abs(f"{VAULT_REL}/Scripts/Video_{nn(video)}_Script.md")
+        rc, verdict, findings = msl.run(str(manifest_abs), str(script_abs))
+    except Exception as e:  # fail OPEN — never block the billed path on lint infra
+        print(f"⚠️ Video {video}: manifest_spine_lint could not run ({e}) — "
+              f"proceeding (fail-open; the image-review gate still applies).")
+        return None
+    # Formatting sits OUTSIDE the fail-open try: the decision value (rc) is
+    # already in hand, and a cosmetic summary crash must not convert a FAIL
+    # into a silent spend.
+    try:
+        line = msl.summary_line(verdict, findings)
+    except Exception:
+        line = f"manifest_spine_lint: {verdict} ({len(findings)} finding(s))"
+    return rc, verdict, line
+
+
+_MSL = None  # cached manifest_spine_lint module; tests seed this to redirect REPORT
+
+
+def _load_spine_lint():
+    """Import scripts/manifest_spine_lint.py once, by path (no package layout
+    assumed — same importlib idiom the test suite uses on this module). Cached so
+    tests can pre-seed _MSL with a REPORT-redirected copy."""
+    global _MSL
+    if _MSL is None:
+        import importlib.util
+        lint_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "manifest_spine_lint.py")
+        spec = importlib.util.spec_from_file_location("manifest_spine_lint", lint_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _MSL = mod
+    return _MSL
+
+
+_SPINE_REPORT_REL = f"{VAULT_REL}/Raw_Assets/_manifest_spine_report.md"
+
+
 def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     """Decision 4 (C1): the ONLY billed-spend path. Confirms stage 5 is ready,
     confirms the scene manifest exists, runs the pre-spend image-review gate,
@@ -2360,6 +2413,14 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
                     f"scene-image-prompt-generator def. Drop --force to block.")
             print(line)
             notify(line)
+        # A-46 spine lint: under --force we never block, but a FAIL still shouts —
+        # a Steve override shouldn't silently bill dup-named or invented-figure shots.
+        res = _run_manifest_spine_lint(video, manifest_abs)
+        if res is not None and res[0] == 1:
+            line = (f"⚠️ Video {video}: --force spend but {res[2]} — proceeding because "
+                    f"you overrode. Report: {_SPINE_REPORT_REL}. Drop --force to block.")
+            print(line)
+            notify(line)
     else:
         # Deterministic suppressor guard — runs BEFORE the LLM gate, fails CLOSED.
         # Cheap, no model call, catches the exact V3 re-spend bug instantly. A
@@ -2413,6 +2474,40 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
                         f"variant before stage 8 for the A/B pair.")
                 print(line)
                 notify(line)
+        # A-46 deterministic spine lint — fails CLOSED on a lint FAIL (dup image
+        # names / untraceable card figures / banned vocab / broken JSON — all $0
+        # to catch here, real money after). Lint-side rc 2 (missing script) and
+        # infra crashes fail OPEN with a printed warning: the LLM gate still
+        # stands, and a guard that can't run is not a finding. Called TWICE:
+        # once here (cheap — an already-failing manifest shouldn't burn reviewer
+        # tokens), and again AFTER the review loop returns SHIP, because the fix
+        # loop rewrites the billed manifest IN PLACE — the deciding lint must see
+        # the bytes generate_images.py will actually bill.
+        def _spine_gate():
+            res = _run_manifest_spine_lint(video, manifest_abs)
+            if res is None:
+                return None
+            lrc, lverdict, lline = res
+            if lrc == 1:
+                s["note"] = f"spend refused: manifest spine lint FAIL ({lline[:160]})"
+                sf.save()
+                gline = (f"🛑 Video {video}: {lline} — refusing to spend (deterministic "
+                         f"pre-spend spine lint; the V01 dup-shot / invented-figure "
+                         f"money-leak class). Fix per {_SPINE_REPORT_REL}, then re-run "
+                         f"spend-ok (or override with --force).")
+                print(gline)
+                notify(gline)
+                return 2
+            if lrc != 0:
+                print(f"⚠️ Video {video}: manifest_spine_lint exited {lrc} — "
+                      f"proceeding (fail-open; the image-review gate still applies).")
+            elif lverdict == "WARN":
+                print(f"⚠️ Video {video}: {lline} — advisory only, proceeding.")
+            return None
+
+        blocked = _spine_gate()
+        if blocked is not None:
+            return blocked
         verdict, vrel, detail = run_prompt_review_loop(video, manifest_rel)
         # BINARY allow-list (Steve, 2026-06-20; fail-closed hardened 2026-06-22):
         # spend ONLY on a clean SHIP — a 100% sign-off. EVERYTHING else fails
@@ -2435,6 +2530,12 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
         elif verdict == "SHIP":
             line = f"✅ Video {video}: image-reviewer pre-spend verdict SHIP ({vrel})."
             print(line)
+            # DECIDING spine-lint pass: the review loop's fixer may have rewritten
+            # the manifest in place after the first lint — re-check the exact file
+            # about to bill. This is the last gate before the spend.
+            blocked = _spine_gate()
+            if blocked is not None:
+                return blocked
         else:
             s["note"] = f"spend held: image-reviewer {verdict} ({vrel})"
             sf.save()

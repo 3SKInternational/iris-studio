@@ -656,7 +656,8 @@ class TestSpendOkImageGate(unittest.TestCase):
         subprocess on a HOLD-SPEND verdict; the loop's own behaviour is covered
         by TestPromptReviewLoop instead."""
         saved = (po.reconcile_orphans, po.vault_abs, po.notify,
-                 po.subprocess.run, po.run_prompt_review_loop)
+                 po.subprocess.run, po.run_prompt_review_loop,
+                 po._run_manifest_spine_lint)
 
         def _noop_reconcile(_stages, _video):
             return None
@@ -670,10 +671,16 @@ class TestSpendOkImageGate(unittest.TestCase):
         po.reconcile_orphans = _noop_reconcile
         po.vault_abs = _fake_vault_abs
         po.notify = lambda *a, **k: None
+        # Neutralize the A-46 spine lint (fail-open) — the manifest here is a .py
+        # source file, which the real lint would structurally FAIL and block on,
+        # making every review-gate assertion below vacuous. The lint's own wire
+        # behaviour is covered by TestSpendOkSpineLintGuard.
+        po._run_manifest_spine_lint = lambda _v, _m: None
 
         def restore():
             (po.reconcile_orphans, po.vault_abs, po.notify,
-             po.subprocess.run, po.run_prompt_review_loop) = saved
+             po.subprocess.run, po.run_prompt_review_loop,
+             po._run_manifest_spine_lint) = saved
         return restore
 
     def test_hold_spend_refuses_spend(self):
@@ -823,10 +830,14 @@ class TestSpendOkThumbnailGuard(unittest.TestCase):
         manifest_path = Path(tmp.name)
 
         saved = (po.reconcile_orphans, po.vault_abs, po.notify,
-                 po.subprocess.run, po.run_prompt_review_loop)
+                 po.subprocess.run, po.run_prompt_review_loop,
+                 po._run_manifest_spine_lint)
         po.reconcile_orphans = lambda _s, _v: None
         po.vault_abs = lambda rel: manifest_path
         po.notify = lambda *a, **k: None
+        # Neutralize the A-46 spine lint (fail-open) — these tests pin the
+        # thumbnail guard only; the lint wire has its own test class.
+        po._run_manifest_spine_lint = lambda _v, _m: None
         spy = {"gen": False}
 
         def _spy_run(*a, **k):
@@ -838,7 +849,8 @@ class TestSpendOkThumbnailGuard(unittest.TestCase):
 
         def restore():
             (po.reconcile_orphans, po.vault_abs, po.notify,
-             po.subprocess.run, po.run_prompt_review_loop) = saved
+             po.subprocess.run, po.run_prompt_review_loop,
+             po._run_manifest_spine_lint) = saved
             try:
                 manifest_path.unlink()
             except OSError:
@@ -888,19 +900,23 @@ class TestSpendOkThumbnailGuard(unittest.TestCase):
         finally:
             restore()
 
-    def test_unreadable_manifest_fails_open_to_llm_gate(self):
-        # A malformed-JSON manifest must NOT crash the guard; it fails OPEN so the
-        # LLM gate (here stubbed SHIP) and downstream checks still run.
+    def test_unreadable_manifest_still_fails_open_past_thumbnail_guard(self):
+        # A malformed-JSON manifest must NOT crash the suppressor/thumbnail guards;
+        # they fail OPEN. (Since A-46 the spine lint deterministically BLOCKS broken
+        # JSON further down — covered by TestSpendOkSpineLintGuard — so it is
+        # stubbed open here to keep this test about THESE two guards.)
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix="_hd.json", delete=False, encoding="utf-8")
         tmp.write("{ this is not json ")
         tmp.close()
         manifest_path = Path(tmp.name)
         saved = (po.reconcile_orphans, po.vault_abs, po.notify,
-                 po.subprocess.run, po.run_prompt_review_loop)
+                 po.subprocess.run, po.run_prompt_review_loop,
+                 po._run_manifest_spine_lint)
         po.reconcile_orphans = lambda _s, _v: None
         po.vault_abs = lambda rel: manifest_path
         po.notify = lambda *a, **k: None
+        po._run_manifest_spine_lint = lambda _v, _m: None
         spy = {"gen": False}
 
         def _spy_run(*a, **k):
@@ -914,11 +930,204 @@ class TestSpendOkThumbnailGuard(unittest.TestCase):
             self.assertTrue(spy["gen"], "unreadable manifest must fail OPEN, not block")
         finally:
             (po.reconcile_orphans, po.vault_abs, po.notify,
-             po.subprocess.run, po.run_prompt_review_loop) = saved
+             po.subprocess.run, po.run_prompt_review_loop,
+             po._run_manifest_spine_lint) = saved
             try:
                 manifest_path.unlink()
             except OSError:
                 pass
+
+
+class TestSpendOkSpineLintGuard(unittest.TestCase):
+    """A-46: the deterministic pre-spend manifest spine lint inside cmd_spend_ok.
+
+    Runs the REAL lint module (seeded into po._MSL with its REPORT redirected to a
+    tempfile so no test ever writes the vault report), wired through the real
+    cmd_spend_ok. FAIL blocks the billed spend; WARN/CLEAN proceed; a lint that
+    cannot run fails OPEN; --force downgrades a FAIL to a warning and spends."""
+
+    def _ready_stages(self):
+        return _mark_done(_stages(), "2_review")
+
+    def _patch(self, manifest_obj, malformed=False):
+        """Like the thumbnail guard's _patch, but keeps the REAL spine lint,
+        seeded with a REPORT-redirected module copy."""
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_hd.json", delete=False, encoding="utf-8")
+        if malformed:
+            tmp.write("{ this is not json ")
+        else:
+            json.dump(manifest_obj, tmp)
+        tmp.close()
+        manifest_path = Path(tmp.name)
+        report_tmp = tempfile.NamedTemporaryFile(suffix="_spine_report.md", delete=False)
+        report_tmp.close()
+
+        # Seed a REPORT-redirected lint module into the orchestrator's cache.
+        _spec = importlib.util.spec_from_file_location(
+            "manifest_spine_lint_test", _HERE.parent / "scripts" / "manifest_spine_lint.py")
+        msl = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(msl)
+        msl.REPORT = report_tmp.name
+
+        saved = (po.reconcile_orphans, po.vault_abs, po.notify,
+                 po.subprocess.run, po.run_prompt_review_loop, po._MSL)
+        po.reconcile_orphans = lambda _s, _v: None
+        po.vault_abs = lambda rel: manifest_path
+        po.notify = lambda *a, **k: None
+        po._MSL = msl
+        spy = {"gen": False}
+
+        def _spy_run(*a, **k):
+            spy["gen"] = True
+            return _Proc(0, stdout="generated")
+        po.subprocess.run = _spy_run
+        po.run_prompt_review_loop = lambda video, manifest_rel: ("SHIP", "rel", "ok")
+
+        def restore():
+            (po.reconcile_orphans, po.vault_abs, po.notify,
+             po.subprocess.run, po.run_prompt_review_loop, po._MSL) = saved
+            for p in (manifest_path, Path(report_tmp.name)):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        return restore, manifest_path, spy
+
+    # Both thumbnails present so the thumbnail guard passes and the spine lint is
+    # the deciding guard in every case below.
+    def _base_images(self):
+        return [
+            {"name": "Video_03_Thumbnail_A", "use_references": True,
+             "prompt": "Split. Keep the top band clear."},
+            {"name": "Video_03_Thumbnail_B", "use_references": True,
+             "prompt": "Closeup. Keep the top band clear."},
+        ]
+
+    def test_duplicate_names_block_spend(self):
+        # The V01 money leak: 6 dup-named shots double-billed. Structural FAIL.
+        manifest = {"images": self._base_images() + [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three points."},
+        ]}
+        restore, _path, spy = self._patch(manifest)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 2)
+            self.assertFalse(spy["gen"], "dup image names must fail CLOSED — no spend")
+        finally:
+            restore()
+
+    def test_malformed_json_blocks_spend(self):
+        # Since A-46 an unparseable manifest is a deterministic structural FAIL —
+        # it cannot render anyway; block BEFORE state churn, with a clear message.
+        restore, _path, spy = self._patch(None, malformed=True)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 2)
+            self.assertFalse(spy["gen"], "malformed manifest JSON must block the spend")
+        finally:
+            restore()
+
+    def test_warn_only_manifest_spends(self):
+        # A genuine WARN (Thumbnail_A lacks a reserved-title-zone phrase → the
+        # thumb-title-zone advisory) must not block the billed spend.
+        manifest = {"images": [
+            {"name": "Video_03_Thumbnail_A", "use_references": True,
+             "prompt": "Split."},   # no reserved-zone phrase → WARN
+            {"name": "Video_03_Thumbnail_B", "use_references": True,
+             "prompt": "Closeup. Keep the top band clear."},
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+        ]}
+        restore, _path, spy = self._patch(manifest)
+        try:
+            # Fixture sanity: this manifest must actually produce a WARN verdict,
+            # not CLEAN — otherwise this test isn't covering the advisory branch.
+            res = po._run_manifest_spine_lint(3, _path)
+            self.assertIsNotNone(res)
+            self.assertEqual(res[1], "WARN", "fixture must genuinely WARN")
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "a WARN-only lint must not block the spend")
+        finally:
+            restore()
+
+    def test_missing_script_fails_open(self):
+        # Lint rc 2 (script not found) is a lint-side missing file, not a manifest
+        # defect: warn + proceed. Selective vault_abs: manifest resolves, script
+        # rel resolves to a nonexistent path.
+        manifest = {"images": self._base_images()}
+        restore, mpath, spy = self._patch(manifest)
+        po.vault_abs = lambda rel: (Path("/nonexistent/script.md")
+                                    if "Scripts/" in str(rel) else mpath)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "a missing script must fail OPEN (rc 2), not block")
+        finally:
+            restore()
+
+    def test_fixer_rewritten_manifest_is_relinted_before_spend(self):
+        # THE deciding-pass pin (A-46 review HIGH finding): the review loop's
+        # fixer rewrites the billed manifest IN PLACE. A manifest that linted
+        # clean pre-loop but was rewritten into a FAIL state (dup names) before
+        # the loop returned SHIP must STILL be blocked — the last lint must see
+        # the bytes that would actually bill.
+        clean = {"images": self._base_images() + [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+        ]}
+        broken = {"images": self._base_images() + [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three points."},
+        ]}
+        restore, mpath, spy = self._patch(clean)
+
+        def _rewriting_loop(video, manifest_rel):
+            mpath.write_text(json.dumps(broken))  # the in-place fixer rewrite
+            return ("SHIP", "rel", "ok")
+        po.run_prompt_review_loop = _rewriting_loop
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 2)
+            self.assertFalse(
+                spy["gen"],
+                "a fixer-rewritten FAIL manifest must be re-linted and blocked")
+        finally:
+            restore()
+
+    def test_lint_unavailable_fails_open(self):
+        # Guard-infra failure is not a finding: if the lint cannot load, spend
+        # proceeds (the LLM review gate still stands).
+        manifest = {"images": self._base_images()}
+        restore, _path, spy = self._patch(manifest)
+        saved_loader = po._load_spine_lint
+        po._MSL = None
+
+        def _boom():
+            raise RuntimeError("lint import broken")
+        po._load_spine_lint = _boom
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "a lint that cannot run must fail OPEN")
+        finally:
+            po._load_spine_lint = saved_loader
+            restore()
+
+    def test_force_downgrades_fail_to_warning_and_spends(self):
+        # Steve override: --force never blocks on the lint, but it still runs it
+        # and shouts, so an override can't silently bill a dup-named batch.
+        manifest = {"images": self._base_images() + [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three points."},
+        ]}
+        restore, _path, spy = self._patch(manifest)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()), force=True)
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "--force must still spend past a lint FAIL")
+        finally:
+            restore()
 
 
 class TestAssembleImageGate(unittest.TestCase):
