@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,15 @@ OUT_W, OUT_H = 1920, 1080
 # even for very slow moves (the gentle ~2% Ken Burns default that exposed zoompan
 # jitter at 2x canvas). Higher = smoother but slower; 4x is the sweet spot.
 CANVAS_W, CANVAS_H = 7680, 4320
+# Motion shots render zoompan at SUPERSAMPLE× the output, then lanczos-downscale
+# to OUT. zoompan recomputes an INTEGER crop rectangle per frame, so a smooth
+# zoom lands on a stair-step that reads as tremble/breathing (worst on text +
+# fullscreen). Rendering the zoom larger and shrinking it averages that integer
+# step down to sub-pixel, where the eye can't catch it. 3× (5760×3240) was the
+# level Steve confirmed smooth on-screen; supersampling the OUTPUT alone (not
+# the input canvas) is what fixes it — 2× still showed it. HOLD shots don't zoom
+# (no crop step, no tremble) so they skip this and its cost entirely.
+SUPERSAMPLE = 3
 VIDEO_CODEC = ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
                "-pix_fmt", "yuv420p"]
 AUDIO_CODEC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
@@ -50,7 +60,7 @@ AUDIO_CODEC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 # re-render — the safety valve that stops the cache serving stale pixels after a
 # pipeline change. (The ffmpeg binary identity is ALSO folded into the key
 # automatically, so an ffmpeg upgrade/keg-swap self-invalidates without a bump.)
-CACHE_VERSION = 1
+CACHE_VERSION = 2   # 2026-07-23: motion shots now supersample+downscale (de-tremble)
 
 
 def _resolve_bin(name: str) -> str:
@@ -303,10 +313,21 @@ def compose_filter(shot: Shot, font: str | None, draw_ok: bool) -> str:
     else:  # hold
         zexpr, xexpr, yexpr = "1", cx, cy
 
-    zoompan = (
-        f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':"
-        f"d={n}:s={OUT_W}x{OUT_H}:fps={FPS},setsar=1,format=yuv420p"
-    )
+    if shot.motion == "hold":
+        # No zoom => no per-frame integer-crop step => no tremble. Render at
+        # output size directly; supersampling a static frame is wasted cost.
+        zoompan = (
+            f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':"
+            f"d={n}:s={OUT_W}x{OUT_H}:fps={FPS},setsar=1,format=yuv420p"
+        )
+    else:
+        # Supersample the zoom, then lanczos-downscale to output (de-tremble).
+        ss_w, ss_h = OUT_W * SUPERSAMPLE, OUT_H * SUPERSAMPLE
+        zoompan = (
+            f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':"
+            f"d={n}:s={ss_w}x{ss_h}:fps={FPS},"
+            f"scale={OUT_W}:{OUT_H}:flags=lanczos,setsar=1,format=yuv420p"
+        )
 
     graph = f"[0:v]{compose},{zoompan}"
 
@@ -389,6 +410,7 @@ def shot_cache_key(shot: Shot, font: str | None, draw_ok: bool,
         "cache_version": CACHE_VERSION,
         "env": env_id,
         "fps": FPS, "out": [OUT_W, OUT_H], "canvas": [CANVAS_W, CANVAS_H],
+        "supersample": SUPERSAMPLE,   # self-invalidate if the SS factor changes
         "vcodec": VIDEO_CODEC, "acodec": AUDIO_CODEC,
         "image_sha": _file_digest(shot.image),
         "audio_sha": (_file_digest(shot.audio) if shot.audio is not None else None),
@@ -890,40 +912,73 @@ def main() -> None:
     try:
         if use_cache:
             env_id = _ffmpeg_identity()
+        # --- Plan (serial, cheap): decide each shot's output path + whether it
+        # needs rendering. shot_files stays in shot order — concat depends on it.
+        # Each shot's seg/staged filename is unique (index + content key), so
+        # parallel workers never touch the same file; the process already holds
+        # the single-writer cache lock, so intra-process concurrency is safe.
         shot_files: list[Path] = []
         referenced: set[Path] = set()
+        to_render: list[tuple[Shot, Path, Path]] = []   # (shot, out_seg, staged)
         for shot in shots:
             if use_cache:
                 key = shot_cache_key(shot, font, draw_ok, env_id)
                 seg = cache_dir / f"shot_{shot.index:02d}_{key[:24]}.mp4"
                 referenced.add(seg)
+                shot_files.append(seg)
                 if seg.exists() and seg.stat().st_size > 0:
                     print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
                           f"{shot.motion} {shot.seg_dur:.1f}s  [cached]")
                     reused += 1
-                    shot_files.append(seg)
                     continue
-                print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
-                      f"{shot.motion} {shot.seg_dur:.1f}s  [render]")
                 # Stage INSIDE the cache dir (same filesystem) so os.replace is
                 # atomic and never raises EXDEV across volumes; the '.staging_'
                 # prefix keeps it out of the 'shot_*.mp4' reuse + prune globs. A
                 # killed render leaves only the staging file, cleaned up below.
                 staged = cache_dir / f".staging_{shot.index:02d}_{key[:24]}.mp4"
-                try:
-                    render_shot(shot, font, draw_ok, staged)
-                    os.replace(staged, seg)
-                finally:
-                    if staged.exists():
-                        staged.unlink(missing_ok=True)
-                rendered += 1
-                shot_files.append(seg)
+                to_render.append((shot, seg, staged))
             else:
                 sf = tmp / f"shot_{shot.index:02d}.mp4"
-                print(f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
-                      f"{shot.motion} {shot.seg_dur:.1f}s")
-                render_shot(shot, font, draw_ok, sf)
                 shot_files.append(sf)
+                to_render.append((shot, sf, sf))   # no cache => render in place
+
+        # --- Render (parallel): ffmpeg is a subprocess, so worker THREADS give
+        # true parallelism (the GIL is released across subprocess.run). zoompan
+        # is single-threaded per shot, so N shots on N cores ≈ N× wall-clock.
+        # Cap at cores-2 to leave headroom, and at 8 (past that, memory bandwidth
+        # + the lanczos downscale contend and the gain flattens). Order-free:
+        # results land in their pre-assigned seg paths, shot_files already holds
+        # the right order.
+        def _render_one(job: "tuple[Shot, Path, Path]") -> str:
+            shot, out_seg, staged = job
+            render_shot(shot, font, draw_ok, staged)
+            if staged != out_seg:
+                os.replace(staged, out_seg)   # atomic publish (cache mode)
+            return (f"[assemble]  shot {shot.index:02d}: {shot.image.name} "
+                    f"{shot.motion} {shot.seg_dur:.1f}s  [rendered]")
+
+        if to_render:
+            workers = max(1, min(8, (os.cpu_count() or 2) - 2, len(to_render)))
+            print(f"[assemble] rendering {len(to_render)} shot(s) across "
+                  f"{workers} worker(s); {reused} cached")
+            try:
+                if workers == 1:
+                    for job in to_render:
+                        print(_render_one(job))
+                else:
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        futs = {ex.submit(_render_one, j): j for j in to_render}
+                        for fut in as_completed(futs):
+                            print(fut.result())   # re-raises a worker's exception
+                rendered += len(to_render)
+            finally:
+                # A failed/killed render can leave staging files behind; sweep
+                # them so a later run's prune-glob stays clean (mirrors the
+                # single-shot finally the serial version had).
+                if use_cache and cache_dir is not None:
+                    for _, _, staged in to_render:
+                        if staged.exists():
+                            staged.unlink(missing_ok=True)
 
         concat_shots(shot_files, out_mp4, tmp)
         srt = build_srt(shots, align=args.align)
