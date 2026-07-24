@@ -1141,9 +1141,14 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
             shot: dict = {
                 "image": image_rel,
                 "vo_clip": f"{vo_rel}/{vo_name}",
-                # `still` locks every shot to a static frame (no Ken Burns) when
-                # the caller wants zero motion drift; otherwise cycle for variety.
-                "motion": "hold" if still else _MOTIONS[mi % len(_MOTIONS)],
+                # `still` locks every shot to a static frame. Otherwise every
+                # shot zooms OUT — starts tight, resolves to the full uncropped
+                # frame right before the cut (Steve 2026-07-23, from the in-niche
+                # motion observation). NOT the old 6-way _MOTIONS cycle: the pans
+                # and zoom_in end cropped, which is the 6/17 top/bottom-clipping
+                # complaint; zoom_out ends at zoom 1.0 = whole image, so it never
+                # parks the viewer on a crop.
+                "motion": "hold" if still else "zoom_out",
                 "caption_text": text,
             }
             mi += 1
@@ -1221,9 +1226,16 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         "asset_dir": str(asset_dir),
         "output_dir": str(output_dir),
         "output_name": output_name,
-        # zoom 1.02 = a gentle ~2% Ken Burns drift. 1.04 cropped too far into the
-        # top/bottom of the contain-fitted stills (Steve, 2026-06-17); halved it.
-        "defaults": {"zoom": 1.02, "fit": fit or "contain"},
+        # zoom 1.12 (Steve 2026-07-23, picked from a 1.02/1.08/1.12 render
+        # comparison). The old 1.02 was tuned down 6/17 because 1.04 cropped the
+        # top/bottom — but that was under zoom_IN, which ENDS zoomed. Motion is
+        # now zoom_OUT, which ends at zoom 1.0 = the full uncropped frame, so a
+        # larger start magnitude is the visible pull-in effect without ever
+        # resting on a crop. At 1.12 the opening frame is cropped 1-1/1.12 =
+        # ~10.7% total, symmetric = ~5.4% per edge, resolving to full frame by
+        # the cut; figure-card legibility during each card's spoken beat verified
+        # at assemble before ship (the cards are the number spine).
+        "defaults": {"zoom": 1.12, "fit": fit or "contain"},
         "shots": out_shots,
     }
     return manifest, all_vo, fallbacks, undetermined, align_notes
@@ -1271,11 +1283,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fit", choices=["cover", "contain"], default=None,
                    help="Override the edit-manifest default fit. 'cover' = crop-to-fill "
                         "(V1's original look); 'contain' = blurred-fill, no crop (default).")
-    p.add_argument("--still", action=argparse.BooleanOptionalAction, default=True,
-                   help="Lock every shot to a static frame (motion 'hold') — no Ken "
-                        "Burns pan/zoom. ON BY DEFAULT (Steve, 2026-06-22: 3SK videos "
-                        "ship as stills — no on-screen motion drift on the flat 2D art). "
-                        "Pass --no-still to re-enable the gentle Ken Burns pan/zoom cycle.")
+    p.add_argument("--still", action=argparse.BooleanOptionalAction, default=False,
+                   help="Lock every shot to a static frame (motion 'hold'). OFF BY "
+                        "DEFAULT since 2026-07-23 (Steve): shots zoom OUT (1.12 → full "
+                        "frame) for the in-niche pull-in effect. This SUPERSEDES the "
+                        "2026-06-22 stills-only default — see Decisions_Log 2026-07-23. "
+                        "Pass --still to ship flat static frames (no motion).")
     p.add_argument("--no-cta", action="store_true",
                    help="Omit the shared reusable CTA segments (mid-roll subscribe "
                         "bump + outro like/comment/subscribe). On by default; they "

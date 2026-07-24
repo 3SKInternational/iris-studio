@@ -79,12 +79,54 @@ NICHE_SUBDIR = "Channel_Intelligence/Niche_Views"
 # channels.list(forHandle=...) so we never hardcode brittle UC ids; a handle that
 # fails to resolve is skipped, never fatal. Override with --channels (one handle
 # per line). Each contributes its most-viewed uploads in the window.
-CREATOR_HANDLES = [
+# FALLBACK ONLY — the live roster is the markdown file below. This is what we
+# fall back to if that file is missing or unparseable, so a bad edit degrades to
+# the last-known-good set instead of researching nothing.
+CREATOR_HANDLES_FALLBACK = [
     "willie_finance",   # Willie Finance — STYLE ANCHOR, animated-documentary (~24K)
     "ryanfinanceus",    # Finance With Ryan — animated finance, near-identical (~184K)
     "hypotheticallyhq", # Hypothetically — animated "every level of wealth" (~297K)
     "markbuildsus",     # Mark Invests — animated-character finance (added 2026-06-22, Steve)
 ]
+
+# Single source of truth for WHICH channels get researched (added 2026-07-23).
+# Before this the roster lived only as the Python literal above: Steve had no
+# file to edit, and the other research surfaces each discovered channels ad hoc
+# per run, so "what are we tracking" had three different answers. Same lesson as
+# the 7/22 fire-check phantoms — derive from one place on disk, never retype.
+# Relative to vault() — which is the BRAND dir (DEFAULT_VAULT above), not the
+# outputs root. Matches NICHE_SUBDIR's convention.
+ROSTER_REL = "Channel_Intelligence/_Research_Channel_Roster.md"
+_ROSTER_HANDLE_RE = re.compile(r"youtube\.com/@([A-Za-z0-9_.-]+)", re.IGNORECASE)
+
+
+def creator_handles(verbose: bool = True) -> list[str]:
+    """Tracked-channel handles, read from the roster markdown.
+
+    Falls back to CREATOR_HANDLES_FALLBACK (never returns empty) when the file
+    is missing, unreadable, or yields no handles — researching the last-known-good
+    set beats researching nothing. Always announces which source was used so a
+    silent fallback can't masquerade as a successful roster read."""
+    path = vault() / ROSTER_REL
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        if verbose:
+            print(f"roster: {path} unreadable — falling back to the built-in "
+                  f"{len(CREATOR_HANDLES_FALLBACK)}-channel list", file=sys.stderr)
+        return list(CREATOR_HANDLES_FALLBACK)
+    seen: dict[str, None] = {}
+    for m in _ROSTER_HANDLE_RE.finditer(text):
+        seen.setdefault(m.group(1).lower(), None)   # dedupe, preserve first-seen order
+    handles = list(seen)
+    if not handles:
+        if verbose:
+            print(f"roster: no @handles found in {path} — falling back to the "
+                  f"built-in {len(CREATOR_HANDLES_FALLBACK)}-channel list", file=sys.stderr)
+        return list(CREATOR_HANDLES_FALLBACK)
+    if verbose:
+        print(f"roster: {len(handles)} channel(s) from {ROSTER_REL}")
+    return handles
 
 # SECONDARY source: keyword search. INTENTIONALLY finance-anchored (every query
 # carries an unambiguous money/investing term) because a broad seed like "how to
@@ -134,7 +176,7 @@ def load_queries(path: str | None) -> list[str]:
 
 def load_handles(path: str | None) -> list[str]:
     if not path:
-        return list(CREATOR_HANDLES)
+        return creator_handles()   # roster file → fallback literal
     p = Path(os.path.expanduser(path)).resolve()
     if not p.exists():
         die(f"--channels file not found: {p}")
