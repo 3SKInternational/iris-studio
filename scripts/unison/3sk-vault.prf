@@ -55,3 +55,24 @@ ignore = Name .trash
 ignore = Name *.tmp
 ignore = Name .syncthing.*.tmp
 ignore = Name .unison.*
+
+# --- Heavy regenerable build artifacts: NOT bidirectional --------------------
+# 4.4 GB of Mini-generated binary media (renders, VO mp3s, thumbnails, stills).
+# Excluded so the initial scan covers 254 MB / 2.5k files (seconds) instead of
+# 4.8 GB / 10.5k files (~50 min) -- the Air sleeps before a full scan finishes.
+#
+# Excluded BY FILE TYPE, deliberately NOT by directory: dirs like
+# Footage_and_Edits/_preflight and Voice_Files hold hand-edited .md working docs
+# (preflight signoffs, VO drafts). A directory exclusion would drop those out of
+# bidirectional sync and let the one-way rsync clobber Air-side edits.
+# Every .md/.json/.txt anywhere stays bidirectional; only binaries are one-way.
+ignore = Name *.png
+ignore = Name *.jpg
+ignore = Name *.jpeg
+ignore = Name *.mp4
+ignore = Name *.mov
+ignore = Name *.mp3
+ignore = Name *.wav
+ignore = Name *.m4a
+# Generated knowledge-graph output (205 MB / 5.4k files), never hand-edited.
+ignore = Path graphify-out
