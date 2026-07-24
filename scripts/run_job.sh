@@ -64,6 +64,56 @@ alert() {
     "$NOTIFY" "$1" || true
 }
 
+# M2 scheduled-path alert throttle (2026-07-24, Steve-✅). The scheduled path used
+# to red-alert on EVERY failure — the retry path was throttled but this one wasn't,
+# so at an hourly cadence a persistent fault meant ~24 red pings/day for as long as
+# it stayed broken. Gate, by WALL CLOCK (not failure count — a count-based gate
+# calibrated for hourly jobs silences a dead DAILY job for 24 days post-pause,
+# because only the scheduled fire bumps the counter then):
+#   - START of a streak (no retry marker yet)            → full red alert
+#   - a DIFFERENT failure reason than the marker's last  → full red alert (a new
+#     fault hiding behind an old streak must always break through)
+#   - ≥20h since this path last alerted for this job     → "STILL failing" reminder
+#     (20h not 24h: schedule jitter would skip alternate days on a daily job)
+#   - otherwise                                          → suppressed, logged
+# Net effect: hourly jobs go from 24 pings/day to ~1/day; daily/weekly jobs keep
+# their once-per-fire signal (a dead nightly backup still pings every night).
+# Mid-streak the retry path's own checkpoints (first retry, ~3h, pause notice) add
+# coverage. Safe to suppress on: success AND both silent skips (EX_TEMPFAIL 75,
+# FDA/EPERM) drop the marker, resetting the streak — only CONSECUTIVE failures are
+# ever throttled, never a fresh fault.
+PRIOR_FAILS="$(rq_attempts "$JOB")"
+SCHED_STAMP="$RQ_BASE/${JOB}.lastalert"
+SCHED_REMIND_SECS="${SCHED_REMIND_SECS:-72000}"   # 20h
+sched_alert() {
+    # $1 = message · $2 = one-line failure reason (compared to the marker's
+    # last_reason; must match what rq_record_failure will record for this fire).
+    local now stamp prev_reason
+    now="$(date +%s)"
+    if [ "$PRIOR_FAILS" -eq 0 ]; then
+        alert "$1"
+        printf '%s' "$now" > "$SCHED_STAMP" 2>/dev/null || true
+        return 0
+    fi
+    prev_reason="$(_rq_get "$(_rq_marker "$JOB")" last_reason)"
+    if [ -n "${2:-}" ] && [ -n "$prev_reason" ] && [ "$prev_reason" != "$2" ]; then
+        alert "🔴 launchd job '${JOB}' failing with a NEW error mid-streak (was: ${prev_reason}).
+$1"
+        printf '%s' "$now" > "$SCHED_STAMP" 2>/dev/null || true
+        return 0
+    fi
+    stamp="$(cat "$SCHED_STAMP" 2>/dev/null)"
+    case "${stamp:-0}" in (*[!0-9]*|'') stamp=0 ;; esac
+    if [ $(( now - stamp )) -ge "$SCHED_REMIND_SECS" ]; then
+        alert "🔴 launchd job '${JOB}' STILL failing — ${PRIOR_FAILS} prior consecutive failure(s) and counting.
+Latest: $1"
+        printf '%s' "$now" > "$SCHED_STAMP" 2>/dev/null || true
+    else
+        echo "run_job: '${JOB}' red alert suppressed (mid-streak: ${PRIOR_FAILS} prior consecutive failures, same reason, last alert <20h ago)" >> "$LOG"
+    fi
+    return 0
+}
+
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 
 # Serialize the job against itself so a 30-min retry replay can't overlap its own
@@ -89,9 +139,10 @@ if [ ! -f "$WORKSPACE_ROOT/iris.py" ]; then
     TSW="$(date '+%Y-%m-%d %H:%M %Z')"
     echo "run_job: '${JOB}' SKIPPED — AI_Workspace volume unavailable (sentinel $WORKSPACE_ROOT/iris.py missing) at ${TSW}" >> "$LOG"
     if [ "${IRIS_RETRY:-0}" != "1" ]; then
-        alert "🔴 launchd job '${JOB}' could not run — AI_Workspace volume unavailable (not mounted).
+        sched_alert "🔴 launchd job '${JOB}' could not run — AI_Workspace volume unavailable (not mounted).
 Time: ${TSW}
-The 30-min auto-retry will re-run it once the volume is back."
+The 30-min auto-retry will re-run it once the volume is back." \
+            "AI_Workspace volume unavailable (not mounted)"
     fi
     rq_record_failure "$JOB" "infra" "AI_Workspace volume unavailable (not mounted)" -- "${ORIG_ARGV[@]}"
     exit 1
@@ -127,6 +178,7 @@ if [ "$rc" -ne 0 ] && tail -c "+$((LOG_OFF_BEFORE + 1))" "$LOG" 2>/dev/null \
     # guaranteed-skip forever (the storm the 6/27 patch missed). Drop it silently;
     # the job self-heals on its next scheduled fire once FDA returns.
     rq_drop_marker "$JOB"
+    rm -f "$SCHED_STAMP" 2>/dev/null || true   # streak over — next failure alerts fresh
     echo "run_job: '${JOB}' SKIPPED — venv interpreter not execable under launchd (FDA/EPERM at Python startup); silent, retries on next schedule at ${TS}" >> "$LOG"
     exit 0
 fi
@@ -151,17 +203,20 @@ fi
 # re-alerts on its next fire (hourly here), so at most one cycle of memory is lost.
 if [ "$rc" -eq 75 ]; then
     rq_drop_marker "$JOB"
+    rm -f "$SCHED_STAMP" 2>/dev/null || true   # streak over — next failure alerts fresh
     echo "run_job: '${JOB}' SKIPPED — target unavailable, nothing done (EX_TEMPFAIL 75); silent, retries on next schedule at ${TS}" >> "$LOG"
     exit 0
 fi
 
 if [ "$rc" -ne 0 ]; then
-    # Red alert only on the original fire; retries are throttled by rq_record_failure.
+    # Red alert only on the original fire (throttled by streak — see sched_alert);
+    # retries are throttled separately by rq_record_failure.
     if [ "${IRIS_RETRY:-0}" != "1" ]; then
-        alert "🔴 launchd job '${JOB}' FAILED — exit code ${rc}.
+        sched_alert "🔴 launchd job '${JOB}' FAILED — exit code ${rc}.
 Time: ${TS}
 Log tail:
-$(tail -n 4 "$LOG" 2>/dev/null || echo '(no log)')"
+$(tail -n 4 "$LOG" 2>/dev/null || echo '(no log)')" \
+            "exit code ${rc}"
     fi
     # Enqueue/bump a retry marker so the 30-min sweep keeps trying until it runs.
     rq_record_failure "$JOB" "infra" "exit code ${rc}" -- "${ORIG_ARGV[@]}"
@@ -173,6 +228,7 @@ fi
 # failing). On the retry path that recovery ping is the signal, so suppress the
 # routine ✅ to avoid a duplicate.
 rq_clear_on_success "$JOB"
+rm -f "$SCHED_STAMP" 2>/dev/null || true   # streak over — next failure alerts fresh
 echo "run_job: '${JOB}' completed ok at ${TS}" >> "$LOG"
 if [ "${JOB_QUIET_OK:-0}" != "1" ] && [ "${IRIS_RETRY:-0}" != "1" ]; then
     alert "✅ launchd job '${JOB}' completed at $(date '+%H:%M %Z')."
