@@ -43,6 +43,18 @@ from pathlib import Path
 # next to this script and is gitignored — it is local spend data, not code.
 LEDGER_DEFAULT = Path(__file__).resolve().parent / "cost_ledger.jsonl"
 
+# DQ-40 (2026-07-24, Steve set $10): per-VIDEO cumulative image-spend policy cap.
+# Distinct from --max-cost, which is only a per-RUN plausibility guard the caller
+# legitimately raises for big flagships — which is exactly how 3 videos crossed
+# the old $8 policy number with zero signal. Crossing THIS cap blocks the run
+# unless --over-cap-ok is passed, and pings Telegram either way, so a policy
+# overage is never silent. Accepted residual: the gate compares prior ACTUALS +
+# this run's ESTIMATE, so a single batch can finish over cap by the estimate
+# error (measured: cents on the with-refs flagship path) — the next run sees
+# the true total. LOCKED VALUE: changing it requires a Decisions_Log why-stub
+# in the same session (CLAUDE.md rule, 2026-07-08).
+POLICY_CAP_USD = 10.0
+
 # --- Config values (deliberately swappable) ---------------------------------
 
 VALID_PROVIDERS = ("openai", "flux")
@@ -254,9 +266,34 @@ PROVIDERS = {"openai": generate_openai, "flux": generate_flux}
 
 
 def video_label(manifest_name: str) -> str:
-    """Stable per-video key for the ledger ('Video_05' from any V5 manifest)."""
-    m = re.search(r"(Video_\d+)", manifest_name)
-    return m.group(1) if m else Path(manifest_name).stem
+    """Stable per-video key for the ledger ('Video_05' from any V5 manifest).
+
+    Case-insensitive + zero-padded (DQ-40, 2026-07-24): the old case-sensitive
+    'Video_\\d+' never matched the actual lowercase manifest names, so one video's
+    spend fragmented across keys ('video_13_hd', 'video_13_fixup_renders', …) and
+    no cumulative per-video math was possible."""
+    m = re.search(r"video[_\s-]?(\d+)", manifest_name, re.IGNORECASE)
+    return f"Video_{int(m.group(1)):02d}" if m else Path(manifest_name).stem
+
+
+def canonical_video(rec: dict) -> str:
+    """Canonical 'Video_NN' for an EXISTING ledger row, tolerating the pre-fix
+    fragmented keys: derive from the video field, else from the shot name
+    ('Video_13_Shot_17b' → 'Video_13'), else pass the raw key through."""
+    for cand in (rec.get("video"), rec.get("shot")):
+        m = re.search(r"video[_\s-]?(\d+)", str(cand or ""), re.IGNORECASE)
+        if m:
+            return f"Video_{int(m.group(1)):02d}"
+    return str(rec.get("video") or "?")
+
+
+def policy_gate_key(image_name: str, manifest_video: str) -> str:
+    """Which video's policy cap an image bills against: its OWN name's video
+    index when it has one (so a multi-video batch manifest like thumb_pop_batch
+    gates each video separately instead of bypassing the cap under the batch
+    key), else the manifest's video."""
+    m = re.search(r"video[_\s-]?(\d+)", image_name, re.IGNORECASE)
+    return f"Video_{int(m.group(1)):02d}" if m else manifest_video
 
 
 def load_render_counts(ledger_path: Path, video: str) -> dict:
@@ -272,9 +309,46 @@ def load_render_counts(ledger_path: Path, video: str) -> dict:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue  # ponytail: tolerate a torn last line, never crash the batch on it
-        if rec.get("video") == video and rec.get("shot"):
+        # canonical_video, not raw rec['video']: a fixup/regen manifest's rows must
+        # count as re-renders of the SAME video (pre-fix keys fragmented this).
+        if canonical_video(rec) == video and rec.get("shot"):
             counts[rec["shot"]] = counts.get(rec["shot"], 0) + 1
     return counts
+
+
+def load_video_spend(ledger_path: Path, video: str) -> float:
+    """Total billed USD already on the ledger for THIS video, across ALL prior
+    runs/manifests (hd batch, fixups, regens). Feeds the DQ-40 policy-cap gate."""
+    total = 0.0
+    if not ledger_path.exists():
+        return total
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # tolerate a torn last line, same as load_render_counts
+        if canonical_video(rec) == video and isinstance(rec.get("cost_usd"), (int, float)):
+            total += rec["cost_usd"]
+    return total
+
+
+def notify(msg: str) -> None:
+    """Best-effort Telegram ping via scripts/notify.sh. Never blocks or raises.
+    IRIS_NOTIFY_DISABLE=1 silences it (tests)."""
+    if os.environ.get("IRIS_NOTIFY_DISABLE"):
+        return
+    ns = Path(__file__).resolve().parent.parent / "scripts" / "notify.sh"
+    if not os.access(ns, os.X_OK):
+        return
+    try:
+        import subprocess
+        subprocess.run([str(ns), msg], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)  # > notify.sh's curl --max-time 20
+    except Exception:
+        pass
 
 
 def ledger_append(ledger_path: Path, record: dict) -> None:
@@ -301,7 +375,7 @@ def print_report(ledger_path: Path) -> None:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        v = rec.get("video", "?")
+        v = canonical_video(rec)  # merge pre-fix fragmented keys per video
         a = agg.setdefault(v, {"renders": 0, "rerenders": 0, "cost": 0.0, "dup_cost": 0.0, "unknown": 0, "unsaved": 0})
         cost = rec.get("cost_usd")
         rr = bool(rec.get("rerender"))
@@ -371,6 +445,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-cost", type=float, default=30.0,
                    help="Refuse to run if the estimated batch cost exceeds $N (spend guard; default 30).")
     p.add_argument("--ledger", help="Cost-ledger JSONL path (default: image_factory/cost_ledger.jsonl).")
+    p.add_argument("--over-cap-ok", action="store_true",
+                   help=f"Explicit per-video override: proceed past the "
+                        f"${POLICY_CAP_USD:.0f}/video cumulative policy cap (DQ-40). "
+                        f"Requires Steve's overage ok; the override itself pings Telegram.")
     p.add_argument("--report", action="store_true",
                    help="Print spend + re-render summary from the ledger and exit (no manifest needed).")
     return p.parse_args()
@@ -537,7 +615,9 @@ def main() -> None:
     # the count or the estimate is implausibly large, abort before spending a cent.
     # Conservative by design: a real flagship (~76 shots, ~$9) clears comfortably;
     # a duplicated/wrong manifest (hundreds of shots / tens of dollars) is blocked.
+    _mvideo = video_label(manifest_path.name)
     would_render, pre_est = 0, 0.0
+    gate_adds: dict = {}   # policy-cap gate key -> this run's estimated add
     for _img in images:
         if not isinstance(_img, dict):
             continue
@@ -554,7 +634,21 @@ def main() -> None:
         _full = f"{preamble}\n\n{_prompt}" if preamble else _prompt
         _refs = ref_paths if (_img.get("use_references", True) and ref_paths) else []
         would_render += 1
-        pre_est += estimate_cost(model, _q, _s, _full, len(_refs))
+        _est = estimate_cost(model, _q, _s, _full, len(_refs))
+        pre_est += _est
+        _k = policy_gate_key(_name, _mvideo)
+        gate_adds[_k] = gate_adds.get(_k, 0.0) + _est
+
+    # DQ-40 policy-cap state, grouped by each image's OWN video index (falling
+    # back to the manifest's video) — a multi-video batch manifest like
+    # thumb_pop_batch must not bypass the per-video ceilings. Prior is ledger
+    # ACTUALS; this run is the ESTIMATE, so one batch can finish over cap by the
+    # estimate error (measured: cents on the with-refs flagship path); the next
+    # run sees the true totals. A MISSING ledger legitimately sums to $0 — that
+    # is a silent cap reset, so the live path prints a notice when it happens.
+    gate_state = [(k, load_video_spend(ledger_path, k), gate_adds[k])
+                  for k in sorted(gate_adds)]
+    breaches = [(k, p, a) for k, p, a in gate_state if p + a > POLICY_CAP_USD]
     if not args.dry_run:
         if would_render > args.max_images:
             die(f"spend guard: {would_render} images would bill this run, over the "
@@ -565,9 +659,46 @@ def main() -> None:
             die(f"spend guard: estimated ${pre_est:.2f} for {would_render} image(s) "
                 f"exceeds the --max-cost=${args.max_cost:.2f} cap. If intentional, "
                 f"re-run with --max-cost {pre_est:.2f}.")
+        # DQ-40 policy-cap gate: cumulative per-VIDEO spend vs the $-policy cap.
+        # --max-cost above is per-RUN plausibility; THIS is the per-video ceiling
+        # Steve owns. `breaches` is only ever non-empty when something would
+        # actually bill (gate_adds fills per billing image), so a $0 no-op run —
+        # every PNG already on disk — can never block or ping here, even for a
+        # video already over cap.
+        if would_render and not ledger_path.exists():
+            print(f"policy cap: NOTE — no ledger at {ledger_path}; cumulative spend "
+                  f"starts at $0. If this machine has billed before, the ledger "
+                  f"moved or was deleted — check before a big spend.")
+        if breaches:
+            _det = "; ".join(f"{k} would reach ${p + a:.2f} (${p:.2f} already billed "
+                             f"+ ~${a:.2f} this run)" for k, p, a in breaches)
+            _line = (f"policy cap: {_det} — over the ${POLICY_CAP_USD:.2f}/video "
+                     f"policy cap.")
+            if not args.over_cap_ok:
+                notify(f"🛑 {_line} BLOCKED — get Steve's explicit overage ok, then "
+                       f"re-run with --over-cap-ok.")
+                die(f"{_line} Get Steve's explicit ok for the overage, then re-run "
+                    f"with --over-cap-ok. (An overage is never silent: this block "
+                    f"and any override both ping Telegram.)")
+            _msg = f"⚠️ {_line} Proceeding on --over-cap-ok (explicit override)."
+            notify(_msg)
+            print(_msg + "\n")
         if would_render:
+            _wk, _wp, _wa = max(gate_state, key=lambda t: t[1] + t[2])
             print(f"spend guard: OK — {would_render} image(s) to render, "
-                  f"~${pre_est:.2f} estimated (caps: {args.max_images} imgs / ${args.max_cost:.0f}).\n")
+                  f"~${pre_est:.2f} estimated (caps: {args.max_images} imgs / ${args.max_cost:.0f}; "
+                  f"{_wk} cumulative ${_wp + _wa:.2f} of ${POLICY_CAP_USD:.0f} policy).\n")
+    else:
+        # Dry-run: surface the policy-cap picture (the check-cost-first habit)
+        # without blocking or pinging. Falls back to the manifest's video when
+        # nothing would render, so the info line still appears.
+        _rows = gate_state or [(_mvideo, load_video_spend(ledger_path, _mvideo), 0.0)]
+        for _k, _p, _a in _rows:
+            _over = " — OVER, a live run will need Steve's ok + --over-cap-ok" \
+                if _p + _a > POLICY_CAP_USD else ""
+            print(f"policy cap: {_k} ${_p:.2f} billed to date; this batch ~${_a:.2f} "
+                  f"→ ${_p + _a:.2f} of ${POLICY_CAP_USD:.0f}/video{_over}")
+        print()
 
     client = None
     if not args.dry_run and provider == "openai":
@@ -689,7 +820,10 @@ def main() -> None:
                 # succeeded or threw — the bill already happened either way.
                 ledger_append(ledger_path, {
                     "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "video": video,
+                    # The shot's OWN video when its name carries one, so the row
+                    # lands where the policy gate charged it (a cross-video batch
+                    # image must not attribute to the batch manifest's video).
+                    "video": policy_gate_key(name, video),
                     "manifest": manifest_path.name,
                     "shot": name,
                     "model": model,
