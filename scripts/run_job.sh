@@ -24,7 +24,20 @@
 #                    alert). A per-job noise knob — set it in the job's plist
 #                    EnvironmentVariables if a daily ✅ becomes noise.
 #
-# Exit code is the job's own exit code (so launchd still sees failures).
+# Exit codes THE JOB MAY RETURN — 75 is a reserved cross-job contract:
+#   0            success. Clears any retry marker (pings RECOVERED if it had been
+#                failing) and emits the routine ✅ unless JOB_QUIET_OK=1.
+#   75           EX_TEMPFAIL — "my TARGET was unavailable, so I did NOTHING."
+#                Not success, not a fault. Silent: no ping, any pending retry
+#                marker is DROPPED, and launchd is handed 0. Use it for a job
+#                whose target is legitimately absent sometimes — e.g. sync-to-air
+#                when the Air laptop is asleep. Do NOT use a bare `exit 0` for
+#                that: it is indistinguishable from real success, so it reports a
+#                completion that never happened and falsely clears real failures.
+#   other ≠ 0    genuine failure. Red alert + retry marker, code passed to launchd.
+#
+# Otherwise the job's own exit code is returned verbatim, so launchd still sees
+# failures. (The FDA/EPERM branch below is a second internal 0-returning skip.)
 
 set -uo pipefail
 
