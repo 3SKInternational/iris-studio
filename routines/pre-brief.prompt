@@ -107,6 +107,15 @@ Perform these health checks and write findings into INBOX.md as a single "🌅 P
 
 
 
+
+18. **Stale pipeline-state lint (added 2026-07-25).** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/python scripts/pipeline_stale_state_lint.py`. **Run it from the repo root as written** — the script imports `pipeline_orchestrator` for its pid-liveness helpers, and from elsewhere it degrades to a weaker age rule (it warns on stderr when that happens). If stdout starts with `CLEAN`, note nothing (the common case). If it starts with `🔴 FLAG`, append the full report verbatim under a `**⚠️ Stale pipeline state:**` line inside today's sweep subsection, and treat it as needing a human decision — the script is READ-ONLY and never edits state, deliberately, because the fix (mark done vs re-run vs investigate) depends on which class fired.
+
+    Catches two classes that turn into recurring false "needs Steve" pings on the hourly sweep: (a) **published-but-open** — a video with a live upload receipt whose pre-publish stage isn't `done` (the receipt proves it completed; `11_analyze` and `12_leadmagnet` are deliberately exempt, the latter because it is not a publish dep and may legally stay parked); (b) **orphaned-running** — a stage stuck `running` with a dead or recycled pid.
+
+    Why daily and not hourly: `advance_once` already calls `reconcile_orphans` for every video on every hourly sweep, so a dead-pid orphan self-heals within the hour — this linter is a CANARY for when the sweep itself is broken, and a canary doesn't need to sing 24x/day. Class (a) only changes state at publish. Hourly would also turn any future false positive into 24 pings/day, which is the exact alert-fatigue failure it exists to prevent.
+
+    Origin: 2026-07-25 — the hourly pipeline sweep was reporting Videos 1-12 as "needs Steve" when all were published; audit found 26 stale pre-publish stages across 6 published videos plus one orphaned `running`. Reconciled by hand; this lint is the guard so it can't silently recur.
+
 ---
 
 ## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)
