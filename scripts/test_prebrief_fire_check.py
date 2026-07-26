@@ -16,6 +16,15 @@ m = importlib.util.module_from_spec(_spec)
 sys.modules["pfc"] = m  # @dataclass needs the module registered before exec
 _spec.loader.exec_module(m)
 
+# Never let a test run touch the REAL interval-liveness state. main() persists a
+# launchd `runs` snapshot; a test that consumes a genuine "job stopped" alert
+# into its own stdout AND re-baselines the window would defer the real alert by a
+# full pre-brief cycle. Harmless on a day when no counter moved, silently
+# destructive on the day it matters.
+import tempfile as _tf
+from pathlib import Path as _P
+m.INTERVAL_STATE = _P(_tf.mkdtemp(prefix="pfc_test_")) / "interval_job_runs.tsv"
+
 
 def test_weekday_conversion():
     # launchd Sun=0..Sat=6  ->  python Mon=0..Sun=6

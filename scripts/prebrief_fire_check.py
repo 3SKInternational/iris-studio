@@ -23,13 +23,16 @@ brief + chief-of-staff-weekly + market-researcher-monthly all skipped with
 zero error signal because APScheduler logged "missed by 7:54:35" and moved
 on. Pairs with A-21 (rotation refill) for full cadence-observability.
 
-Surface-only. Never modifies state. Safe to run unconditionally.
+Surface-only for the vault. The ONE thing it writes is its own monitoring
+state (~/iris_studio/state/interval_job_runs.tsv — the launchd `runs` snapshot
+the interval-liveness check diffs against). Safe to run unconditionally.
 Output is consumed by `routines/pre-brief.prompt` Pass 12.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -67,6 +70,9 @@ MON, TUE, WED, THU, FRI, SAT, SUN = 0, 1, 2, 3, 4, 5, 6
 # detection (A-22 reported OK while any could be dead). This derives an Expected
 # per calendar-scheduled claude-code plist straight from the schedule on disk.
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+# Populated by collect_launchd_expected: [(name, label, interval_seconds)] for
+# every StartInterval job, so check_interval_jobs can give them real coverage.
+_INTERVAL_JOBS: list[tuple[str, str, int]] = []
 CLAUDE_PLIST_GLOB = "com.iris.claude-code-*.plist"
 
 # Plists already covered by a hardcoded check below — auto-derive skips them to
@@ -163,6 +169,7 @@ def collect_launchd_expected(
     the report can be honest about what it does NOT cover (no silent confidence)."""
     expected: list[Expected] = []
     not_checked: list[tuple[str, str]] = []
+    _INTERVAL_JOBS.clear()
     if not shutil.which("plutil") or not LAUNCH_AGENTS_DIR.is_dir():
         return expected, not_checked  # not on macOS / no agents dir — hardcoded-only
     for path in sorted(LAUNCH_AGENTS_DIR.glob(CLAUDE_PLIST_GLOB)):
@@ -182,6 +189,11 @@ def collect_launchd_expected(
                 if interval else "no schedule (RunAtLoad/manual) — not coverage-checked"
             )
             not_checked.append((name, reason))
+            if interval:
+                try:
+                    _INTERVAL_JOBS.append((name, label, int(interval)))
+                except (TypeError, ValueError):
+                    pass   # a malformed StartInterval must not crash the check
             continue
         log_path = _derive_log_path(data, name)
         entries = sci if isinstance(sci, list) else [sci]
@@ -191,6 +203,193 @@ def collect_launchd_expected(
                 expected.append(exp)
     return expected, not_checked
 
+
+
+# === Interval-job liveness (added 2026-07-26) ================================
+# The calendar model above cannot express a StartInterval job, so 7 of them —
+# including the retry runner, the hourly pipeline sweep and the auth canary —
+# were reported as "not coverage-checked" and had NO silent-stop detection at all.
+#
+# Why launchd's counter and not log-mtime: mtime would actually WORK for 5 of
+# these 6 (run_job.sh writes "starting at" unconditionally; auth_canary always
+# logs) — but NOT for `retry_runner.sh`, which exits silently on an empty queue
+# (line ~48), so a healthy idle retry job is byte-identical to a dead one. The
+# counter avoids needing per-wrapper knowledge of who logs what, is uniform
+# across every job, and additionally catches "the wrapper was never invoked at
+# all" — a case no wrapper-written log can report on.
+#
+# The authoritative signal is launchd's OWN cumulative counter, `runs`, from
+# `launchctl print`. It advances on every fire regardless of what the job logs,
+# exits, or no-ops. We snapshot it per job and flag when it fails to advance
+# across a window in which it should have fired. Derive from the scheduler, never
+# from a proxy — the same rule the 2026-07-22 phantom-alert fix established.
+#
+# `runs` RESETS TO 0 on reload/reboot (verified: a `launchctl unload/load` put
+# caption-sweep back to 0 while its sibling sat at 141). A decrease is therefore
+# a re-baseline, never a failure.
+INTERVAL_STATE = Path.home() / "iris_studio" / "state" / "interval_job_runs.tsv"
+# How many whole intervals must elapse with a frozen counter before we call it
+# stopped. 2.5 tolerates one skipped fire plus scheduler jitter; at the daily
+# pre-brief cadence the real elapsed gap is ~24h, so this only matters when the
+# check is run twice in quick succession.
+INTERVAL_MISS_FACTOR = 2.5
+# Degraded-cadence guard: a job can advance its counter while firing far below
+# schedule, which a freeze-only check reads as green forever. Flag when it
+# delivers under DEGRADED_FLOOR of its due fires.
+#
+# 0.25 is argued from this vault's own logs, not picked: real per-day counts for
+# hourly jobs run 19-24 of 24 (pipeline-sweep's worst real day was 19 = 79%,
+# pure scheduler jitter — comment-sweep and alt-thumbnail hit 24/24 the same
+# day). A 0.75 floor would false-alarm on that 19. 0.25 puts the line at 6/24:
+# 3.2x headroom under the worst observed natural dip, while still catching the
+# caption-sweep class (1/24 = 4%, the month-long stale-plist bug).
+#
+# NOTE: a separate minimum-sample gate is NOT needed. In this branch the counter
+# advanced, so got >= 1; `got < due * 0.25` already implies `due > 4`. An
+# explicit DEGRADED_MIN_DUE was unreachable dead code and is deliberately absent.
+# If the floor is ever raised above 0.25 that implication weakens and a real
+# minimum-sample gate (with a fixture that exercises it) becomes necessary.
+DEGRADED_FLOOR = 0.25
+
+
+def _boot_time() -> datetime | None:
+    """When the machine last booted, or None if unreadable.
+
+    A reboot zeroes every job's `runs`. The `cur < prev` reset detector cannot
+    see a reset that lands ABOVE a low prior baseline (e.g. a job reloaded just
+    before the last check sits at 0; after a reboot it reads 3, which looks like
+    "advanced"). The degraded-cadence maths would then measure those 3 fires
+    against a window the counter never lived through and report a HEALTHY job at
+    17% of schedule. Verified live against the on-disk caption-sweep tuple.
+    """
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                             capture_output=True, text=True, timeout=5)
+        m = re.search(r"\bsec\s*=\s*(\d+)", out.stdout)  # \b: `usec` must not shadow `sec`
+        return datetime.fromtimestamp(int(m.group(1))) if m else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _launchd_runs(label: str) -> int | None:
+    """launchd's cumulative fire count for a job, or None if unreadable."""
+    try:
+        out = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        m = re.search(r"^\s*runs\s*=\s*(\d+)\s*$", out.stdout, re.MULTILINE)
+        return int(m.group(1)) if m else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _read_interval_state() -> dict[str, tuple[int, datetime]]:
+    out: dict[str, tuple[int, datetime]] = {}
+    try:
+        for line in INTERVAL_STATE.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            try:
+                out[parts[0]] = (int(parts[1]), datetime.fromisoformat(parts[2]))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def _write_interval_state(state: dict[str, tuple[int, datetime]]) -> bool:
+    """Persist the snapshot. Returns False if it could NOT be written.
+
+    A failure here silently DISABLES the whole check — every subsequent run
+    re-baselines, so a permanently dead job is never flagged. The caller must
+    surface that rather than keep printing "liveness-checked": this module's
+    contract is to be honest about what it does NOT cover (no silent confidence).
+    """
+    try:
+        INTERVAL_STATE.parent.mkdir(parents=True, exist_ok=True)
+        INTERVAL_STATE.write_text(
+            "".join(f"{k}\t{v[0]}\t{v[1].isoformat()}\n" for k, v in sorted(state.items())),
+            encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def check_interval_jobs(now: datetime, jobs: list[tuple[str, str, int]],
+                        runs_fn=_launchd_runs, state=None, boot=None
+                        ) -> tuple[list[str], dict[str, tuple[int, datetime]]]:
+    """Anomaly lines for interval jobs whose launchd `runs` counter has frozen.
+
+    jobs: [(name, label, interval_seconds)]. Returns (anomalies, new_state) —
+    pure apart from runs_fn, so the selftest can drive it with a fake counter.
+    """
+    prior = _read_interval_state() if state is None else state
+    if boot is None:
+        boot = _boot_time()
+    new: dict[str, tuple[int, datetime]] = {}
+    anomalies: list[str] = []
+    for name, label, interval in jobs:
+        cur = runs_fn(label)
+        if cur is None:
+            new[name] = prior.get(name, (0, now))
+            continue
+        seen = prior.get(name)
+        if seen is None:
+            new[name] = (cur, now)            # first sight — baseline, never flag
+            continue
+        prev_runs, prev_ts = seen
+        # A reboot restarts every counter at 0, so any window that predates boot
+        # is not a window this counter lived through. Clamp it on BOTH paths:
+        # the freeze path would otherwise report a job that booted 30 min ago as
+        # "frozen for 17.8h — loaded but not firing", which is strictly more
+        # alarming than the degraded false-positive and equally wrong.
+        rebooted = boot is not None and boot > prev_ts
+        window_start = max(prev_ts, boot) if boot else prev_ts
+        if cur > prev_runs:
+            # Advancing, but is it advancing ENOUGH? A job firing 1x/day instead
+            # of 24x still moves the counter and would read green forever. That
+            # is not hypothetical: caption-sweep ran 1x/day at 04:20 for a month
+            # while its repo plist said hourly (the installed plist was stale),
+            # and pipeline-sweep is currently ~6 fires short over 5.9 days.
+            # Only judge over a window long enough to be meaningful, and use a
+            # loose 25% floor so sleep/wake deferrals don't cry wolf.
+            elapsed = (now - prev_ts).total_seconds()
+            due = elapsed / interval
+            got = cur - prev_runs
+            if not rebooted and got < due * DEGRADED_FLOOR:
+                anomalies.append(
+                    f"{name}: fired {got}x in {elapsed/3600:.1f}h but a {interval}s "
+                    f"interval is ~{due:.0f}x due — running at {got/due*100:.0f}% "
+                    f"of its schedule. Not stopped, but degraded (a stale installed "
+                    f"plist, sleep/App-Nap, or a wedged run can cause this).")
+            new[name] = (cur, now)            # advanced => alive
+        elif cur < prev_runs:
+            new[name] = (cur, now)            # counter reset (reload/reboot) => re-baseline
+        else:
+            elapsed = (now - window_start).total_seconds()
+            if elapsed >= interval * INTERVAL_MISS_FACTOR:
+                missed = int(elapsed // interval)
+                anomalies.append(
+                    f"{name}: launchd `runs` frozen at {cur} for "
+                    f"{elapsed/3600:.1f}h — a {interval}s-interval job should have "
+                    f"fired ~{missed}x in that window. The job is loaded but not "
+                    f"firing (log mtime cannot show this: an idle no-op writes "
+                    f"nothing).")
+                # Re-baseline the TIMESTAMP so the next message's elapsed/miss
+                # figures stay truthful about the current window. This does NOT
+                # de-duplicate: at the daily pre-brief cadence elapsed (~24h)
+                # re-crosses every threshold (<=7.5h), so a still-dead job
+                # re-alerts each run. That is intended — a permanently dead job
+                # going quiet after one ping would be the worse failure.
+                new[name] = (cur, now)
+            else:
+                new[name] = seen              # too early to judge — KEEP the old
+                                              # timestamp so the window accumulates
+    return anomalies, new
 
 @dataclass
 class Expected:
@@ -524,6 +723,113 @@ CHECKERS = {
 }
 
 
+
+def _selftest_interval_liveness() -> int:
+    """Pins the interval-job liveness contract (added 2026-07-26).
+
+    The three properties that make this safe to alert on: a frozen counter only
+    flags AFTER its window elapses; a counter RESET (reload/reboot sets runs=0)
+    is a re-baseline and never a failure; and an inconclusive tick must NOT bump
+    the stored timestamp, or the window could never accumulate and the check
+    could never fire at all."""
+    t0 = datetime(2026, 7, 26, 12, 0, 0)
+    JOB = [("sweep", "com.iris.x", 3600)]
+    cases = [
+        # (label, prior, fake_runs, want_flag, want_baseline_preserved)
+        ("first sight -> baseline, never flag", {}, 10, False, None),
+        # Advance must be PROPORTIONAL to be "alive": 5 fires in 5h on an hourly
+        # job. (Written as 11 before the degraded-cadence guard existed — 1 fire
+        # in 5h is 20% of schedule, which the guard now correctly flags.)
+        ("counter advanced at schedule -> alive",
+         {"sweep": (10, t0 - timedelta(hours=5))}, 15, False, False),
+        ("counter RESET (reload/reboot) -> re-baseline, NOT a failure",
+         {"sweep": (500, t0 - timedelta(hours=5))}, 0, False, False),
+        ("frozen 5h on a 1h job -> FLAG",
+         {"sweep": (10, t0 - timedelta(hours=5))}, 10, True, False),
+        ("frozen only 1h on a 1h job -> too early, KEEP baseline",
+         {"sweep": (10, t0 - timedelta(hours=1))}, 10, False, True),
+        # want_keep=True is load-bearing: with None this fixture was VACUOUS —
+        # `cur = runs_fn(...) or 0`, dropping the prior tuple, and bumping the ts
+        # on the None path all survived it. An intermittently-unreadable
+        # launchctl would then reset the accumulation window every run and the
+        # check could never fire.
+        ("launchctl unreadable -> no flag AND baseline preserved",
+         {"sweep": (10, t0 - timedelta(hours=5))}, None, False, True),
+    ]
+    # Degraded cadence: advancing, but far under schedule.
+    cases += [
+        ("degraded: 2 fires in 24h on a 1h job -> FLAG",
+         {"sweep": (10, t0 - timedelta(hours=24))}, 12, True, False),
+        ("healthy: 24 fires in 24h on a 1h job -> no flag",
+         {"sweep": (10, t0 - timedelta(hours=24))}, 34, False, False),
+        ("1 fire in 2h on a 1h job (50%) -> above the floor, no flag",
+         {"sweep": (10, t0 - timedelta(hours=2))}, 11, False, False),
+    ]
+    # Boot far in the past unless a case overrides it -> the reboot guard is
+    # inert for every case that isn't specifically testing it.
+    OLD_BOOT = t0 - timedelta(days=30)
+    cases = [(c[0], c[1], c[2], c[3], c[4], OLD_BOOT) for c in cases]
+    cases += [
+        # M5: pins DEGRADED_FLOOR. 12/24 = 50% must NOT flag — this fails if the
+        # floor drifts up to 0.75 and passes at 0.25. Without it the one tuned
+        # number in the check was the one number no fixture constrained.
+        ("degraded floor: 12 fires in 24h (50%) -> no flag",
+         {"sweep": (10, t0 - timedelta(hours=24))}, 22, False, False, OLD_BOOT),
+        # H3: a reboot inside the window zeroes `runs`; a low prior baseline makes
+        # the post-boot count look "advanced". Measuring it against the full
+        # window reported a HEALTHY job at 17% of schedule. Live-armed by
+        # caption-sweep sitting at 0 after today's reload.
+        ("reboot inside window: healthy job must NOT read as degraded",
+         {"sweep": (0, t0 - timedelta(hours=18))}, 3, False, False,
+         t0 - timedelta(hours=16)),
+        ("no reboot: same numbers DO flag as degraded",
+         {"sweep": (0, t0 - timedelta(hours=18))}, 3, True, False, OLD_BOOT),
+        # H4 mirror pair — the FREEZE path had the identical reboot artifact:
+        # a job that booted 30 min ago sits at runs=0 (which is also what a
+        # recently-reloaded baseline looks like), and an unclamped window called
+        # it "frozen for 17.8h — loaded but not firing".
+        ("reboot 30min ago: healthy job at runs=0 must NOT read as frozen",
+         {"sweep": (0, t0 - timedelta(hours=18))}, 0, False, True,
+         t0 - timedelta(minutes=30)),
+        ("no reboot: same runs=0 over 18h DOES flag as frozen",
+         {"sweep": (0, t0 - timedelta(hours=18))}, 0, True, False, OLD_BOOT),
+    ]
+    failures = 0
+
+    # LIVE pin: fixtures inject boot=, so _boot_time()'s own parse is never
+    # exercised by them. If sysctl's output shape ever changes (e.g. `usec`
+    # ordering), the guard would silently degrade to fail-open with the suite
+    # still green. Same live-pin pattern as the youtube-research/dispatch
+    # coverage checks in this file.
+    if shutil.which("sysctl"):
+        b = _boot_time()
+        # Recency bound, not just "in the past": an unanchored `sec` parse would
+        # yield the usec field (e.g. epoch 747401 -> 1970-01-09), which IS in the
+        # past and would pass a naive check while the guard sits inert. The bound
+        # is what actually catches a sysctl output-shape change.
+        ok = (isinstance(b, datetime)
+              and b < datetime.now()
+              and b > datetime.now() - timedelta(days=365))
+        if not ok:
+            failures += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] interval: _boot_time() live-reads "
+              f"a past datetime ({b})")
+
+    for label, prior, fake, want_flag, want_keep, boot_at in cases:
+        anoms, new_state = check_interval_jobs(
+            t0, JOB, runs_fn=lambda _l, v=fake: v, state=dict(prior),
+            boot=boot_at)
+        ok = bool(anoms) == want_flag
+        if ok and want_keep is True:
+            ok = new_state["sweep"][1] == prior["sweep"][1]
+        elif ok and want_keep is False:
+            ok = new_state["sweep"][1] == t0
+        if not ok:
+            failures += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] interval: {label}")
+    return failures
+
+
 def _selftest_youtube_coverage() -> int:
     """Regression pin for the 2026-07-22 fix: youtube-research must be covered by
     auto-derive off its own plist, and only on its real fire days (Mon+Thu 02:00).
@@ -689,6 +995,7 @@ def _selftest() -> int:
         print(f"  [{status}] missing file: ok={ok} (want False) — {msg}")
         failures += _selftest_youtube_coverage()
         failures += _selftest_dispatch_coverage()
+        failures += _selftest_interval_liveness()
         print("SELFTEST OK" if failures == 0 else f"SELFTEST FAILED ({failures})")
         return 1 if failures else 0
     finally:
@@ -733,9 +1040,22 @@ def main(argv: list[str]) -> int:
     # silently-dead job — exactly the class this check exists for). Interval/manual
     # jobs are listed once as a coverage note, not flagged.
     bad_plists = [n for n, r in not_checked if r == "unparseable plist"]
-    coverage_notes = [(n, r) for n, r in not_checked if r != "unparseable plist"]
     for name in bad_plists:
         findings.append(f"{name}: plist unparseable by plutil — launchd cannot (re)load it")
+
+    # Interval jobs get real coverage from the launchd `runs`-counter check
+    # rather than the calendar model. Anything flagged here is a silent stop.
+    interval_anoms, new_state = check_interval_jobs(now, list(_INTERVAL_JOBS))
+    findings.extend(interval_anoms)
+    state_ok = _write_interval_state(new_state) if _INTERVAL_JOBS else True
+    if not state_ok:
+        findings.append(
+            f"interval liveness: state file unwritable at {INTERVAL_STATE} — "
+            f"silent-stop detection for {len(_INTERVAL_JOBS)} interval job(s) is "
+            f"INACTIVE (every run re-baselines, so a dead job would never flag)")
+    interval_names = {n for n, _, _ in _INTERVAL_JOBS}
+    coverage_notes = [(n, r) for n, r in not_checked
+                      if r != "unparseable plist" and n not in interval_names]
 
     if not findings:
         print(f"OK ({green}/{green} expected fires verified)")
@@ -743,9 +1063,12 @@ def main(argv: list[str]) -> int:
         print(f"ANOMALIES ({len(findings)} of {green + len(findings)} expected fires):")
         for i, line in enumerate(findings, 1):
             print(f"  {i}. {line}")
+    if _INTERVAL_JOBS and state_ok:
+        print(f"Interval jobs liveness-checked via launchd `runs`: "
+              f"{len(_INTERVAL_JOBS)} ({', '.join(sorted(n for n, _, _ in _INTERVAL_JOBS))})")
     if coverage_notes:
         print(
-            f"NOT coverage-checked ({len(coverage_notes)} interval/manual jobs): "
+            f"NOT coverage-checked ({len(coverage_notes)} manual/unschedulable): "
             + ", ".join(f"{n} ({r})" for n, r in coverage_notes)
         )
     return 0  # surface-only; never block the routine
