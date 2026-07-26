@@ -43,7 +43,9 @@ OUT_W, OUT_H = 1920, 1080
 CANVAS_W, CANVAS_H = 7680, 4320
 # Motion shots render zoompan at SUPERSAMPLE× the output, then lanczos-downscale
 # to OUT. zoompan recomputes an INTEGER crop rectangle per frame, so a smooth
-# zoom lands on a stair-step that reads as tremble/breathing (worst on text +
+# zoom lands on a stair-step that reads as tremble/breathing (measured: a
+# 0/1/0/1 px alternation — a 50% velocity ripple, max stall run exactly ONE
+# frame, not a multi-frame freeze; worst on text +
 # fullscreen). Rendering the zoom larger and shrinking it averages that integer
 # step down to sub-pixel, where the eye can't catch it. 3× (5760×3240) was the
 # level Steve confirmed smooth on-screen; supersampling the OUTPUT alone (not
@@ -60,7 +62,7 @@ AUDIO_CODEC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 # re-render — the safety valve that stops the cache serving stale pixels after a
 # pipeline change. (The ffmpeg binary identity is ALSO folded into the key
 # automatically, so an ffmpeg upgrade/keg-swap self-invalidates without a bump.)
-CACHE_VERSION = 2   # 2026-07-23: motion shots now supersample+downscale (de-tremble)
+CACHE_VERSION = 5   # 2026-07-24: move completes over 60% of shot then holds
 
 
 def _resolve_bin(name: str) -> str:
@@ -272,12 +274,68 @@ def build_shots(manifest: dict, asset_dir: Path) -> list[Shot]:
     return shots
 
 
+# Fraction of a shot over which the camera move COMPLETES; it then holds the
+# final framing until the cut. Steve picked 0.60 from a rendered comparison
+# (100% / 75% / 60%) on 2026-07-24.
+#
+# THE TREMBLE BUG this fixes: zoompan recomputes an INTEGER crop rectangle every
+# frame. One canvas pixel is OUT_W/CANVAS_W = 0.25 output px, so a move slower
+# than ~0.25 px/frame leaves the crop identical for several frames and then
+# jumps — visible micro-stepping, which is what read as "trembling" fullscreen.
+# Stretching a fixed 1.12 zoom across a whole shot made the rate depend on shot
+# LENGTH, and V13's shots run median 11.9s / max 23.2s:
+#     23.2s over 100% of the shot -> 0.19 px/frame  (under the floor: steps)
+#     23.2s over  60% of the shot -> 0.31 px/frame  (over the floor: smooth)
+# Completing the move earlier raises the rate above the floor without touching
+# the zoom magnitude, so the authored framing (1.12 = 5.4%/edge, approved
+# 2026-07-23) is preserved exactly.
+#
+# Measured motion-energy CV on the real 23.2s shot, lower = smoother:
+#     100% span                          25.2%   (5.4% crop)
+#      60% span                          17.4%   (5.4% crop)  <-- chosen
+#     zoom raised to 1.20, 100% span     18.4%   (8.3% crop — crops feet/cards)
+#     canvas 11520 + tmix=5, 100% span   18.9%   (5.4% crop, ~5x render cost)
+# The early-complete path is the smoothest AND the cheapest AND keeps framing —
+# no supersample increase, no frame blending, no extra crop, no added cost.
+# It also matches the reference look: the image reaches full frame BEFORE the cut.
+MOTION_COMPLETE_FRAC = 0.60
+# ...but the fraction alone is NOT duration-robust. The stall condition is
+# absolute: the crop edge travels a fixed number of canvas px regardless of shot
+# length, so the rate is travel/km1 and 0-px frames reappear once km1 > travel.
+# At z=1.12 travel is ~411px, i.e. the fraction stops working past ~23.2s — and
+# V13's longest shot is 23.24s, sitting exactly on that line (15 residual stall
+# frames). A 38.7s shot at 0.60 would be precisely as trembly as a 23.2s shot was
+# at 100%, and nothing bounds shot length: clamp_scene_dwell only fires for k>=2,
+# which is why that 23.24s single-image shot exists at all.
+# So cap km1 by the travel budget too. On V13's longest shot this yields ~59%,
+# reproducing the look Steve signed off from the rendered comparison, while
+# staying correct for a 40s shot and no longer speeding up short ones.
+MIN_CANVAS_PX_PER_FRAME = 1.0
+# ponytail: this bounds the AVERAGE rate, not the instantaneous one. x(on) grows
+# as (IW/2)(1 - 1/z) with z linear in `on`, so d/don is ~1/z^2 — at the tight end
+# of a 1.12 zoom_out the rate dips to ~0.89 px/f and a few stalls survive (11 in
+# V13's 23.2s shot, down from 15). A true worst-case guarantee needs
+# travel/(z^2 * MIN_PX), which would cut that shot to a 47% span and move it off
+# the 59% Steve approved on screen. Deliberately not taken. The vertical edge is
+# also slower (231px vs 411px) for the same reason; the supersample+lanczos chain
+# absorbs it at 0.25 output px.
+
+
 # ---- Filtergraph ----------------------------------------------------------
 def compose_filter(shot: Shot, font: str | None, draw_ok: bool) -> str:
     """Build the per-shot video filtergraph producing [v] at 1920x1080."""
     n = shot.n_frames
     nm1 = max(1, n - 1)          # avoid div-by-zero on 1-frame shots
     z = shot.zoom
+    # The move completes over the first km1 frames, then holds (see
+    # MOTION_COMPLETE_FRAC). Clamped so a 1-2 frame shot still divides safely.
+    # Frames over which the move completes: the smaller of the fraction and the
+    # travel budget (see MIN_CANVAS_PX_PER_FRAME). Zooms move both edges inward so
+    # each travels half the delta; pans translate the full delta.
+    _span = CANVAS_H if shot.motion in ("pan_up", "pan_down") else CANVAS_W
+    _travel = (_span - _span / z) / (2 if shot.motion in ("zoom_in", "zoom_out") else 1)
+    _budget = max(1, int(round(_travel / MIN_CANVAS_PX_PER_FRAME)))
+    km1 = max(1, min(nm1, int(round(nm1 * MOTION_COMPLETE_FRAC)), _budget))
 
     # 1. Compose a CANVAS_W x CANVAS_H frame from the still.
     if shot.fit == "cover":
@@ -298,18 +356,26 @@ def compose_filter(shot: Shot, font: str | None, draw_ok: bool) -> str:
     #    index) -> fully deterministic, no accumulating jitter.
     cx = "iw/2-(iw/zoom/2)"
     cy = "ih/2-(ih/zoom/2)"
+    # Each move runs over the first km1 frames then CLAMPS at its end state and
+    # holds to the cut. Belt-and-braces: ffmpeg's zoompan ALSO clamps internally
+    # (av_clipd(zoom,1,10), and x/y bounded to the crop), so an unclamped
+    # expression would not actually break — verified, an unclamped z=0.92 renders
+    # byte-identically to z=1. The explicit clamps are kept because they make the
+    # hold intent readable and pin the hold position deterministically (ffmpeg
+    # bounds x against the INTEGER crop width, landing pan_right at 206 vs our
+    # 205). Do not read this as "removing them causes a reverse zoom" — it does not.
     if shot.motion == "zoom_in":
-        zexpr, xexpr, yexpr = f"1+({z}-1)*on/{nm1}", cx, cy
+        zexpr, xexpr, yexpr = f"min({z},1+({z}-1)*on/{km1})", cx, cy
     elif shot.motion == "zoom_out":
-        zexpr, xexpr, yexpr = f"{z}-({z}-1)*on/{nm1}", cx, cy
+        zexpr, xexpr, yexpr = f"max(1,{z}-({z}-1)*on/{km1})", cx, cy
     elif shot.motion == "pan_right":
-        zexpr, xexpr, yexpr = f"{z}", f"(iw-iw/zoom)*on/{nm1}", cy
+        zexpr, xexpr, yexpr = f"{z}", f"min((iw-iw/zoom),(iw-iw/zoom)*on/{km1})", cy
     elif shot.motion == "pan_left":
-        zexpr, xexpr, yexpr = f"{z}", f"(iw-iw/zoom)*(1-on/{nm1})", cy
+        zexpr, xexpr, yexpr = f"{z}", f"max(0,(iw-iw/zoom)*(1-on/{km1}))", cy
     elif shot.motion == "pan_down":
-        zexpr, xexpr, yexpr = f"{z}", cx, f"(ih-ih/zoom)*on/{nm1}"
+        zexpr, xexpr, yexpr = f"{z}", cx, f"min((ih-ih/zoom),(ih-ih/zoom)*on/{km1})"
     elif shot.motion == "pan_up":
-        zexpr, xexpr, yexpr = f"{z}", cx, f"(ih-ih/zoom)*(1-on/{nm1})"
+        zexpr, xexpr, yexpr = f"{z}", cx, f"max(0,(ih-ih/zoom)*(1-on/{km1}))"
     else:  # hold
         zexpr, xexpr, yexpr = "1", cx, cy
 
@@ -410,7 +476,17 @@ def shot_cache_key(shot: Shot, font: str | None, draw_ok: bool,
         "cache_version": CACHE_VERSION,
         "env": env_id,
         "fps": FPS, "out": [OUT_W, OUT_H], "canvas": [CANVAS_W, CANVAS_H],
-        "supersample": SUPERSAMPLE,   # self-invalidate if the SS factor changes
+        # Hash the ACTUAL filtergraph, not an enumeration of its inputs. Listing
+        # individual knobs (as `supersample` did) only ever covers the knob you
+        # remembered: MOTION_COMPLETE_FRAC was NOT covered, and frac 0.60 / 0.75 /
+        # 1.00 provably produced identical keys — so tuning it and re-running
+        # silently reused every stale segment and logged "[cached]" while changing
+        # nothing. The graph string subsumes supersample, canvas, cx/cy, the move
+        # fraction, the drawtext expression, and every future expression edit, so
+        # CACHE_VERSION goes back to being a last-resort valve rather than
+        # something you must remember to bump.
+        "filter": compose_filter(shot, font, draw_ok),
+        "supersample": SUPERSAMPLE,   # redundant under "filter"; kept as a cheap tripwire
         "vcodec": VIDEO_CODEC, "acodec": AUDIO_CODEC,
         "image_sha": _file_digest(shot.image),
         "audio_sha": (_file_digest(shot.audio) if shot.audio is not None else None),
@@ -1012,6 +1088,100 @@ def main() -> None:
     print(f"[assemble] SRT   {out_srt}")
 
 
+
+def _selftest_motion() -> int:
+    """Pins compose_filter's motion contract — previously ZERO coverage.
+
+    Nothing in --selftest touched compose_filter, which is how MOTION_COMPLETE_FRAC
+    shipped invisible to the cache key and how the fraction-only span shipped
+    duration-fragile. These four properties are the ones whose breakage is silent.
+    """
+    import hashlib as _h, json as _j, re as _re
+    from types import SimpleNamespace as _NS
+    fails = 0
+
+    import tempfile as _tf, os as _os
+    _fd, _img = _tf.mkstemp(suffix="_motion_fixture.png")
+    _os.write(_fd, b"fixture"); _os.close(_fd)
+
+    def _sh(n, motion="zoom_out", zoom=1.12):
+        return _NS(n_frames=n, zoom=zoom, fit="cover", motion=motion,
+                   onscreen_label=None, image=Path(_img), audio=None,
+                   audio_start=0.0, seg_dur=n / FPS, index=1, caption_text="")
+
+    def _chk(cond, label):
+        nonlocal fails
+        if not cond:
+            fails += 1
+        print(f"  [{'PASS' if cond else 'FAIL'}] motion: {label}")
+
+    # 1. THE regression guard: a MOTION_COMPLETE_FRAC change must change the key.
+    global MOTION_COMPLETE_FRAC
+    keep = MOTION_COMPLETE_FRAC
+    try:
+        a = shot_cache_key(_sh(150), None, False, "env")
+        MOTION_COMPLETE_FRAC = 0.50
+        b = shot_cache_key(_sh(150), None, False, "env")
+    finally:
+        MOTION_COMPLETE_FRAC = keep
+    # n=150 deliberately: at n=696 the travel cap binds for BOTH fractions, so the
+    # graphs are legitimately identical and this check would pass vacuously. 150 is
+    # short enough that the fraction still governs km1.
+    _chk(a != b, "MOTION_COMPLETE_FRAC change invalidates the cache key")
+
+    # 2. No expression can leave its valid range, for every motion and every n.
+    bad = []
+    for n in (1, 2, 3, 90, 696, 1800):
+        for mot in ("zoom_in", "zoom_out", "pan_left", "pan_right",
+                    "pan_up", "pan_down", "hold"):
+            g = compose_filter(_sh(n, mot), None, False)
+            zx = _re.search(r"zoompan=z='([^']+)':x='([^']+)':y='([^']+)'", g)
+            if not zx:
+                bad.append(f"{mot}/{n}: unparseable"); continue
+            ze, xe, ye = zx.groups()
+            for on in {0, 1, n // 2, max(0, n - 1)}:
+                env = {"on": on, "iw": CANVAS_W, "ih": CANVAS_H,
+                       "min": min, "max": max}
+                try:
+                    z = eval(ze, {"__builtins__": {}}, env)          # noqa: S307
+                    env["zoom"] = z
+                    x = eval(xe, {"__builtins__": {}}, env)          # noqa: S307
+                    y = eval(ye, {"__builtins__": {}}, env)          # noqa: S307
+                except Exception as e:                                # pragma: no cover
+                    bad.append(f"{mot}/{n}/on={on}: {e}"); continue
+                if not (1.0 - 1e-9 <= z <= _sh(n).zoom + 1e-9):
+                    bad.append(f"{mot}/{n}/on={on}: zoom {z}")
+                if not (-1e-6 <= x <= CANVAS_W - CANVAS_W / z + 1e-6):
+                    bad.append(f"{mot}/{n}/on={on}: x {x}")
+                if not (-1e-6 <= y <= CANVAS_H - CANVAS_H / z + 1e-6):
+                    bad.append(f"{mot}/{n}/on={on}: y {y}")
+    _chk(not bad, f"all 6 motions x 6 durations stay in range ({len(bad)} violations)")
+
+    # 3. The move REACHES its end state at km1 and holds identically after.
+    g = compose_filter(_sh(696), None, False)
+    km1 = int(_re.search(r"on/(\d+)\)", g).group(1))
+    ze = _re.search(r"zoompan=z='([^']+)'", g).group(1)
+    ev = lambda on: eval(ze, {"__builtins__": {}},                    # noqa: S307
+                         {"on": on, "min": min, "max": max})
+    _chk(abs(ev(km1) - 1.0) < 1e-9 and abs(ev(695) - 1.0) < 1e-9,
+         "zoom_out reaches 1.0 at km1 and holds there to the last frame")
+
+    # 4. Duration robustness: px/frame must never fall under the stall floor,
+    #    which a pure fraction does not guarantee past ~23s.
+    worst = []
+    for n in (90, 696, 1161, 1800):
+        g = compose_filter(_sh(n), None, False)
+        k = int(_re.search(r"on/(\d+)\)", g).group(1))
+        worst.append(((CANVAS_W - CANVAS_W / 1.12) / 2) / k)
+    _chk(min(worst) >= MIN_CANVAS_PX_PER_FRAME - 1e-9,
+         f"px/frame >= floor at every duration, horizontal axis (min {min(worst):.2f})")
+    try:
+        _os.unlink(_img)
+    except OSError:
+        pass
+    return fails
+
+
 def _selftest() -> None:
     """Assert the word-timed caption path: real word times, monotonic non-overlap,
     tail within video, and clean fallback to proportional when no alignment."""
@@ -1207,6 +1377,13 @@ def _selftest() -> None:
                  for ln in blk.split("\n")[2:]]
     assert cap_lines and not any(ch in "".join(cap_lines) for ch in "-–—―−*"), dsrt
     assert "-->" in dsrt, dsrt  # structural cue arrow untouched
+    _mf = _selftest_motion()
+    if _mf:
+        print(f"[assemble] selftest FAILED ({_mf} motion)")
+        sys.exit(1)   # NOT `return 1`: __main__ discards the return, so a
+                      # printed FAILED would still exit 0 — the rc=0-means-
+                      # success trap. Every sibling check here aborts via
+                      # assert; these four must fail the process too.
     print("[assemble] selftest OK")
 
 

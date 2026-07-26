@@ -1122,8 +1122,10 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
     window from where its words are ACTUALLY spoken (local forced alignment)
     instead of the caption character-proportion estimate. Any scene that can't be
     aligned cleanly silently keeps the proportional split, so --align only ever
-    sharpens timing. `fit` overrides the manifest's default fit ("contain" when
-    unset); pass "cover" to keep V1's original crop-to-fill look.
+    sharpens timing. `fit` overrides the manifest's default fit ("cover" when
+    unset, since 2026-07-24); pass "contain" for the blurred-fill letterbox
+    (only needed for non-16:9 sources — 3SK art is all 16:9, where cover is
+    identical output minus the tremble-amplifying invisible blur bg).
 
     `edit_anchors` (from parse_cut_anchors): optional per-scene editorial cut
     phrases. When --align is on and a scene supplies exactly k-1 anchors that all
@@ -1306,7 +1308,18 @@ def author_edit_manifest(shots: list[dict], cadence: dict[int, float], kit: dict
         # ~10.7% total, symmetric = ~5.4% per edge, resolving to full frame by
         # the cut; figure-card legibility during each card's spoken beat verified
         # at assemble before ship (the cards are the number spine).
-        "defaults": {"zoom": 1.12, "fit": fit or "contain"},
+        # fit=cover (was contain) — 2026-07-24. All 3SK art is exactly 16:9, so
+        # the contain path's blurred-fill background is 100% covered by the fitted
+        # foreground and never visible — yet under a zoom it AMPLIFIED the tremble
+        # (blur magnifies sub-pixel wobble + a 1px overlay seam shimmers). Measured
+        # on a synthetic target: contain breathing 0.31px vs cover 0.23px at the
+        # same zoom. cover = plain scale+crop, no blur: smoother AND cheaper (skips
+        # split/blur/overlay). This is what made the isolated test clips read
+        # smooth while the full contain-rendered V13 trembled on identical zoom.
+        # NOTE: correct because the source is 16:9; a non-16:9 asset would be
+        # center-cropped by cover instead of letterboxed. An explicit --fit
+        # contain still overrides for any such case.
+        "defaults": {"zoom": 1.12, "fit": fit or "cover"},
         "shots": out_shots,
     }
     return manifest, all_vo, fallbacks, undetermined, align_notes
@@ -1353,7 +1366,8 @@ def parse_args() -> argparse.Namespace:
                         "Pass --no-align to fall back to even-split proportional timing.")
     p.add_argument("--fit", choices=["cover", "contain"], default=None,
                    help="Override the edit-manifest default fit. 'cover' = crop-to-fill "
-                        "(V1's original look); 'contain' = blurred-fill, no crop (default).")
+                        "(default since 2026-07-24; no blur, no tremble); 'contain' = "
+                        "blurred-fill letterbox, for non-16:9 sources.")
     p.add_argument("--still", action=argparse.BooleanOptionalAction, default=False,
                    help="Lock every shot to a static frame (motion 'hold'). OFF BY "
                         "DEFAULT since 2026-07-23 (Steve): shots zoom OUT (1.12 → full "
