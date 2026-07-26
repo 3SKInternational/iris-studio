@@ -72,8 +72,13 @@ RECEIPT_GLOB = os.path.join(FIN, "Production_Kits", "*_youtube_upload.json")
 REPORT = os.path.join(FIN, "Raw_Assets", "_verdict_resolution_report.md")
 NOTIFY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.sh")
 
-# Overall verdict line: start of line, optional markdown heading/bold, then VERDICT:
-_VERDICT_RE = re.compile(r'^\s*(?:#+\s*|\*\*\s*)?VERDICT\s*:\s*(.+)$', re.IGNORECASE)
+# Overall verdict line: COLUMN 0, optional markdown heading/bold, then VERDICT:.
+# Column-0 anchored to match the frontmatter read — an INDENTED `verdict: X` is a
+# nested YAML history entry (`prior_round_verdicts:`), never a file's own verdict.
+# Under any-clean-wins an indented history `verdict: SHIP` in the body would EAT a
+# live open verdict, a worse failure direction than the false flag it used to
+# cause. Verified free: all 157 corpus verdict lines start at column 0.
+_VERDICT_RE = re.compile(r'^(?:#+\s*|\*\*\s*)?VERDICT\s*:\s*(.+)$', re.IGNORECASE)
 _VIDEO_RE = re.compile(r'Video[_\- ]?(\d{1,3})', re.IGNORECASE)
 # Non-verdict files that live in the review dirs but are not per-video gates.
 _SKIP_NAME_RE = re.compile(r'(_MOC|Policy_and_AgentDef|__)', re.IGNORECASE)
@@ -196,11 +201,21 @@ def classify_path(path):
     # flagged. On an already-shipped video that is future-re-bake work, not a
     # publish-blocking gate — and this linter exists to stop closed verdicts
     # being resurrected as open gates, so it errs toward silence, not phantoms.
-    # Fixtures 11d/11e pin both orderings; 11f pins this ceiling deliberately.
+    # Fixtures 11d/11e pin both orderings; 11c pins this ceiling deliberately.
     signals = []
     mfv = re.search(r'^verdict\s*:\s*(.+)$', fm, re.MULTILINE)   # column-0 ONLY
     if mfv:
-        signals.append((0, "", classify_verdict(mfv.group(1))))
+        # Cite the real line/text: the frontmatter gate (lead-magnet) writes
+        # fm-only verdicts, so an fm-only OPEN one is a reachable finding and a
+        # report row with line 0 and a blank snippet is uncitable.
+        # +1, not +2: _frontmatter returns text[3:end], and text[3] is the
+        # NEWLINE terminating the opening '---'. That leading \n already pays
+        # for the fence line, so adding another double-counts (verified against
+        # Video_02_Packaging_Review.md, whose fm verdict is line 7 — a +2 cited
+        # line 8, i.e. its `tags:` line, with the correct snippet beside it).
+        signals.append((fm[:mfv.start()].count("\n") + 1,
+                        mfv.group(0).strip()[:120],
+                        classify_verdict(mfv.group(1))))
     for i, line in enumerate(text[body_start:].splitlines(),
                              text.count("\n", 0, body_start) + 1):
         m = _VERDICT_RE.match(line)
@@ -393,15 +408,25 @@ def selftest():
     ran = [0]
     receipts = ["Video_04_youtube_upload.json", "Video_11_youtube_upload.json"]  # basenames suffice
 
-    def check(name, filetext, prefix, exp_flags):
+    def check(name, filetext, prefix, exp_flags, exp_line=None):
+        """exp_line: assert the FINDING'S CITED LINE, not just the flag count.
+        Until this existed the harness compared counts only, so a wrong line
+        number sailed through a green 24-fixture suite — a report that cites the
+        wrong line is worse than one that cites none, because it reads as
+        authoritative and contradicts its own snippet."""
         ran[0] += 1
         p = _tmp(filetext, prefix=prefix)
         try:
-            _f, _n, nf = run_check([p], receipts)
+            f, _n, nf = run_check([p], receipts)
         finally:
             os.unlink(p)
         if nf != exp_flags:
             fails.append("%s: expected %d flag, got %d" % (name, exp_flags, nf))
+        elif exp_line is not None:
+            got = f[0][2] if f else None
+            if got != exp_line:
+                fails.append("%s: expected finding at line %s, got %s"
+                             % (name, exp_line, got))
 
     FM = "---\ndate: 2026-07-06\ntype: vo-review\nstatus: ok\nvideo: %s\n%s---\n"
 
@@ -503,6 +528,37 @@ def selftest():
           "---\ntype: analyze-review\nvideo: Video_11\nround: 2\n"
           "prior_round_verdicts:\n  - round: 1\n    verdict: SHIP\n---\n"
           "\nVERDICT: REVISE\n", "Video_11_", 1)
+
+    # 11i. CITATION fixture — the frontmatter verdict's reported line number.
+    #      Mirrors the real `Video_02_Packaging_Review.md` shape (fm verdict on
+    #      line 7). Pins the off-by-one that a count-only harness could not see:
+    #      _frontmatter returns text[3:end] whose leading \n is already the
+    #      fence line's terminator, so the offset is +1, not +2.
+    #        1 ---            5 status: ok
+    #        2 date: 2026-07-06   6 tags:
+    #        3 type: pkg-review   7 verdict: REVISE   <- cited
+    #        4 video: Video_11    8 reviewer: x
+    check("11i fm-verdict-citation-line",
+          "---\ndate: 2026-07-06\ntype: pkg-review\nvideo: Video_11\nstatus: ok\n"
+          "tags:\nverdict: REVISE\nreviewer: x\n---\n\nprose, no body verdict\n",
+          "Video_11_", 1, exp_line=7)
+
+    # 11g. a leading '---' HORIZONTAL RULE is not a frontmatter fence. Without
+    #      the key-line guard in _frontmatter, everything to the closing '---'
+    #      is skipped as if it were frontmatter and the verdict inside is lost.
+    #      Pins a guard that was otherwise untested (mutation: deleting the
+    #      guard left the whole suite green).
+    check("11g hr-lead-is-not-frontmatter",
+          "---\n\nsome prose above the verdict\n\n**VERDICT: REVISE**\n\n---\n",
+          "Video_11_", 1)
+
+    # 11h. an INDENTED body `verdict:` is nested YAML history, not a verdict.
+    #      Under any-clean-wins an indented `verdict: SHIP` would otherwise EAT
+    #      the live REVISE below it — a worse failure direction than the false
+    #      flag the permissive regex used to cause. Must still flag.
+    check("11h indented-body-verdict-is-not-a-signal",
+          FM % ("Video_11", "") + "\nhistory:\n    verdict: SHIP\n\nVERDICT: REVISE\n",
+          "Video_11_", 1)
 
     # --- multi-file (video, dir) grouping: the series-supersession contract ----
     # Each spec = (prefix, verdict_line). All share video Video_11 (receipted) and
