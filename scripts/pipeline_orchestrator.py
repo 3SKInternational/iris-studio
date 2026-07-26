@@ -123,7 +123,39 @@ INFRA_FAILURE_MARKERS = (
                                          # outage/auth-wobble). Treat as infra so the stage
                                          # is left 'ready' and retried — NEVER fail-open
                                          # advance unreviewed work (the V04 regression).
+    "quota-limit",                       # the CLI hit a usage/session limit. Self-healing by
+                                         # definition (the notice names its own reset time),
+                                         # so retry instead of billing a fail_count. Emitted
+                                         # ONLY by _agent_failure_detail() as an explicit
+                                         # sentinel — same design as reviewer-unavailable.
+                                         # Prose cannot forge the sentinel STRING (stdout
+                                         # saying "quota-limit" does not classify), but the
+                                         # INFRA_STDOUT_MARKERS scan below runs against raw
+                                         # stdout — that is the deliberate trust boundary,
+                                         # unavoidable while the CLI prints the notice there.
+                                         # Worst case is bounded: prose quoting "hit your
+                                         # usage limit" parks as infra at MAX_INFRA instead
+                                         # of failed at 3 — relabelled, still surfaced.
 )
+QUOTA_SENTINEL = "quota-limit"           # must stay a member of INFRA_FAILURE_MARKERS above
+
+# Quota notices are matched against the agent's STDOUT (that is where the CLI
+# prints them; stderr stays empty), so they get their own tuple: the general
+# markers above must NEVER be scanned against stdout, where legitimate agent
+# prose says things like "bash: jq: command not found".
+# Matched case-insensitively. The curly-vs-straight apostrophe in "You've" is
+# deliberately outside the match.
+# NOTE: credit exhaustion ("out of usage credits" / "credit balance is too low")
+# is deliberately NOT here — it does not self-heal, so it should park for Steve
+# rather than retry until MAX_INFRA.
+INFRA_STDOUT_MARKERS = (
+    "hit your session limit",
+    "hit your usage limit",
+)
+
+# Separates the toolchain half of a failure string from the appended agent stdout.
+# _is_infra_failure scans the GENERAL markers only against the half before it.
+STDOUT_DELIM = " || stdout: "
 
 # === The run table — the security + invocation envelope ===
 # A hardcoded dict: the analogue of the daemon's DISPATCH_AGENTS enum. A stage
@@ -133,7 +165,17 @@ INFRA_FAILURE_MARKERS = (
 #        "billed" -> shell the billing-capable image tool; ONLY reachable via
 #                    --spend-ok / /pipeline NN spend-ok, NEVER via --advance.
 RUN_TABLE: dict[str, dict] = {
-    "1_script":      {"kind": "agent",  "agent": "scriptwriter",             "timeout": 1200},
+    # 1_script at 2400s: measured flagship drafts run 12-14 min (V12 730s, V13 840s)
+    # and scripts keep growing (V12 54KB → V13 79KB), so the old 1200s left only ~30%
+    # headroom and V14 blew through it twice. A script stage that times out costs a
+    # full re-draft, so buy real margin.
+    # COUPLING: run_script_fixer reads this same value and runs inside STAGE 2's
+    # review loop, so the bump also doubles the fixer budget — stage 2's worst case
+    # goes ~65 min → ~105 min (60 + 480 + 2×(2400+480)). Nothing kills a long stage
+    # (run_job.sh has no watchdog) and launchd coalesces StartInterval ticks, so the
+    # hourly sweep will not overlap itself; but --status takes the same BLOCKING
+    # per-video flock, so `/pipeline 14 status` can hang while a stage runs.
+    "1_script":      {"kind": "agent",  "agent": "scriptwriter",             "timeout": 2400},
     "2_review":      {"kind": "agent",  "agent": "script-reviewer",          "timeout": 480},
     "5_images":      {"kind": "billed", "agent": None,                       "timeout": 3600},
     "6_assemble":    {"kind": "script", "agent": None,                       "timeout": 1800},
@@ -647,6 +689,44 @@ def _agent_uses_mcp(agent: str) -> bool:
     return "mcp__" in tools or tools == "*" or "all tools" in tools.lower()
 
 
+def _agent_failure_detail(proc) -> str:
+    """Failure string for a non-zero `claude --print` dispatch: classification-safe
+    AND readable. EVERY agent-dispatch site must route through this.
+
+    Why it exists: the CLI prints a usage/session-limit notice to STDOUT and exits 1,
+    leaving stderr EMPTY. Sites that built their error from stderr alone produced the
+    bare string "exited 1: ", which matched no INFRA marker, so quota exhaustion was
+    billed as a genuine task failure — 3 strikes park the video. That parked V8/V9's
+    11_analyze (their last strike lines up with the 07:24 EDT canary limit) and made
+    every fixer dispatch in a review loop carry the same defect. NOTE: V12/V13 also
+    parked, but their strikes are not all attributable to quota — V13's first strike
+    was a real analyze-reviewer REVISE.
+
+    Two properties the naive stderr+stdout concat did not have:
+      - Classify on the FULL streams, truncate only for display. The old version
+        truncated first, so a marker outside the last 500 chars went invisible.
+      - Keep raw agent prose out of the GENERAL marker scan (see _is_infra_failure):
+        stdout goes after STDOUT_DELIM, and a quota hit is reported as the explicit
+        QUOTA_SENTINEL, prefixed AFTER bounding so truncation cannot eat it.
+
+    Ordering matters and is load-bearing: bound each stream to its tail FIRST, then
+    prefix the sentinel. Prefixing first and slicing `[-500:]` afterwards chops from
+    the FRONT and destroys the sentinel (a long stderr carrying the notice then
+    parked the video — the very regression this helper exists to prevent). Bounding
+    first also keeps the general-marker scan on a tail rather than an unbounded
+    stderr, so a marker buried deep in a long stderr cannot forge an infra verdict.
+    """
+    err = (getattr(proc, "stderr", "") or "").strip()
+    out = (getattr(proc, "stdout", "") or "").strip()
+    quota = any(m in out.lower() or m in err.lower() for m in INFRA_STDOUT_MARKERS)
+    head = err[-500:]
+    if quota:
+        head = f"[{QUOTA_SENTINEL}] {head}".strip()
+    if not out:
+        return head
+    return f"{head}{STDOUT_DELIM}{out[-500:]}"
+
+
 def _build_agent_cmd(agent: str, prompt: str) -> list[str]:
     """Single source of truth for every `claude --print --agent` dispatch cmd.
     Adds --strict-mcp-config (loads ZERO MCP servers, since we pass no --mcp-config)
@@ -714,7 +794,7 @@ def _dispatch_stage_agent(key: str, video: int) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, f"agent '{agent}' timed out after {cfg['timeout']}s"
     if proc.returncode != 0:
-        return False, f"agent '{agent}' exited {proc.returncode}: {(proc.stderr or '')[-500:]}"
+        return False, f"agent '{agent}' exited {proc.returncode}: {_agent_failure_detail(proc)}"
     return True, (proc.stdout or "").strip()[-500:]
 
 
@@ -1072,7 +1152,7 @@ def run_image_review(mode: str, video: int,
         return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
     if proc.returncode != 0:
         return "UNAVAILABLE", verdict_rel, \
-            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+            f"exited {proc.returncode}: {_agent_failure_detail(proc)}"
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
@@ -1111,7 +1191,7 @@ def run_prompt_fixer(video: int, verdict_rel: str,
     except OSError as e:
         return False, f"prompt-fixer could not run (command not found): {e}"
     if proc.returncode != 0:
-        return False, f"prompt-fixer exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+        return False, f"prompt-fixer exited {proc.returncode}: {_agent_failure_detail(proc)}"
     return True, (proc.stdout or "").strip()[-200:]
 
 
@@ -1179,7 +1259,7 @@ def run_script_review(video: int) -> tuple[str, str, str]:
         return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
     if proc.returncode != 0:
         return "UNAVAILABLE", verdict_rel, \
-            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+            f"exited {proc.returncode}: {_agent_failure_detail(proc)}"
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
@@ -1217,7 +1297,7 @@ def run_script_fixer(video: int, verdict_rel: str) -> tuple[bool, str]:
     except OSError as e:
         return False, f"script-fixer could not run (command not found): {e}"
     if proc.returncode != 0:
-        return False, f"script-fixer exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+        return False, f"script-fixer exited {proc.returncode}: {_agent_failure_detail(proc)}"
     return True, (proc.stdout or "").strip()[-200:]
 
 
@@ -1348,7 +1428,7 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
         return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
     if proc.returncode != 0:
         return "UNAVAILABLE", verdict_rel, \
-            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+            f"exited {proc.returncode}: {_agent_failure_detail(proc)}"
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
@@ -1782,7 +1862,7 @@ def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
         return "UNAVAILABLE", verdict_rel, f"could not run reviewer (command not found): {e}"
     if proc.returncode != 0:
         return "UNAVAILABLE", verdict_rel, \
-            f"exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+            f"exited {proc.returncode}: {_agent_failure_detail(proc)}"
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
@@ -1815,7 +1895,7 @@ def run_stage_fixer(key: str, video: int, verdict_rel: str) -> tuple[bool, str]:
     except OSError as e:
         return False, f"{fixer} could not run (command not found): {e}"
     if proc.returncode != 0:
-        return False, f"{fixer} exited {proc.returncode}: {(proc.stderr or '')[-300:]}"
+        return False, f"{fixer} exited {proc.returncode}: {_agent_failure_detail(proc)}"
     return True, (proc.stdout or "").strip()[-200:]
 
 
@@ -1976,7 +2056,14 @@ def _is_infra_failure(err: str) -> bool:
     must NOT consume a retry or park the video — they're transient host problems
     (e.g. the broken ~/.claude/session-env that took down book-update tonight)."""
     low = (err or "").lower()
-    return any(marker in low for marker in INFRA_FAILURE_MARKERS)
+    # Scan the GENERAL markers only against the toolchain half. _agent_failure_detail
+    # appends the agent's own stdout after STDOUT_DELIM for observability, and agent
+    # prose legitimately contains marker strings ("bash: jq: command not found") that
+    # would otherwise make a genuine task failure retry until MAX_INFRA and then park
+    # under the wrong label. Quota notices survive this split because they arrive as
+    # the explicit QUOTA_SENTINEL, which _agent_failure_detail puts up front.
+    head = low.split(STDOUT_DELIM.lower(), 1)[0]
+    return any(marker in head for marker in INFRA_FAILURE_MARKERS)
 
 
 def _on_failure(s: dict, err: str) -> None:
