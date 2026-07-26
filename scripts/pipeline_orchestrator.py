@@ -52,9 +52,11 @@ under any python3 regardless of the daemon's venv.
 from __future__ import annotations
 
 import argparse
+import atexit
 import fcntl
 import json
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -72,6 +74,22 @@ STATE_DIR = WORKSPACE_DIR / VAULT_REL / "Production_Kits"
 NOTIFY_SH = ROOT / "scripts" / "notify.sh"
 # Host-local lock dir (flock is per-host; keep it OUT of the synced vault).
 LOCK_DIR = Path(os.path.expanduser("~/iris_studio/pipeline_locks"))
+# Host-local per-stage agent logs (same reasoning as LOCK_DIR: keep run noise OUT
+# of the synced vault). One .out.log + .err.log per video+stage, overwritten each
+# attempt — the live view while a stage runs, and the post-mortem when it dies.
+AGENT_LOG_DIR = Path(os.path.expanduser("~/iris_studio/logs/stages"))
+
+# Process groups of agents this orchestrator spawned, so a terminated orchestrator
+# takes them with it (see _reap_live_agents / install_agent_reaper).
+#
+# start_new_session=True gives each agent its OWN session, which is what lets the
+# timeout handler killpg the CLI *and* its grandchildren. But it also removes them
+# from launchd's job process group, so launchd's own cleanup no longer reaches
+# them. Without the reaper below, a `launchctl kickstart -k` or a shutdown mid-stage
+# leaves a fully detached agent writing to the vault under
+# --dangerously-skip-permissions, while the next sweep sees the dead orchestrator
+# pid, resets the stage and dispatches a SECOND agent onto the same script file.
+_LIVE_AGENT_PGIDS: set[int] = set()
 
 # Interpreter for repo shell-outs. The orchestrator itself is stdlib-only and
 # runs under any python3, but the scripts it shells need the repo venv:
@@ -689,6 +707,179 @@ def _agent_uses_mcp(agent: str) -> bool:
     return "mcp__" in tools or tools == "*" or "all tools" in tools.lower()
 
 
+def _reap_live_agents(*_args) -> None:
+    """SIGKILL every agent process group this orchestrator still owns."""
+    for pgid in list(_LIVE_AGENT_PGIDS):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass  # already gone, or not ours to signal
+    _LIVE_AGENT_PGIDS.clear()
+
+
+def install_agent_reaper() -> None:
+    """Make a dying orchestrator take its detached agents with it.
+
+    Called from main() ONLY — never at import. Installing process-wide signal
+    handlers as an import side-effect would hijack them from any process that
+    merely imports this module (the daemon, the test suites).
+
+    Covers the launchd path specifically: the sweep plist has no
+    AbandonProcessGroup, so before start_new_session launchd's own pgroup cleanup
+    reached the agent on `kickstart -k`/bootout/shutdown. Now it does not, and this
+    restores the guarantee.
+    """
+    atexit.register(_reap_live_agents)
+    def _handler(s, _f):
+        # Do NOT sys.exit() here. SystemExit unwinds through Python, and
+        # cmd_advance_all's per-video `except SystemExit` (written to catch die())
+        # CATCHES it — so a SIGTERMed sweep swallows its own termination, carries on
+        # to the NEXT video, dispatches a fresh agent, and is then SIGKILLed by
+        # launchd ~20s later. SIGKILL bypasses this reaper, so that new agent
+        # survives fully detached: the exact hole this reaper exists to close. It
+        # also emitted a false "state file unusable/corrupt — needs you" alert and
+        # exited 0 on a terminated run. Instead: reap, restore the default
+        # disposition, re-signal ourselves — no Python `except` can intercept that,
+        # and the kernel sets the correct wait status (143).
+        _reap_live_agents()
+        # run_job.sh runs us as `"$@" >> "$LOG" 2>&1`, so Python block-buffers and
+        # the re-signal path below never flushes — every progress line, including
+        # the "↳ agent log:" paths, is lost exactly when someone is debugging why
+        # the job died. Flush before we go.
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.flush()
+            except Exception:
+                pass
+        signal.signal(s, signal.SIG_DFL)
+        os.kill(os.getpid(), s)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass  # not on the main thread, or the platform disallows it
+
+
+def _agent_log_label(cmd: list[str], role: str = "") -> str:
+    """Log basename for a dispatch, e.g. "Video_14_scriptwriter.produce".
+
+    Mostly derived from the cmd itself so call sites stay cheap; every stage prompt
+    names its video as "Video_NN", falling back to the bare agent name if it does
+    not.
+
+    `role` is NOT optional in practice — the same agent runs more than once per
+    video (scriptwriter drafts at stage 1 AND fixes in the stage-2 loop;
+    image-reviewer runs Pass A pre-spend AND Pass B pre-assemble; every
+    STAGE_REVIEW stage runs its agent as producer then fixer). Without a role the
+    later run silently overwrites the earlier log — destroying the pre-spend
+    money-gate evidence and the stage-1 draft log, i.e. exactly the post-mortem
+    this logging exists to keep.
+    """
+    agent = cmd[cmd.index("--agent") + 1] if "--agent" in cmd else "agent"
+    m = re.search(r"Video_(\d+)", cmd[-1] if cmd else "")
+    label = f"Video_{m.group(1)}_{agent}" if m else agent
+    if role:
+        label = f"{label}.{role}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", label)  # never let a prompt shape a path
+
+
+def _run_agent(cmd: list[str], timeout: int, label: str) -> subprocess.CompletedProcess:
+    """Run a `claude --print` dispatch with both streams STREAMED TO DISK.
+
+    Why: subprocess.run(capture_output=True) buffers both streams in memory, so a
+    timeout, a kill, or a crash loses every byte the agent produced. The operator
+    gets "timed out after Ns" and nothing else. That is precisely why V14's script
+    stage burned three dispatches (1200s, 1200s, 2400s) before anyone noticed the
+    prompt never told the agent what the video was about — the evidence was being
+    thrown away on each failure. With a per-stage log the run is observable WHILE
+    it runs (`tail -f`) and leaves a post-mortem when it dies.
+
+    stdout and stderr are kept in SEPARATE files, deliberately. Merging them
+    (2>&1) would put the CLI's quota notice into the same stream as ordinary agent
+    prose and break _agent_failure_detail's trust boundary: general infra markers
+    are scanned only against stderr, quota markers only against stdout.
+
+    Drop-in for subprocess.run: returns a CompletedProcess and raises
+    TimeoutExpired identically — after the partial logs are already on disk.
+    """
+    try:
+        AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        out_p = AGENT_LOG_DIR / f"{label}.out.log"
+        err_p = AGENT_LOG_DIR / f"{label}.err.log"
+        # Truncate for a fresh per-attempt log, then reopen in APPEND mode. Belt and
+        # braces with the reaper: if any stale fd from a previous run survives (a
+        # detached agent after an orchestrator kill), O_APPEND sends its writes to
+        # the END of the file instead of to its old offset — so the worst case is
+        # visible junk appended, never the NUL-padded hole that silently carried a
+        # previous run's quota notice into this attempt's classification.
+        out_p.write_text("")
+        err_p.write_text("")
+        handles = (open(out_p, "a"), open(err_p, "a"))
+    except OSError as e:
+        # Logging must NEVER be able to fail a stage. Read-only home, full disk, or
+        # a stray file at AGENT_LOG_DIR would otherwise raise straight through
+        # _dispatch_stage_agent (which catches only TimeoutExpired) and leave the
+        # video status:running with a stale pid. Degrade to in-memory capture —
+        # we lose the post-mortem, not the dispatch.
+        print(f"⚠️ agent log unavailable ({e}) — falling back to in-memory capture")
+        return subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
+                              text=True, timeout=timeout)
+    o, e_fh = handles
+    # Surface the log path: the entire justification for streaming to disk is that a
+    # timeout/failure leaves evidence, and evidence nobody can find is not evidence.
+    print(f"   ↳ agent log: {out_p}")
+    try:
+        # start_new_session: the CLI spawns its own children (Bash tool, ripgrep,
+        # MCP servers) which INHERIT these log fds. Killing only the direct child
+        # leaves them alive, still holding the fd — and because the next attempt
+        # reuses this label, open(...,"w") truncates while the orphan's fd offset
+        # is unchanged, so it writes past the hole. The next attempt's log then
+        # contains NUL padding plus the PREVIOUS run's output, which
+        # _agent_failure_detail scans for quota markers — a stale notice would
+        # forge an infra verdict on a genuine failure, the exact inverse of the
+        # bug fa795b1 fixed. Own the whole process group so the kill is complete.
+        proc = subprocess.Popen(cmd, cwd=str(WORKSPACE_DIR), stdout=o, stderr=e_fh,
+                                text=True, start_new_session=True)
+        pgid = None
+        try:
+            pgid = os.getpgid(proc.pid)
+            _LIVE_AGENT_PGIDS.add(pgid)
+        except OSError:
+            pass  # exited already; the wait() below reaps it
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(pgid if pgid is not None else os.getpgid(proc.pid),
+                          signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()  # group already gone, or we cannot signal it
+            proc.wait()
+            raise
+        finally:
+            # Kill the group on EVERY path, not just timeout. Once proc.wait()
+            # returns, the CLI is done — any process still alive in its session is a
+            # leaked grandchild holding the inherited log fd, and it will keep
+            # writing into the NEXT attempt's log. Append mode stops that becoming a
+            # NUL-padded hole, but the stale bytes still ARRIVE, and a stale quota
+            # notice in them is scanned by _agent_failure_detail: a genuine failure
+            # gets forged into an infra retry. Reaching the normal path with a live
+            # grandchild is itself the bug, so the kill is unconditional.
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass  # group already gone — the normal case
+            _LIVE_AGENT_PGIDS.discard(pgid)
+    finally:
+        o.close()
+        e_fh.close()
+    read = lambda p: p.read_text(errors="replace") if p.exists() else ""  # noqa: E731
+    return subprocess.CompletedProcess(cmd, proc.returncode,
+                                       stdout=read(out_p), stderr=read(err_p))
+
+
 def _agent_failure_detail(proc) -> str:
     """Failure string for a non-zero `claude --print` dispatch: classification-safe
     AND readable. EVERY agent-dispatch site must route through this.
@@ -789,8 +980,7 @@ def _dispatch_stage_agent(key: str, video: int) -> tuple[bool, str]:
     prompt = _stage_prompt(key, video)
     cmd = _build_agent_cmd(agent, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=cfg["timeout"])
+        proc = _run_agent(cmd, cfg["timeout"], _agent_log_label(cmd, "produce"))
     except subprocess.TimeoutExpired:
         return False, f"agent '{agent}' timed out after {cfg['timeout']}s"
     if proc.returncode != 0:
@@ -798,11 +988,44 @@ def _dispatch_stage_agent(key: str, video: int) -> tuple[bool, str]:
     return True, (proc.stdout or "").strip()[-500:]
 
 
+def _stage_title(video: int) -> str:
+    """The video's REAL locked title, or "" if unset/placeholder/unreadable.
+
+    cmd_init defaults title to the placeholder f"Video {nn}" when --title is
+    omitted, and that placeholder must NOT be treated as a topic: injecting it
+    would instruct the agent to write a flagship script about the literal string
+    "Video 15" and forbid it from re-deriving — strictly worse than letting it go
+    find the brief. Any video initialised without --title takes that path, so this
+    guard is on the normal case, not an edge case.
+
+    Read defensively: a prompt is not worth crashing a stage over.
+    """
+    try:
+        data = json.loads((STATE_DIR / f"Video_{nn(video)}_pipeline.json").read_text())
+        title = (data.get("title") or "").strip()
+    except Exception:
+        return ""
+    if title == f"Video {nn(video)}":
+        return ""
+    return re.sub(r"\s+", " ", title.replace("\x00", ""))[:200].strip()
+
+
 def _stage_prompt(key: str, video: int) -> str:
     v = f"Video_{nn(video)}"
+    # The TOPIC is the one input the script stage cannot work without, and it lives
+    # in the state file — so state it explicitly instead of making the agent infer it.
+    # V14 burned three dispatches (1200s, 1200s, 2400s) writing ZERO bytes because the
+    # prompt named only "Video_14": the agent went looking for the topic, found a
+    # readiness brief that deliberately left it UNDECIDED (trigger-gated between three
+    # candidates), and never converged. V13 only worked by luck — a restart brief with
+    # a decided topic happened to be sitting in the brand root. Do not rely on luck.
+    title = _stage_title(video)
+    topic = f' The locked topic/title is: "{title}". Write the script for THAT topic — ' \
+            f'do not re-derive or re-pick it.' if title else ""
     prompts = {
-        "1_script": f"Draft the production script for {v} (3SK Finance). Follow the locked "
-                    f"Brand Bible voice + scene-prompt structure. Write to BRANDS/3SK_Finance/Scripts/.",
+        "1_script": f"Draft the production script for {v} (3SK Finance).{topic} Follow the "
+                    f"locked Brand Bible voice + scene-prompt structure. Write to "
+                    f"BRANDS/3SK_Finance/Scripts/{v}_Script.md.",
         "2_review": f"Review the drafted script for {v} (BRANDS/3SK_Finance/Scripts/{v}_Script.md). "
                     f"7-dimension read-only critique → BRANDS/3SK_Finance/Scripts/_REVIEW_PREP/.",
         "7_packaging": f"Build the packaging for {v}: 8-10 titles, 2 cold-open hooks, 3 thumbnail "
@@ -1142,8 +1365,7 @@ def run_image_review(mode: str, video: int,
     )
     cmd = _build_agent_cmd(IMAGE_REVIEWER_AGENT, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=IMAGE_REVIEW_TIMEOUT)
+        proc = _run_agent(cmd, IMAGE_REVIEW_TIMEOUT, _agent_log_label(cmd, f"{mode}"))
     except subprocess.TimeoutExpired:
         return "UNAVAILABLE", verdict_rel, f"timed out after {IMAGE_REVIEW_TIMEOUT}s"
     except OSError as e:
@@ -1184,8 +1406,7 @@ def run_prompt_fixer(video: int, verdict_rel: str,
     )
     cmd = _build_agent_cmd(PROMPT_FIXER_AGENT, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=IMAGE_REVIEW_TIMEOUT)
+        proc = _run_agent(cmd, IMAGE_REVIEW_TIMEOUT, _agent_log_label(cmd, "fix"))
     except subprocess.TimeoutExpired:
         return False, f"prompt-fixer timed out after {IMAGE_REVIEW_TIMEOUT}s"
     except OSError as e:
@@ -1251,8 +1472,7 @@ def run_script_review(video: int) -> tuple[str, str, str]:
     )
     cmd = _build_agent_cmd(SCRIPT_REVIEWER_AGENT, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=timeout)
+        proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "review"))
     except subprocess.TimeoutExpired:
         return "UNAVAILABLE", verdict_rel, f"timed out after {timeout}s"
     except OSError as e:
@@ -1290,8 +1510,7 @@ def run_script_fixer(video: int, verdict_rel: str) -> tuple[bool, str]:
     )
     cmd = _build_agent_cmd(SCRIPT_FIXER_AGENT, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=timeout)
+        proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "fix"))
     except subprocess.TimeoutExpired:
         return False, f"script-fixer timed out after {timeout}s"
     except OSError as e:
@@ -1420,8 +1639,7 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
     )
     cmd = _build_agent_cmd(VO_REVIEWER_AGENT, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=VO_REVIEW_TIMEOUT)
+        proc = _run_agent(cmd, VO_REVIEW_TIMEOUT, _agent_log_label(cmd, "review"))
     except subprocess.TimeoutExpired:
         return "UNAVAILABLE", verdict_rel, f"timed out after {VO_REVIEW_TIMEOUT}s"
     except OSError as e:
@@ -1854,8 +2072,7 @@ def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
     prompt = cfg["review_prompt"].format(v=v, verdict_rel=verdict_rel)
     cmd = _build_agent_cmd(reviewer, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=timeout)
+        proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "review"))
     except subprocess.TimeoutExpired:
         return "UNAVAILABLE", verdict_rel, f"timed out after {timeout}s"
     except OSError as e:
@@ -1888,8 +2105,7 @@ def run_stage_fixer(key: str, video: int, verdict_rel: str) -> tuple[bool, str]:
     prompt = cfg["fix_prompt"].format(v=v, verdict_rel=verdict_rel)
     cmd = _build_agent_cmd(fixer, prompt)
     try:
-        proc = subprocess.run(cmd, cwd=str(WORKSPACE_DIR), capture_output=True,
-                              text=True, timeout=timeout)
+        proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "fix"))
     except subprocess.TimeoutExpired:
         return False, f"{fixer} timed out after {timeout}s"
     except OSError as e:
@@ -2953,6 +3169,7 @@ def cmd_supervise() -> int:
 # === Main ==================================================================
 
 def main() -> int:
+    install_agent_reaper()  # a dying orchestrator must take its detached agents with it
     p = argparse.ArgumentParser(description="Pipeline orchestrator (deterministic video sequencer).")
     p.add_argument("--video", type=int, default=None,
                    help="Video number, e.g. 1 (required for per-video commands; omit for fleet commands).")

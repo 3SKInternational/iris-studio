@@ -84,6 +84,21 @@ _iris_startup_died() {
     grep -qiE 'An unknown error occurred.*low max file descriptors'
 }
 
+# Signature of the CLI hitting a usage/session LIMIT: it prints e.g.
+#   "You've hit your session limit · resets 7:30am (America/New_York)"
+# on STDOUT and exits non-zero. Same class as the startup abort above — the routine
+# never did its work, but the condition names its own reset time and self-heals, and
+# the 30-min retry sweep already re-fires it. Routing it to fail() raised a red
+# "FAILED" ping for something needing no action: the phantom-alert class (a quota
+# hit is what parked V8/V9's analyze stages on the pipeline side, 2026-07-26).
+# Deliberately NOT matched: "out of usage credits" / "credit balance is too low" —
+# those do NOT self-heal and SHOULD raise a real alert.
+# Keep in sync with INFRA_STDOUT_MARKERS in scripts/pipeline_orchestrator.py, which
+# draws the identical distinction for pipeline-stage dispatches.
+_iris_quota_limited() {
+    grep -qiE "hit your (session|usage) limit"
+}
+
 # A routine ran (exit 0) but an OS access/permission grant blocked its real work.
 # Treat it like the auth/credit case: enqueue for the 30-min retry sweep instead
 # of clearing the marker (the bug this fixes: ROUTINE_INCOMPLETE used to call
@@ -120,6 +135,22 @@ startup_retry() {
     local detail="$1"
     rq_record_failure "$JOB" "claude" "Claude CLI startup abort (low max file descriptors / Unexpected) — transient, auto-retrying" -- "${ORIG_ARGV[@]}"
     echo "run_claude_job: '${JOB}' STARTUP-ABORT (fd/Unexpected) at $(date '+%Y-%m-%d %H:%M %Z') — silent, enqueued for retry: ${detail}" >> "$LOG"
+    exit 1
+}
+
+# A usage/session limit (see _iris_quota_limited): the routine never ran, but the
+# limit resets on its own clock, so the 30-min sweep will re-fire it and it will
+# complete. NO red alert on this fire — exactly like startup_retry. Note this is
+# quieter, not silent: retry_queue.sh still fires its throttled ⚠️ "STILL failing"
+# ping at attempt 2 (~30 min) and every 6th after, so a 04:10 job waiting on a
+# 07:30 reset will still ping 2-3 times — just without the 🔴 FAILED on top. One
+# honest "✅ RECOVERED" ping when it clears.
+# Exits 1 so launchd still records this fire as failed, which is accurate.
+# $1 = short detail string for the log.
+quota_retry() {
+    local detail="$1"
+    rq_record_failure "$JOB" "claude" "Claude usage/session limit — transient, auto-retrying after reset" -- "${ORIG_ARGV[@]}"
+    echo "run_claude_job: '${JOB}' QUOTA-LIMITED at $(date '+%Y-%m-%d %H:%M %Z') — silent, enqueued for retry: ${detail}" >> "$LOG"
     exit 1
 }
 
@@ -193,6 +224,12 @@ if [ "$rc" -ne 0 ]; then
             # its terminal output, so this still catches every true case.
             if printf '%s\n' "$NZ_LAST" | _iris_startup_died; then
                 startup_retry "exit $rc — CLI startup abort (low max file descriptors / Unexpected); routine never ran"
+            fi
+            # Quota/session limit: same silent-retry treatment, same last-line
+            # scoping so a routine that merely QUOTES the phrase mid-run and then
+            # dies of something else still reports a real failure.
+            if printf '%s\n' "$NZ_LAST" | _iris_quota_limited; then
+                quota_retry "exit $rc — CLI usage/session limit; routine never ran"
             fi
             ;;
     esac
