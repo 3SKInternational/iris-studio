@@ -99,11 +99,22 @@ def _video_from_name(name):
 
 
 def _frontmatter(text):
-    """Return the raw frontmatter block (between the first two '---') or ''."""
+    """Return (raw frontmatter block, body start offset).
+
+    A leading '---' that is a horizontal RULE rather than a frontmatter fence
+    would otherwise swallow real content: the block must contain at least one
+    column-0 `key:` line to count. Returns ('', 0) when there is no
+    frontmatter, so the caller scans the whole file."""
     if not text.startswith("---"):
-        return ""
+        return "", 0
     end = text.find("\n---", 3)
-    return text[3:end] if end != -1 else ""
+    if end == -1:
+        return "", 0
+    fm = text[3:end]
+    if not re.search(r'^[A-Za-z_][\w-]*\s*:', fm, re.MULTILINE):
+        return "", 0           # '---' hr, not a fence
+    nl = text.find("\n", end + 1)          # past the closing '---' line
+    return fm, (nl + 1 if nl != -1 else len(text))
 
 
 def classify_verdict(remainder):
@@ -147,7 +158,7 @@ def classify_path(path):
             text = fh.read()
     except (OSError, UnicodeDecodeError):
         return None
-    fm = _frontmatter(text)
+    fm, body_start = _frontmatter(text)
     resolved = bool(re.search(r'^\s*resolution\s*:', fm, re.MULTILINE))
     mv = re.search(r'^\s*video\s*:\s*(.+)$', fm, re.MULTILINE)
     fm_video = mv.group(1).strip().strip('"').strip("'") if mv else None
@@ -157,22 +168,49 @@ def classify_path(path):
     idx = _series_index(name)
     if resolved:
         return (video, idx, "closed", 0, "")
-    open_hit = None
-    saw_verdict = False
-    for i, line in enumerate(text.splitlines(), 1):
+    # Collect EVERY verdict signal in the file, then: any clean one concludes it.
+    #
+    # Signals are (1) the column-0 frontmatter `verdict:` key and (2) each body
+    # `VERDICT:` line. Two false-positive classes this closes (both live
+    # 2026-07-26, both flagged a SHIP'd file as an open gate):
+    #  (a) frontmatter history — `prior_round_verdicts:` lists superseded rounds
+    #      as INDENTED `verdict: REVISE` entries. Column-0 anchoring skips those
+    #      while still reading a real fm verdict (V13: flagged at its round-1
+    #      entry though its body verdict was SHIP).
+    #  (b) retained-history sections — "# Prior pass retained — PASS 3, VERDICT:
+    #      REVISE" appended BELOW the current verdict, whose own text says
+    #      "-> RESOLVED pass 4" (V09 image review).
+    #
+    # WHY any-clean-wins rather than first-verdict-wins: the gates use TWO live
+    # orderings and position does NOT encode recency. Newest-at-top: the image
+    # gates. Newest-at-BOTTOM (current verdict appended last): the VO-review,
+    # lead-magnet, packaging, and description-search-rewrite gates — e.g.
+    # `Video_09_VO_Review.md` opens REVISE (pass 1) and closes SHIP (pass 2).
+    # A positional rule reads the stale verdict in whichever convention it
+    # guesses wrong, so it cannot be the discriminator.
+    #
+    # ponytail: this makes within-file behavior identical to the series contract
+    # run_check already documents ("any SHIP concludes the series"), instead of
+    # a second, conflicting rule. Same accepted ceiling, now in one place: a
+    # genuine LATER re-bake REVISE after an earlier SHIP in the same file is not
+    # flagged. On an already-shipped video that is future-re-bake work, not a
+    # publish-blocking gate — and this linter exists to stop closed verdicts
+    # being resurrected as open gates, so it errs toward silence, not phantoms.
+    # Fixtures 11d/11e pin both orderings; 11f pins this ceiling deliberately.
+    signals = []
+    mfv = re.search(r'^verdict\s*:\s*(.+)$', fm, re.MULTILINE)   # column-0 ONLY
+    if mfv:
+        signals.append((0, "", classify_verdict(mfv.group(1))))
+    for i, line in enumerate(text[body_start:].splitlines(),
+                             text.count("\n", 0, body_start) + 1):
         m = _VERDICT_RE.match(line)
-        if not m:
-            continue
-        state = classify_verdict(m.group(1))
-        if state == "open":
-            open_hit = (i, line.strip()[:120])
-            break
-        if state == "clean":
-            saw_verdict = True
-    if open_hit:
-        return (video, idx, "open", open_hit[0], open_hit[1])
-    if saw_verdict:
+        if m:
+            signals.append((i, line.strip()[:120], classify_verdict(m.group(1))))
+    if any(s == "clean" for _, _, s in signals):
         return (video, idx, "clean", 0, "")
+    for i, snippet, s in signals:
+        if s == "open":
+            return (video, idx, "open", i, snippet)
     return (video, idx, "none", 0, "")
 
 
@@ -326,19 +364,37 @@ def main(argv=None):
 
 
 # --- selftest fixtures -------------------------------------------------------
+# Fixture filenames must be DETERMINISTIC. mkstemp draws its random component
+# from [a-z0-9_]; the prefixes here end in '_', so a draw starting with '_' (or
+# containing '__') matched _SKIP_NAME_RE, classify_path returned None, and the
+# fixture's file was silently skipped -> 0 flags -> a bogus FAIL on whichever
+# fixture drew badly. Measured ~2.6%/file x ~19 files = ~50% of runs failed on a
+# random innocent fixture, in BOTH this version and the prior one. A flaky
+# verification instrument reports noise, and under retry_runner.sh it would page
+# Steve every 30 min about a phantom. One temp DIR, counter-suffixed names.
+_TMP_DIR = None
+_TMP_N = 0
+
+
 def _tmp(text, suffix=".md", prefix="Video_09_"):
+    global _TMP_DIR, _TMP_N
     import tempfile
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    if _TMP_DIR is None:
+        _TMP_DIR = tempfile.mkdtemp(prefix="vrl_selftest_")
+    _TMP_N += 1
+    path = os.path.join(_TMP_DIR, "%s%03d%s" % (prefix, _TMP_N, suffix))
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
 
 
 def selftest():
     fails = []
+    ran = [0]
     receipts = ["Video_04_youtube_upload.json", "Video_11_youtube_upload.json"]  # basenames suffice
 
     def check(name, filetext, prefix, exp_flags):
+        ran[0] += 1
         p = _tmp(filetext, prefix=prefix)
         try:
             _f, _n, nf = run_check([p], receipts)
@@ -396,12 +452,65 @@ def selftest():
     check("11 no-video",
           "---\ntype: review\n---\nVERDICT: REVISE\n", "Policy_disclosure_", 0)
 
+    # --- false-positive classes observed live 2026-07-26 --------------------
+    # 11a. frontmatter `prior_round_verdicts:` history must NOT be read as this
+    #      file's verdict. Body says SHIP -> 0. (The live V13 case: flagged at
+    #      its round-1 frontmatter entry while its real verdict was SHIP.)
+    check("11a fm-prior-round-history",
+          "---\ntype: analyze-review\nstatus: ok\nvideo: Video_11\nround: 3\n"
+          "prior_round_verdicts:\n"
+          "  - round: 1\n    verdict: REVISE\n    issues: 3\n"
+          "  - round: 2\n    verdict: REVISE\n    issues: 1\n"
+          "---\n\nVERDICT: SHIP\n", "Video_11_", 0)
+
+    # 11b. retained-history section BELOW the current verdict must not flag.
+    #      (The live V09 case: PASS 6 SHIP at top, "Prior pass retained ...
+    #      VERDICT: REVISE" further down, whose own text says RESOLVED pass 4.)
+    check("11b retained-history-below-ship",
+          FM % ("Video_11", "") + "\n**VERDICT: SHIP**\n\n55/55 clean.\n\n"
+          "# Prior pass retained — RENDERS pass 3, VERDICT: REVISE\n\n"
+          "**VERDICT: REVISE** — Thumbnail_B re-failed. -> RESOLVED pass 4.\n",
+          "Video_11_", 0)
+
+    # 11c. the inverse must STILL flag: a genuinely open verdict at the top with
+    #      an older SHIP retained below it. This pins the ACCEPTED CEILING of
+    #      any-clean-wins: expected 0, i.e. deliberately NOT flagged. Identical
+    #      to run_check's documented series ceiling #14 (a later re-bake REVISE
+    #      after a SHIP is future work, not a publish gate) — the two rules now
+    #      agree instead of contradicting. Change this only with the series
+    #      contract, never on its own.
+    check("11c ceiling: open-above-retained-ship not flagged",
+          FM % ("Video_11", "") + "\n**VERDICT: REVISE** — 2 shots re-failed.\n\n"
+          "# Prior pass retained — pass 2, VERDICT: SHIP\n\n**VERDICT: SHIP**\n",
+          "Video_11_", 0)
+
+    # 11d. NEWEST-AT-BOTTOM convention (the real `Video_09_VO_Review.md` shape:
+    #      pass 1 REVISE at top, pass 2 SHIP appended at the bottom). A
+    #      positional rule reads the stale REVISE here; any-clean-wins reads the
+    #      real verdict -> 0. This is why the rule is not first-verdict-wins.
+    check("11d newest-at-bottom-convention",
+          FM % ("Video_11", "") + "\n**VERDICT: REVISE**\n\npass 1 findings...\n\n"
+          "## Pass 2 — re-review after fixes\n\n**VERDICT: SHIP** — all fixes verified.\n",
+          "Video_11_", 0)
+
+    # (11e is a GROUP fixture — see below. A lone fm-only file can never flag on
+    #  its own, so testing it single-file would be vacuous: the regression only
+    #  shows up when that file has to CONCLUDE a series containing a REVISE.)
+
+    # 11f. column-0 anchoring must not swallow a REAL open verdict: indented
+    #      prior_round history (skipped) + a genuinely open body verdict -> 1.
+    check("11f indented-history-plus-real-open",
+          "---\ntype: analyze-review\nvideo: Video_11\nround: 2\n"
+          "prior_round_verdicts:\n  - round: 1\n    verdict: SHIP\n---\n"
+          "\nVERDICT: REVISE\n", "Video_11_", 1)
+
     # --- multi-file (video, dir) grouping: the series-supersession contract ----
     # Each spec = (prefix, verdict_line). All share video Video_11 (receipted) and
     # land in the same tmp dir -> one (video, dir) series. Series order is the
     # filename index (Pass/Round N), NOT mtime.
     # spec = (prefix, fm_extra, verdict_line); fm_extra goes INTO the frontmatter.
     def check_group(name, specs, exp_flags):
+        ran[0] += 1
         paths = [_tmp(FM % ("Video_11", fm) + "\n" + vl + "\n", prefix=pre)
                  for pre, fm, vl in specs]
         try:
@@ -441,6 +550,19 @@ def selftest():
         ("Video_11_Script_Review_Round6_", "", "## VERDICT: REVISE"),
     ], 1)
 
+    # 11e. frontmatter-only verdict concluding a series (the real
+    #      `Lead_Magnets/_REVIEW/Video_09_LeadMagnet_Review.md` shape: column-0
+    #      `verdict: SHIP` in frontmatter, ZERO body VERDICT: lines). Paired
+    #      with a REVISE sibling so the fm verdict has to do real work — if the
+    #      frontmatter signal is dropped, that file classifies 'none', stops
+    #      concluding the series, and the linter manufactures a false FLAG on a
+    #      shipped video: the exact phantom class this script exists to prevent,
+    #      re-created by its own fix. Must be 0.
+    check_group("11e fm-only-verdict-concludes-series", [
+        ("Video_11_LeadMagnet_Review_a_", "verdict: SHIP\n", ""),
+        ("Video_11_LeadMagnet_Review_b_", "", "VERDICT: REVISE"),
+    ], 0)
+
     # 16. all-REVISE series but ONE file carries a resolution stamp -> 0
     #     (a stamp anywhere concludes the gate).
     check_group("16 stamp-concludes", [
@@ -454,7 +576,9 @@ def selftest():
         for f in fails:
             print("  - " + f)
         return 1
-    print("verdict_resolution_lint selftest: OK (16/16)")
+    # Counted, never hardcoded — a stale literal in a verification instrument is
+    # the exact drift this script polices (it read "16/16" while running 19).
+    print("verdict_resolution_lint selftest: OK (%d/%d)" % (ran[0], ran[0]))
     return 0
 
 
