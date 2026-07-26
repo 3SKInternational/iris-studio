@@ -28,13 +28,8 @@
 	<string>/Users/steve/iris_studio/logs/claude-code-caption-sweep.stderr.log</string>
 	<key>StandardOutPath</key>
 	<string>/Users/steve/iris_studio/logs/claude-code-caption-sweep.stdout.log</string>
-	<key>StartCalendarInterval</key>
-	<dict>
-		<key>Hour</key>
-		<integer>4</integer>
-		<key>Minute</key>
-		<integer>20</integer>
-	</dict>
+	<key>StartInterval</key>
+	<integer>3600</integer>
 	<key>WorkingDirectory</key>
 	<string>/Volumes/AI_Workspace/iris_studio</string>
 </dict>
