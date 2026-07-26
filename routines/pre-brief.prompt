@@ -117,6 +117,10 @@ Perform these health checks and write findings into INBOX.md as a single "🌅 P
 
     Origin: 2026-07-25 — the hourly pipeline sweep was reporting Videos 1-12 as "needs Steve" when all were published; audit found 26 stale pre-publish stages across 6 published videos plus one orphaned `running`. Reconciled by hand; this lint is the guard so it can't silently recur.
 
+19. **DAILY_BRIEFING head-guard lint — deterministic, read-only (added 2026-07-26).** Run:
+    `cd /Volumes/AI_Workspace/iris_studio && python3 scripts/briefing_headguard.py --check /Users/steve/Documents/3SK/outputs/DAILY_BRIEFING.md`
+    Exit 0 → the file's first non-blank line is a valid `# Daily Briefing` header; note nothing (the common case). Exit 1 → stdout begins `BRIEFING_HEAD_CORRUPT`; append that line verbatim under a `**⚠️ Briefing head corrupt:**` line in today's sweep subsection and treat it as needing a look — the briefing regen leaked a model preamble ("I'll generate both outputs…") or an `<analysis>` blob above the header (2026-07-23/24/25, three instances). This is an INDEPENDENT observer of the writer-side head-guard in iris.py's `_persist_daily_briefing` (Code Pickup 2026-07-24) — it catches the class even if that guard regresses AND catches non-daemon writers (the 7/23 blob may not have come from the daemon path). The script is READ-ONLY — it never repairs the file; the fix is `strip_briefing_preamble` (the same module) or a hand-strip, and belongs to a human/session decision, not this sweep. The morning brief fires ~06:00 so a 05:00 catch still lands before Steve reads it.
+
 **Append to today's daily note (per-agent-sections convention 2026-05-27).** After your primary task, append ONE bullet to `_Iris_Memory/Daily/YYYY-MM-DD.md` (today's ISO date) under the `## 🤖 Claude Code intra-day log` section. Format: `HH:MM — [1-line action] → [outcome path or "clean" if nothing changed]`. If the daily note doesn't exist yet, create it from `01_Operating_Docs/Templates/Daily_Note_Template.md` and fill the frontmatter date/day fields. Do NOT edit Cowork's `## 📝 Cowork-Iris intra-day log` section — that's her lane.
 
 

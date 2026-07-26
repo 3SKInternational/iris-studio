@@ -167,6 +167,17 @@ except Exception as _adapt_load_exc:  # noqa: BLE001 - never block daemon boot
         f"adaptation apply core unavailable (/adapt disabled): {_adapt_load_exc}"
     )
 
+# DAILY_BRIEFING head-guard (Code Pickup 2026-07-24). Same local-importlib
+# pattern as the linter above. Loaded un-guarded on purpose: this stdlib-only
+# helper is the integrity gate that keeps a leaked model preamble out of the
+# briefing file — if it can't load, the daemon should fail loudly at boot, not
+# silently ship corrupt briefings.
+_bhg_spec = _importlib_util.spec_from_file_location(
+    "_briefing_headguard", PROJECT_DIR / "scripts" / "briefing_headguard.py"
+)
+_briefing_headguard = _importlib_util.module_from_spec(_bhg_spec)
+_bhg_spec.loader.exec_module(_briefing_headguard)
+
 # Force Agent SDK to use the claude CLI OAuth (Max sub).
 ANTHROPIC_API_KEY_FALLBACK = os.environ.pop("ANTHROPIC_API_KEY", None)
 
@@ -3545,6 +3556,29 @@ def _persist_daily_briefing(new_content: str) -> bool:
     place. Returns False (without writing) if the content is suspiciously short,
     so a degenerate generation never clobbers a good file. File IO may raise —
     callers wrap in try/except."""
+    # Head-guard (Code Pickup 2026-07-24): the generation sometimes leaks a model
+    # preamble ('I'll generate both outputs...') or an <analysis> blob ABOVE the
+    # '# Daily Briefing' header (2026-07-23/24/25, three instances). Strip anything
+    # before the header; if there is no header at all, PRESERVE the existing file
+    # rather than clobber it with headerless output, and alert Steve.
+    stripped = _briefing_headguard.strip_briefing_preamble(new_content)
+    if stripped is None:
+        logger.error(
+            "DAILY_BRIEFING regen produced no '# Daily Briefing' header; "
+            "yesterday's briefing preserved (not overwritten)."
+        )
+        _alert_steve(
+            "⚠️ DAILY_BRIEFING regen produced no valid header; yesterday's "
+            "briefing preserved. Check the daemon's briefing generation."
+        )
+        return False
+    if stripped != new_content:
+        logger.warning(
+            "DAILY_BRIEFING head-guard stripped %d bytes of leaked preamble "
+            "before the header.",
+            len(new_content) - len(stripped),
+        )
+    new_content = stripped
     # ponytail: length-only floor — catches a degenerate short generation, not a
     # well-formed-length file in the wrong format. Watch the logged char-counts
     # the first few mornings of the combined-prompt path; add a format check if
