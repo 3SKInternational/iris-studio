@@ -1067,14 +1067,59 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     # (no-autonomous-spend invariant). The fix path is the same closed loop as Pass
     # A — correct the prompts per the verdict (free) then re-run `/pipeline N
     # spend-ok`, which re-reviews + regenerates, and this gate re-checks the fresh
-    # renders. UNAVAILABLE is the single fail-OPEN exception (assembly is free):
-    # warn and assemble anyway.
+    # renders.
+    #
+    # UNAVAILABLE used to be a fail-OPEN exception here ("assembly is free — warn
+    # and assemble anyway"). That reasoning weighed the wrong cost: the risk is not
+    # the assemble step's price, it is that UNREVIEWED renders then flow onward to
+    # thumbnail, description and publish. A quota window (now an identifiable,
+    # frequent condition — see INFRA_STDOUT_MARKERS) would silently carry an
+    # unvetted off-model batch through those stages — it stops at the human
+    # 10_publish gate, so nothing reaches YouTube unreviewed, but every stage in
+    # between is done on work nobody vetted. That is the failure class the binary
+    # gates exist to stop (Steve, 2026-06-20: only a clean SHIP advances; "ship with fixes" is
+    # retired). Every other BINARY gate already fails CLOSED on UNAVAILABLE; the
+    # two that AUTO-advance (stage-2 script, stage-review) use the
+    # reviewer-unavailable INFRA marker so they retry rather than fail-open
+    # advancing unreviewed work (the V04 regression). The other two do not need
+    # the marker: cmd_spend_ok is human-invoked (returns 2) and
+    # _maybe_promote_vo_expand parks with a note. This site was the odd one out.
+    # Now it matches: the stage is left ready and retried, bounded by MAX_INFRA,
+    # and parks for Steve if the reviewer is genuinely down.
     verdict, vrel, detail = run_image_review("renders", video,
                                              canonical_manifest_rel(video))
     if verdict == "UNAVAILABLE":
-        notify(f"⚠️ Video {video}: image-reviewer could not run the pre-assemble "
-               f"renders review ({detail}) — assembling anyway (fail-open).")
-    elif verdict != "SHIP":
+        # The cause must survive TWO truncations that cut from OPPOSITE ENDS:
+        #   notify/Telegram  -> out[:160]   (advance_once, head)
+        #   state-file note  -> err[-300:]  (_on_failure, tail)
+        # So: BOUND {detail} and keep it EARLY, total <= 300. Detail-last satisfies
+        # the note and leaves the Telegram line cause-free; detail-late-and-long
+        # satisfies neither. Two earlier versions of this message got exactly one
+        # of the two ends right, which left Steve unable to tell a reviewer timeout
+        # from a quota hit from a missing agent definition — three different fixes.
+        # (_is_infra_failure scans the untruncated RETURN VALUE — strictly, its
+        # pre-STDOUT_DELIM head — never either display window. So keep the marker
+        # at index 0: moving it after {detail} could push it behind that delimiter
+        # and silently reclassify a reviewer outage as a task failure.)
+        # The stage-2 and stage-review gates were early but UNBOUNDED until
+        # 2026-07-26; their cause starts falling out of the note once the DETAIL
+        # passes ~250 chars (a real quota detail made the stage-2 message ~650).
+        # They now carry
+        # this same detail[:120] bound, so "match the siblings" is sound advice
+        # rather than a way to reinherit this bug.
+        # "assemble by hand, THEN stamp" — not just stamp. Nothing downstream
+        # verifies the master exists (GATE_ARTIFACTS covers only 4_vo_record; the
+        # packaging/thumbnail/description stages never check for the video). The only
+        # check is _producer_artifact_ok against stage_artifact_path's
+        # Footage_and_Edits/{v}_v2.mp4, and it runs on the PRODUCER path only —
+        # a hand-stamp bypasses it, advancing the pipeline with no file ever
+        # built, and the first thing to notice is the human at 10_publish.
+        # Matches _gate_note's house style: do the work, then stamp.
+        return False, (f"reviewer-unavailable: {detail[:120]} — refusing to assemble "
+                       f"unreviewed renders (parks at {MAX_INFRA} attempts; manual "
+                       f"exit = assemble by hand, then set 6_assemble status:done "
+                       f"+ completed_at)")
+    if verdict != "SHIP":
         return False, (f"image-reviewer {verdict} on the rendered images — refusing to "
                        f"assemble. Fix prompts per {vrel}, then re-run /pipeline "
                        f"{video} spend-ok to regenerate (BILLED — human-gated) ({detail}).")
@@ -1599,7 +1644,7 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
         return True, f"script-reviewer SHIP ({vrel}). {detail}"
     if verdict == "UNAVAILABLE":
         return False, (f"reviewer-unavailable: stage-2 script review could not run "
-                       f"({detail}) — left ready to retry, NOT advanced (binary gate).")
+                       f"({detail[:120]}) — left ready to retry, NOT advanced (binary gate).")
     return False, (f"script-reviewer {verdict} on the script after auto-fix — refusing to "
                    f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})")
 
@@ -1666,7 +1711,9 @@ def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None,
     revision (a parked REVISE does NOT re-dispatch or re-notify every hourly sweep —
     only a fresh kit edit, which bumps the mtime, triggers a re-review). The render
     itself stays MANUAL (Cowork) — a SHIP is the go-signal, never an auto-spend.
-    UNAVAILABLE does NOT fail open here (unlike the free script path): a money-
+    UNAVAILABLE does NOT fail open here (nor on the free script path — that
+    parenthetical was stale from the day it was written; the script gate has
+    failed closed since 25ba76a, 2026-06-22): a money-
     adjacent gate must not green-light an unreviewed kit because the reviewer was
     down — it parks for the human, and the render is manual anyway.
 
@@ -1769,8 +1816,15 @@ def _maybe_promote_vo_expand(s: dict, video: int, threshold: float | None,
 # review gate. Each stage names a dedicated specialist REVIEWER (binary SHIP /
 # REVISE) and reuses its own PRODUCER as the FIXER (edits in place; $0). The flow
 # per stage: produce → review → (fix → re-review)* → advance ONLY on a clean SHIP.
-# UNAVAILABLE fails OPEN (free content path must not wedge on review tooling being
-# down). Everything reuses the proven image/script-gate machinery: _parse_image_
+# UNAVAILABLE fails CLOSED — the stage is left ready and retried as infra (see
+# run_stage_review_gate's "left ready to retry, NOT advanced"). This comment used
+# to claim it "fails OPEN (free content path must not wedge on review tooling
+# being down)"; that was STALE and said the opposite of its own code. A review
+# that did not run is not an approval, on the free path as much as the billed one
+# — the cost of the GATED STEP was never the fail-open/fail-closed criterion
+# (cost does drive other things here: see the money-gate comments at
+# cmd_spend_ok and the vo-kit gate). Everything reuses the proven
+# image/script-gate machinery: _parse_image_
 # verdict, the IMAGE_REVIEW_MAX_FIX_ATTEMPTS budget, TimeoutExpired+OSError
 # graceful degradation. The reviewer defs live in ~/.claude/agents/.
 STAGE_REVIEW: dict[str, dict] = {
@@ -2183,7 +2237,7 @@ def run_stage_review_gate(key: str, video: int,
         return True, f"{STAGE_REVIEW[key]['reviewer']} SHIP ({vrel}). {detail}"
     if verdict == "UNAVAILABLE":
         return False, (f"reviewer-unavailable: {key} review ({STAGE_REVIEW[key]['reviewer']}) "
-                       f"could not run ({detail}) — left ready to retry, NOT advanced.")
+                       f"could not run ({detail[:120]}) — left ready to retry, NOT advanced.")
     return False, (f"{STAGE_REVIEW[key]['reviewer']} {verdict} on the {key} output after "
                    f"auto-fix — refusing to advance. Fix per {vrel}, then re-run "
                    f"/pipeline {video}. ({detail})")
@@ -2681,8 +2735,11 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     # (image-reviewer flags → scene-image-prompt-generator fixes the manifest →
     # re-review, bounded). All of this is $0 and happens BEFORE the single billed
     # spend. A HOLD-SPEND that survives the fix budget refuses the batch; --force
-    # (CLI-only) skips the gate; fail-OPEN on reviewer infra (a human authorized
-    # this spend — don't block the billed path on review tooling failing to run).
+    # (CLI-only) skips the gate. NOTE: this comment used to end "fail-OPEN on
+    # reviewer infra (a human authorized this spend...)" — STALE since 2026-06-22
+    # (25ba76a landed the behaviour change and left the comment behind).
+    # UNAVAILABLE now fails CLOSED here (see the `return 2` below): a review that
+    # did not run is not an approval. --force remains Steve's explicit override.
     if force:
         print(f"⏭️  Video {video}: --force — skipping pre-spend image-review gate.")
         # The deterministic suppressor guard is cheap ($0) and catches the exact

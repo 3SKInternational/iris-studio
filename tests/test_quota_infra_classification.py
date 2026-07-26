@@ -366,6 +366,90 @@ def test_grandchild_cannot_contaminate_the_next_attempt_on_the_normal_path():
     assert not po._is_infra_failure(po._agent_failure_detail(p2)), "forged an infra verdict"
 
 
+def _run_assemble_gate(verdict_triple):
+    """Drive the stage-6 gate with a stubbed reviewer AND a stubbed subprocess.
+
+    Stubbing subprocess.run is NOT optional. Without it these tests are green only
+    while the gate blocks — on the very regression they exist to catch they would
+    reach `build_video.py --assemble` for real, a 1800s blocking call that
+    overwrites a real master (video 99 is used precisely because it is
+    inert; video 8 would have been r-2o2VM72L0, PUBLISHED) with
+    whatever renders happen to be on disk. That is this file's own documented
+    incident class (see _stub_dispatch's docstring: a subprocess patch that stopped
+    intercepting spawned eight real dispatches and hung the run).
+
+    Returns (ok, detail, build_was_reached).
+    """
+    saved = (po.run_image_review, po.subprocess.run, po.subprocess.Popen, po.notify)
+    reached = {"build": False}
+
+    def _spy(*a, **k):
+        reached["build"] = True
+        raise AssertionError("build_video.py must never be reached from this test")
+
+    po.run_image_review = lambda *a, **k: verdict_triple
+    # Trap BOTH spawn primitives, not just the one the build happens to use today.
+    # The dispatch sites migrated run -> Popen mid-session, which is exactly how a
+    # patch stops intercepting while the suite stays green; guarding only `run`
+    # would let a future move to Popen make `assert not built` pass vacuously while
+    # launching a real 1800s assemble. Same invariant _stub_dispatch enforces.
+    po.subprocess.run = _spy
+    po.subprocess.Popen = _spy
+    po.notify = lambda *a, **k: None
+    try:
+        ok, detail = po.run_script_stage("6_assemble", 99)
+    finally:
+        (po.run_image_review, po.subprocess.run,
+         po.subprocess.Popen, po.notify) = saved
+    return ok, detail, reached["build"]
+
+
+def test_renders_gate_refuses_to_assemble_when_the_reviewer_cannot_run():
+    """BINARY gates never fail open (Steve, 2026-06-20: only a clean SHIP advances).
+
+    This gate used to assemble anyway on UNAVAILABLE, reasoning that "assembly is
+    free" — but the cost that matters is that UNREVIEWED renders then flow on to
+    thumbnail, description and publish. A quota window would carry an unvetted
+    off-model batch through every stage up to the human 10_publish gate. The one
+    fail-open warning was a non-force notify(), so the hourly --advance-all sweep
+    (SUPPRESS_NOTIFY) dropped it and the digest read as a normal advance. Nothing
+    reaches YouTube unreviewed, but every stage in between is done on unvetted work.
+    It must retry (infra), not advance.
+    """
+    # A SHORT detail alone cannot test the truncation: the message stays under 300
+    # so the tail assertion is trivially true and the UNBOUNDED mutant survives it.
+    # (A detail-last variant also happens to die on the short fixture, but only by
+    # a handful of chars and only at the current message length — luck, not
+    # coverage; the margin already flipped direction once during review.) The LONG case is what makes
+    # the assertions bite — and long is the realistic case (a real quota detail runs ~535 (empty stderr, notice plus agent prose on stdout)
+    # chars, a non-zero-exit dispatch up to ~1036).
+    long_cause = "REVIEWERBOOM " + ("noise " * 200)
+    for cause, marker in [("timed out after 900s", "timed out"),
+                          (long_cause, "REVIEWERBOOM")]:
+        ok, detail, built = _run_assemble_gate(("UNAVAILABLE", "v.md", cause))
+        assert not ok, "gate failed OPEN — assembled unreviewed renders"
+        assert not built, "build_video.py was reached — a real render would have run"
+        # The cause must survive BOTH truncations, which cut from OPPOSITE ends:
+        # Telegram takes out[:160] (head), the state note takes err[-300:] (tail).
+        # Satisfying only one leaves Steve a parked stage with no diagnosable cause.
+        assert marker in detail[:160], f"cause lost from the Telegram head: {detail!r}"
+        assert marker in detail[-300:], f"cause lost from the state note tail: {detail!r}"
+        assert len(detail) <= 300, f"message must stay inside the note window: {len(detail)}"
+    assert po._is_infra_failure(detail), f"must retry, not burn a strike: {detail!r}"
+    s = _fresh_stage()
+    po._on_failure(s, detail)
+    assert s["fail_count"] == 0 and s["status"] == "ready", s
+
+
+def test_renders_gate_still_blocks_on_a_revise_verdict():
+    """The fail-closed change must not weaken the ordinary REVISE block, and a
+    REVISE is a real content failure — it must consume a retry, not retry forever."""
+    ok, detail, built = _run_assemble_gate(("REVISE", "v.md", "shot 3 off-model"))
+    assert not ok
+    assert not built, "build_video.py was reached"
+    assert not po._is_infra_failure(detail), f"REVISE must park eventually: {detail!r}"
+
+
 def test_log_label_sanitiser_strips_path_separators():
     """The label is safe by construction today (digits from a regex + an agent name
     from module constants), so this calls the sanitiser directly rather than routing

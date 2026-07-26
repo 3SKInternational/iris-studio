@@ -1152,7 +1152,19 @@ class TestAssembleImageGate(unittest.TestCase):
         finally:
             (po.run_image_review, po.subprocess.run, po.notify) = saved
 
-    def test_unavailable_fails_open_and_builds(self):
+    def test_unavailable_fails_closed_and_does_not_build(self):
+        """SUPERSEDED 2026-07-26 (was test_unavailable_fails_open_and_builds).
+
+        The original asserted "fail-open must still assemble" and was written
+        2026-06-19 — BEFORE the binary-gate directive (c53c77e, 06-20) and before
+        Steve hardened the PROMPTS gate to fail CLOSED on UNAVAILABLE (25ba76a,
+        06-22: "A review that did not run is not an approval"). That audit left the
+        RENDERS gate fail-open, which reads as an inconsistency rather than a
+        deliberate carve-out: the justification was "assembly is free", but the real
+        cost is that unreviewed renders flow onward to thumbnail, description and
+        publish. Now fails closed and retries as INFRA (bounded by MAX_INFRA), so a
+        transient reviewer outage self-heals instead of shipping unvetted work.
+        """
         saved = (po.run_image_review, po.subprocess.run, po.notify)
         try:
             called = {"build": False}
@@ -1164,9 +1176,11 @@ class TestAssembleImageGate(unittest.TestCase):
             po.notify = lambda *a, **k: None
             po.run_image_review = lambda mode, video, manifest_rel=None: (
                 "UNAVAILABLE", "rel", "reviewer down")
-            ok, _msg = po.run_script_stage("6_assemble", 3)
-            self.assertTrue(ok, "fail-open must still assemble")
-            self.assertTrue(called["build"])
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertFalse(ok, "must NOT assemble unreviewed renders")
+            self.assertFalse(called["build"], "build_video.py must never be reached")
+            self.assertTrue(po._is_infra_failure(msg),
+                            f"a reviewer outage must retry, not burn a strike: {msg!r}")
         finally:
             (po.run_image_review, po.subprocess.run, po.notify) = saved
 
