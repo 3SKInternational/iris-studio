@@ -111,6 +111,12 @@ def load_flags(path: str | None) -> dict[str, str]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         die(f"--flags file is not valid JSON: {e}")
+    # Unwrap ONLY when "flags" is the sole key: {"Shot_01a": "...", "flags": {...}}
+    # otherwise silently discarded Shot_01a with no warning, rc 0.
+    if isinstance(data, dict) and "flags" in data and len(data) > 1 \
+            and isinstance(data["flags"], dict):
+        die('--flags has a "flags" key alongside other keys — ambiguous. Use either a '
+            'flat {shot: reason} object OR {"flags": {...}} alone.')
     if isinstance(data, dict) and "flags" in data:
         if not isinstance(data["flags"], dict):
             die(f'--flags has a "flags" key that is not an object '
@@ -206,7 +212,10 @@ def build(video: int, out: Path, flags: dict[str, str] | None = None) -> int:
             # gold border into the neighbouring label strip.
             # Cap first: the shrink loop is O(n) measurements, so a pathological
             # reason (200k chars) hung. No cell can show more than ~50 chars anyway.
-            full = flags[name][:200]
+            # Collapse whitespace FIRST: getlength() measures a newline-bearing string
+            # as one line, so the width guard never sees it and the extra lines spill
+            # past the 44px label strip onto the next row's image.
+            full = " ".join(flags[name].split())[:200]
             # Reserve the ellipsis width BEFORE measuring — appending "…" after the
             # loop swapped a 4.45px glyph for a 16px one and re-overshot the cell.
             ell_w = _text_w(d, "…", f)

@@ -285,6 +285,21 @@ def _selftest() -> int:
             pass
     chk("empty values names the RIGHT error", "is empty" in _err.getvalue(), _err.getvalue().strip())
 
+    # Two more guards that fall through to a SIBLING when removed, so "it raised"
+    # cannot tell which fired: a bad hex falls to the unknown-colour die, and a
+    # non-list `values` falls to the range check. Both stay loud and correct — but
+    # unpinned. Assert the message, same as above.
+    for bad, needle, label in (
+            ({"name": "t", "variant": "plain", "field": "#ZZZZZZ"}, "malformed hex", "hex"),
+            ({"name": "t", "variant": "bars", "values": "x"}, "must be a list", "non-list values")):
+        _e = io.StringIO()
+        with contextlib.redirect_stderr(_e):
+            try:
+                render_card(bad, {}, canvas)
+            except SystemExit:
+                pass
+        chk(f"{label} names the RIGHT error", needle in _e.getvalue(), _e.getvalue().strip())
+
     # End-to-end spec write.
     with tempfile.TemporaryDirectory() as td:
         out = run_spec({"canvas": list(canvas), "cards": [
