@@ -53,7 +53,19 @@ LEDGER_DEFAULT = Path(__file__).resolve().parent / "cost_ledger.jsonl"
 # error (measured: cents on the with-refs flagship path) — the next run sees
 # the true total. LOCKED VALUE: changing it requires a Decisions_Log why-stub
 # in the same session (CLAUDE.md rule, 2026-07-08).
-POLICY_CAP_USD = 10.0
+POLICY_CAP_USD = 9.0
+# Reprint budget, held back from the cap above (Steve, 2026-07-27). The FIRST batch
+# for a video may spend up to POLICY_CAP_USD; any later run — a regen after the
+# contact-sheet review, a fixup, a thumbnail redo — is a REPRINT and may add at most
+# REPRINT_CAP_USD, with the absolute per-video ceiling at the sum ($10).
+# WHY the split: a single $10 cap could be consumed entirely by pass 1, leaving zero
+# budget to fix the shots that review then rejects — the money ran out exactly when
+# it was needed most. V14 surfaced it: a 102-shot first batch estimated $12.65, and
+# even trimmed to fit $10 it would have left nothing for re-renders. Reserving $1
+# makes the fix pass affordable by construction rather than by luck.
+# LOCKED VALUE: changing either figure requires a Decisions_Log why-stub in the same
+# session (CLAUDE.md rule, 2026-07-08).
+REPRINT_CAP_USD = 1.0
 
 # --- Config values (deliberately swappable) ---------------------------------
 
@@ -648,7 +660,19 @@ def main() -> None:
     # is a silent cap reset, so the live path prints a notice when it happens.
     gate_state = [(k, load_video_spend(ledger_path, k), gate_adds[k])
                   for k in sorted(gate_adds)]
-    breaches = [(k, p, a) for k, p, a in gate_state if p + a > POLICY_CAP_USD]
+    # A video with prior ledger spend is on a REPRINT run: the first batch is bounded
+    # by POLICY_CAP_USD, later runs by REPRINT_CAP_USD each, and everything by the
+    # absolute ceiling. Checked per-video, so a multi-video manifest cannot launder a
+    # reprint through a fresh video's headroom.
+    breaches = []
+    for k, p, a in gate_state:
+        if p > 0.0 and a > REPRINT_CAP_USD:
+            breaches.append((k, p, a, f"reprint run adds ~${a:.2f}, over the "
+                                      f"${REPRINT_CAP_USD:.2f} reprint limit"))
+        elif p + a > POLICY_CAP_USD + (REPRINT_CAP_USD if p > 0.0 else 0.0):
+            _ceil = POLICY_CAP_USD + (REPRINT_CAP_USD if p > 0.0 else 0.0)
+            breaches.append((k, p, a, f"would reach ${p + a:.2f}, over the "
+                                      f"${_ceil:.2f} ceiling"))
     if not args.dry_run:
         if would_render > args.max_images:
             die(f"spend guard: {would_render} images would bill this run, over the "
@@ -670,10 +694,10 @@ def main() -> None:
                   f"starts at $0. If this machine has billed before, the ledger "
                   f"moved or was deleted — check before a big spend.")
         if breaches:
-            _det = "; ".join(f"{k} would reach ${p + a:.2f} (${p:.2f} already billed "
-                             f"+ ~${a:.2f} this run)" for k, p, a in breaches)
-            _line = (f"policy cap: {_det} — over the ${POLICY_CAP_USD:.2f}/video "
-                     f"policy cap.")
+            _det = "; ".join(f"{k}: {why} (${p:.2f} already billed + ~${a:.2f} this run)"
+                             for k, p, a, why in breaches)
+            _line = (f"policy cap: {_det} — caps are ${POLICY_CAP_USD:.2f}/video first "
+                     f"batch + ${REPRINT_CAP_USD:.2f} reprint.")
             if not args.over_cap_ok:
                 notify(f"🛑 {_line} BLOCKED — get Steve's explicit overage ok, then "
                        f"re-run with --over-cap-ok.")
@@ -687,17 +711,22 @@ def main() -> None:
             _wk, _wp, _wa = max(gate_state, key=lambda t: t[1] + t[2])
             print(f"spend guard: OK — {would_render} image(s) to render, "
                   f"~${pre_est:.2f} estimated (caps: {args.max_images} imgs / ${args.max_cost:.0f}; "
-                  f"{_wk} cumulative ${_wp + _wa:.2f} of ${POLICY_CAP_USD:.0f} policy).\n")
+                  f"{_wk} cumulative ${_wp + _wa:.2f} of ${POLICY_CAP_USD:.0f}"
+                  f"+${REPRINT_CAP_USD:.0f} policy).\n")
     else:
         # Dry-run: surface the policy-cap picture (the check-cost-first habit)
         # without blocking or pinging. Falls back to the manifest's video when
         # nothing would render, so the info line still appears.
         _rows = gate_state or [(_mvideo, load_video_spend(ledger_path, _mvideo), 0.0)]
         for _k, _p, _a in _rows:
+            _isreprint = _p > 0.0
+            _ceil = POLICY_CAP_USD + (REPRINT_CAP_USD if _isreprint else 0.0)
+            _bad = (_a > REPRINT_CAP_USD) if _isreprint else False
             _over = " — OVER, a live run will need Steve's ok + --over-cap-ok" \
-                if _p + _a > POLICY_CAP_USD else ""
+                if (_bad or _p + _a > _ceil) else ""
+            _kind = f"REPRINT (limit ${REPRINT_CAP_USD:.2f}/run)" if _isreprint else "first batch"
             print(f"policy cap: {_k} ${_p:.2f} billed to date; this batch ~${_a:.2f} "
-                  f"→ ${_p + _a:.2f} of ${POLICY_CAP_USD:.0f}/video{_over}")
+                  f"[{_kind}] → ${_p + _a:.2f} of ${_ceil:.0f}/video{_over}")
         print()
 
     client = None

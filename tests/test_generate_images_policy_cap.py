@@ -126,20 +126,111 @@ class TestPolicyCapGate(unittest.TestCase):
              "cost_usd": amount}) + "\n")
 
     def test_over_cap_blocks_without_override(self):
-        self._seed_prior(gi.POLICY_CAP_USD)  # any new estimate crosses
+        # Seed at the ABSOLUTE ceiling (cap + reprint). Seeding at POLICY_CAP alone no
+        # longer crosses: since 2026-07-27 a video sitting at the cap is deliberately
+        # still allowed a <=$1 reprint, so the old seed now passes by design.
+        self._seed_prior(gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD)
         p = self._run()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("policy cap", p.stderr + p.stdout)
         self.assertIn("--over-cap-ok", p.stderr + p.stdout)
 
     def test_over_cap_ok_opens_the_gate(self):
-        self._seed_prior(gi.POLICY_CAP_USD)
+        self._seed_prior(gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD)
         p = self._run("--over-cap-ok")
         # The gate opened (override line printed); the run then dies at the flux
         # NotImplementedError stub — proving we got PAST the policy gate with a
         # provider that cannot bill.
         self.assertIn("Proceeding on --over-cap-ok", p.stdout)
         self.assertNotIn("policy cap:", p.stderr)
+
+    def test_cap_values_are_the_locked_figures(self):
+        """Pin the LITERALS. Every other test references the symbols, so changing a
+        constant would slide through silently — the value itself is the locked thing
+        (Steve 2026-07-27: $9 first batch, $1 reprint). A change here must be
+        deliberate and carry a Decisions_Log why-stub."""
+        self.assertEqual(gi.POLICY_CAP_USD, 9.0)
+        self.assertEqual(gi.REPRINT_CAP_USD, 1.0)
+
+    def test_normal_first_batch_above_reprint_limit_passes(self):
+        """THE primary production path: a first render with no prior spend, costing
+        more than the $1 reprint limit but less than the $9 cap, must PASS.
+
+        This pins the `p > 0.0` discriminator. Mutating it to `p >= 0.0` classifies
+        every run as a reprint and caps normal first batches at $1 — and it survived
+        all 20 previous tests, because every other fixture either seeds prior spend
+        (making it a genuine reprint) or blocks for a reason that matches the reprint
+        message too. 50 images ~= $4.75: over the reprint limit, well under the cap."""
+        self._widen_manifest(50)
+        p = self._run("--max-images", "150", "--max-cost", "99")
+        out = p.stdout + p.stderr
+        self.assertIn("spend guard: OK", out, "a normal first batch must not be gated")
+        self.assertNotIn("--over-cap-ok", out)
+
+    def test_reprint_limit_boundary_brackets(self):
+        """Brackets the reprint limit from both sides: ~$0.95 passes, ~$1.05 blocks.
+
+        HONEST LIMIT: this does NOT pin `>` vs `>=` at exactly $1.00 — image cost is
+        ~$0.095/unit so no integer count lands on $1.0000, and mutating `>` to `>=`
+        survives this fixture. Pinning that boundary would need the gate predicate
+        extracted from main() into a callable. Economically irrelevant (a batch
+        costing exactly $1.0000 does not occur), so it is documented, not chased."""
+        self._seed_prior(0.50)
+        self._widen_manifest(10)
+        p = self._run("--max-images", "150", "--max-cost", "99")
+        self.assertIn("spend guard: OK", p.stdout + p.stderr)
+        self._widen_manifest(11)
+        p2 = self._run("--max-images", "150", "--max-cost", "99")
+        self.assertIn("reprint limit", p2.stdout + p2.stderr)
+
+    def test_reprint_within_limit_passes(self):
+        """A video already at the cap may still take a small reprint.
+
+        This is the POINT of the 2026-07-27 split: a single $10 cap could be fully
+        consumed by pass 1, leaving nothing to fix the shots review then rejects.
+        $9 first batch + $1 reserved makes the fix pass affordable by construction."""
+        self._seed_prior(gi.POLICY_CAP_USD)          # first batch spent the whole cap
+        p = self._run()                              # ~$0.10 reprint
+        self.assertIn("spend guard: OK", p.stdout)
+        self.assertNotIn("--over-cap-ok", p.stderr)
+
+    def _widen_manifest(self, n):
+        """Rewrite the fixture manifest to n images (~$0.10 each) to drive a real
+        dollar estimate. One image can never exceed the $1 reprint limit."""
+        self.manifest.write_text(json.dumps({
+            "project": "cap-test",
+            "images": [{"name": f"Video_99_Shot_{i:02d}", "prompt": "test shot",
+                        "use_references": False} for i in range(1, n + 1)],
+        }))
+
+    def test_reprint_over_limit_blocks_even_under_ceiling(self):
+        """A reprint bigger than $1 blocks even when the TOTAL stays under the ceiling.
+
+        Without this the reprint limit is decorative: a video with $0.50 of prior spend
+        could bill another $8 and still sit below the $10 ceiling. 20 images ~= $2.00
+        against $0.50 prior = $2.50 total — comfortably under the ceiling, and it must
+        STILL block because the reprint half is what was exceeded."""
+        self._seed_prior(0.50)
+        self._widen_manifest(20)
+        p = self._run("--max-images", "150", "--max-cost", "99")
+        self.assertNotEqual(p.returncode, 0, "a >$1 reprint must block")
+        out = p.stdout + p.stderr
+        self.assertIn("reprint limit", out)
+        self.assertIn("--over-cap-ok", out)
+
+    def test_first_batch_over_cap_blocks_at_nine_not_ten(self):
+        """With NO prior spend the ceiling is POLICY_CAP_USD alone — the $1 reprint
+        reserve is not available to a first batch. ~95 images ~= $9.50: over $9,
+        under $10, so it must block (it would have passed under the old single cap)."""
+        self._widen_manifest(95)                     # ~$9.03: over $9, under $10
+        p = self._run("--max-images", "150", "--max-cost", "99")
+        out = p.stdout + p.stderr
+        # NOT assertNotEqual(returncode, 0): the flux stub always exits non-zero, so
+        # that passes whether the gate fired or not. NOT assertIn("policy cap") either
+        # — that string also appears in the benign "no ledger" NOTE. Assert the one
+        # phrase only a real cap BLOCK emits.
+        self.assertIn("--over-cap-ok", out, "a first batch over $9 must block at the gate")
+        self.assertIn("over the", out)
 
     def test_under_cap_passes_quietly(self):
         self._seed_prior(0.10)
@@ -157,7 +248,7 @@ class TestPolicyCapGate(unittest.TestCase):
         # Prior spend recorded under a DIFFERENT manifest key must still count.
         self.ledger.write_text(json.dumps(
             {"video": "video_99_fixup_renders", "shot": "Video_99_Shot_00",
-             "cost_usd": gi.POLICY_CAP_USD}) + "\n")
+             "cost_usd": gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD}) + "\n")
         p = self._run()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("policy cap", p.stderr + p.stdout)
@@ -186,7 +277,7 @@ class TestPolicyCapGate(unittest.TestCase):
         # Video_98, which is already over cap.
         self.ledger.write_text(json.dumps(
             {"video": "video_98_hd", "shot": "Video_98_Shot_00",
-             "cost_usd": gi.POLICY_CAP_USD}) + "\n")
+             "cost_usd": gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD}) + "\n")
         p = self._run()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("Video_98", p.stderr + p.stdout)

@@ -424,7 +424,8 @@ def main(argv):
     flags = [a for a in argv[1:] if a.startswith('--')]
     unknown = [f for f in flags if f not in ('--check', '--fix', '--selftest')]
     if unknown:
-        print(f"unknown flag(s): {' '.join(unknown)}", file=sys.stderr)
+        # sorted(): a verification instrument must be byte-stable run to run.
+        print(f"unknown flag(s): {' '.join(sorted(unknown))}", file=sys.stderr)
         return 2
     if '--selftest' in flags:
         _selftest()

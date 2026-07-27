@@ -189,12 +189,24 @@ RUN_TABLE: dict[str, dict] = {
     # full re-draft, so buy real margin.
     # COUPLING: run_script_fixer reads this same value and runs inside STAGE 2's
     # review loop, so the bump also doubles the fixer budget — stage 2's worst case
-    # goes ~65 min → ~105 min (60 + 480 + 2×(2400+480)). Nothing kills a long stage
-    # (run_job.sh has no watchdog) and launchd coalesces StartInterval ticks, so the
-    # hourly sweep will not overlap itself; but --status takes the same BLOCKING
-    # per-video flock, so `/pipeline 14 status` can hang while a stage runs.
+    # goes to ~171 min (60 + 1800 + 2×(2400+1800)) — RECOMPUTED 2026-07-27 when
+    # 2_review went 480 → 1800; the old figure here said "~105 min (60 + 480 +
+    # 2×(2400+480))" and was silently 66 minutes stale, since that 480 IS 2_review.
+    # Nothing kills a long stage (run_job.sh has no watchdog) and launchd coalesces
+    # StartInterval ticks, so the hourly sweep will not overlap itself; but --status
+    # takes the same BLOCKING per-video flock, so `/pipeline 14 status` from Telegram
+    # can now hang up to ~2h51m (was ~1h45m) while a stage runs. That is the real
+    # operator-facing cost of this bump — if it bites, give --status a non-blocking
+    # LOCK_NB probe rather than shrinking the timeout back.
     "1_script":      {"kind": "agent",  "agent": "scriptwriter",             "timeout": 2400},
-    "2_review":      {"kind": "agent",  "agent": "script-reviewer",          "timeout": 480},
+    # 1800, raised from 480 (2026-07-27). A flagship script review reads the whole
+    # script plus canon and takes longer than 480s: V14 (28 scenes / 2,870 words)
+    # timed out with BOTH agent logs at 0 bytes — `claude --print` emits only on
+    # completion, so a too-short timeout looks identical to a dead dispatch. The
+    # CLI was verified healthy at the same moment (12-byte round trip in <40s).
+    # _run_agent's own docstring already records V14 script dispatches running
+    # 1200-2400s. Stage 1 (scriptwriter, same class of work) is 2400.
+    "2_review":      {"kind": "agent",  "agent": "script-reviewer",          "timeout": 1800},
     "5_images":      {"kind": "billed", "agent": None,                       "timeout": 3600},
     "6_assemble":    {"kind": "script", "agent": None,                       "timeout": 1800},
     "7_packaging":   {"kind": "agent",  "agent": "packaging-strategist",     "timeout": 480},
@@ -1615,6 +1627,102 @@ def run_script_wordcount_check(video: int) -> tuple[str, str]:
     return "error", f"exit {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[:300]}"
 
 
+# `rate-wpm:` at column 0 with an INTEGER value, matched ONLY inside the frontmatter
+# block (see _fm_bounds). vo_wordcount.parse_rate() reads frontmatter only; scanning
+# the whole file made the two disagree — a col-0 `rate-wpm:` inside a body code fence
+# would be read (and rewritten) instead of the real key. `(?!\.)` refuses a float:
+# the old pattern turned `161.5` into `145.5`, a value nobody intended.
+_RATE_WPM_RE = re.compile(r'^(rate-wpm:[ \t]*)(\d+)(?![\d.])', re.M)
+
+
+def _fm_bounds(text: str) -> tuple[int, int] | None:
+    """(start, end) of the YAML frontmatter body, or None. Mirrors
+    vo_wordcount.frontmatter() so both components agree on where the keys live."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return None if end == -1 else (3, end)
+
+
+def _rate_wpm_of(txt: str) -> str | None:
+    """The frontmatter `rate-wpm:` value in `txt`, "UNPARSEABLE", or None.
+
+    Split out from _read_rate_wpm so tests exercise THIS function rather than
+    reimplementing its regex composition — a test that re-derives the logic it
+    pins cannot see the two drifting apart."""
+    b = _fm_bounds(txt)
+    if b is None:
+        return None
+    m = _RATE_WPM_RE.search(txt, b[0], b[1])
+    if m:
+        return m.group(2)
+    # PRESENT BUT UNPARSEABLE is not the same as ABSENT (M5). vo_wordcount.parse_rate
+    # reads `rate-wpm: 161.5` as 161 and computes a real spine from it, but this regex
+    # refuses floats/quoted values — so returning None would skip the whole guard and
+    # let the fixer reset a rate that IS in force. Signal it so the caller can block
+    # rather than silently pass, which is exactly the H2 failure mode.
+    if re.search(r'^rate-wpm:', txt[b[0]:b[1]], re.M):
+        return "UNPARSEABLE"
+    return None
+
+
+def _read_rate_wpm(video: int) -> tuple[Path | None, str | None]:
+    """(script path, its frontmatter `rate-wpm:` value) — the per-video VO rate override."""
+    a = vault_abs(f"{VAULT_REL}/Scripts/Video_{nn(video)}_Script.md")
+    if a is None or not a.exists():
+        return None, None
+    return a, _rate_wpm_of(a.read_text(encoding="utf-8"))
+
+
+def _restore_rate_wpm(path: Path, want: str) -> bool:
+    """Put the frontmatter `rate-wpm:` back to `want`. True if the file changed.
+
+    WHY (2026-07-27): `rate-wpm` is a per-video override — V14 renders at --speed 1.0,
+    so its spine must be computed at the rate that speed actually produces, not the 180
+    default. The review->fix loop dispatches scriptwriter, which rewrites frontmatter and
+    has no idea the override is deliberate: it silently reset V14 from 161 to 180 and
+    rebuilt every scene span and all 16 chapter marks at the wrong rate. Chapter marks
+    are what viewers click. The agent has no authority over this field.
+
+    Writes atomically (tmp + os.replace) — the vault is NOT git-tracked, so a crash
+    mid-write on a 60 KB production script is unrecoverable."""
+    txt = path.read_text(encoding="utf-8")
+    b = _fm_bounds(txt)
+    if b is None:
+        return False
+    m = _RATE_WPM_RE.search(txt, b[0], b[1])
+    if m is None:
+        return False                      # key absent — caller MUST treat as failure (H2)
+    new = txt[:m.start(2)] + want + txt[m.end(2):]
+    if new == txt:
+        return False
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(new, encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
+def _respine(video: int) -> tuple[bool, str]:
+    """Re-derive the timestamp spine at the script's CURRENT rate-wpm.
+
+    Needed because restoring the rate necessarily leaves the spine inconsistent: the
+    fixer rebuilt every span at ITS rate, so putting the rate back makes the file
+    disagree with itself BY CONSTRUCTION. Without this the post-check below would block
+    every non-default-rate video forever — a guaranteed park on exactly the videos these
+    guards exist to protect. vo_wordcount --fix is deterministic and idempotent, and is
+    already the remediation the block message prints."""
+    tool = Path(__file__).resolve().parent / "vo_wordcount.py"
+    script_abs = vault_abs(f"{VAULT_REL}/Scripts/Video_{nn(video)}_Script.md")
+    if not tool.exists() or script_abs is None or not script_abs.exists():
+        return False, "vo_wordcount.py or script missing"
+    try:
+        proc = subprocess.run([sys.executable, str(tool), str(script_abs), "--fix"],
+                              capture_output=True, text=True, timeout=60)
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"could not run --fix: {e}"
+    return proc.returncode == 0, (proc.stdout or proc.stderr or "").strip()[:200]
+
+
 def run_script_review_gate(video: int) -> tuple[bool, str]:
     """Stage-2 executor under the BINARY policy: run the review→fix→re-review loop
     and advance ONLY on a clean SHIP. UNAVAILABLE (the reviewer could not RUN —
@@ -1639,9 +1747,67 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
         notify(f"⚠️ Video {video}: vo_wordcount pre-check could not run ({wc_detail}); "
                f"falling through to LLM script review (count still backstopped there).",
                force=True)
+    # Snapshot the per-video VO rate override BEFORE the fix loop can clobber it.
+    script_path, rate_before = _read_rate_wpm(video)
     verdict, vrel, detail = run_script_review_loop(video)
     if verdict == "SHIP":
-        return True, f"script-reviewer SHIP ({vrel}). {detail}"
+        notes = []
+        # 1) Did a scriptwriter fix silently reset the rate override? Put it back.
+        if script_path is not None and rate_before is not None:
+            _, rate_after = _read_rate_wpm(video)
+            if rate_before == "UNPARSEABLE" or rate_after == "UNPARSEABLE":
+                return False, (f"the Video {video} script has a `rate-wpm:` value this "
+                               f"gate cannot parse (floats and quoted values are not "
+                               f"supported, though vo_wordcount will silently use the "
+                               f"integer part). Refusing to advance rather than leave the "
+                               f"per-video rate override unguarded. Write a bare integer.")
+            if rate_after != rate_before:
+                if _restore_rate_wpm(script_path, rate_before):
+                    # The restore itself desyncs the spine (the fixer rebuilt every span
+                    # at ITS rate), so re-derive at the restored rate or the post-check
+                    # below blocks by construction, every time. C2.
+                    # UNTESTED (no fixture pins this): run_script_review_gate needs the
+                    # whole vault + live agents to exercise, so a mutation reinstating
+                    # the shadowing survives the suite. Verified by hand only.
+                    # NB: bind to _rdetail, NOT detail — `detail` holds the
+                    # script-reviewer's summary (incl. "after N auto-fix attempts")
+                    # and is consumed in the SHIP line below. Shadowing it made the
+                    # gate cite vo_wordcount's stdout as the reviewer's own output.
+                    ok, _rdetail = _respine(video)
+                    notes.append(f"restored rate-wpm {rate_after}->{rate_before} "
+                                 f"(clobbered by the auto-fix loop); "
+                                 f"spine re-derived: {'ok' if ok else 'FAILED ' + _rdetail}")
+                else:
+                    # H2: the fixer DELETED the key. Restore cannot put it back, and
+                    # parse_rate now silently defaults to 180 — so the post-check would
+                    # PASS with the override gone and every chapter mark wrong. Block.
+                    return False, (f"the auto-fix loop removed the `rate-wpm` override "
+                                   f"(was {rate_before}) from the Video {video} script. "
+                                   f"The spine has been rebuilt at the 180 default and every "
+                                   f"chapter mark is wrong for the intended render rate. "
+                                   f"Restore `rate-wpm: {rate_before}` in the frontmatter, run "
+                                   f"`vo_wordcount.py <script> --fix`, then re-run /pipeline {video}.")
+        # 2) RE-RUN the deterministic spine check AFTER the fix loop. The front-gate
+        #    above ran BEFORE any fix, so a fix that broke the spine was never
+        #    re-checked by the very gate built to catch it -- and the LLM reviewer
+        #    does not recompute timestamps. Observed live on V14 (2026-07-27): the
+        #    loop shipped a SHIP while leaving 45 spine mismatches behind it.
+        # CEILING (M6): on the rate-clobber path _respine already ran --fix, which
+        # re-derives counts and spans from whatever VO text now exists — so this
+        # check compares the file against itself and necessarily passes. It surfaces
+        # a fixer-broken spine only on DEFAULT-rate scripts. If a fix also truncated
+        # VO content, --fix rewrites the counts down to match and this will not catch
+        # it; the script-reviewer is the gate for content loss, not this.
+        post_state, post_detail = run_script_wordcount_check(video)
+        if post_state == "mismatch":
+            return False, ("script-reviewer returned SHIP but the auto-fix loop left the "
+                           "word-count / timestamp spine inconsistent (deterministic "
+                           "re-check AFTER the loop) — refusing to advance. Run "
+                           f"`vo_wordcount.py <script> --fix`, then re-run /pipeline {video}."
+                           + (f" [{'; '.join(notes)}]" if notes else "")
+                           + f"\n{post_detail}")
+        suffix = (" " + "; ".join(notes)) if notes else ""
+        return True, f"script-reviewer SHIP ({vrel}). {detail}{suffix}"
     if verdict == "UNAVAILABLE":
         return False, (f"reviewer-unavailable: stage-2 script review could not run "
                        f"({detail[:120]}) — left ready to retry, NOT advanced (binary gate).")

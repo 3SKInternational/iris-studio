@@ -87,7 +87,18 @@ _TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
 # like $3.47), another digit (don't half-match $1234), or a k/M/B magnitude
 # suffix -- leave $10k/$5M untouched for vo_number_lint / human review rather
 # than voicing "$5" + a dangling "M" (the wrong value, billed).
+# _SKIP_TOKEN — IDEMPOTENCE. The figure after a "|" is the CAPTION half of an existing
+# {{words|$X}} token; re-wrapping it nests {{a|{{a|$X}}}}, and generate_vo._DUAL_RE
+# (which excludes braces on both halves) then matches only the INNER token and sends
+# literal "{{ … | … }}" to ElevenLabs in a BILLED render, braces into the SRT too.
+# The old `val >= 1_000_000: skip` was accidentally load-bearing here — it shielded
+# every already-dual-formed millions figure, so removing it exposed this. The
+# documented remediation loop (reviewer flags a bare million -> a fix pass writes the
+# dual-form into the SCRIPT -> rebuild the kit) fed straight into it: V12 nested on
+# rebuild. Anchor idempotence in the regex, not in a value guard.
+_SKIP_TOKEN = r"(\{\{[^{}]*\}\})|"   # an existing dual-form: matched first, returned as-is
 _DOLLAR_RE = re.compile(
+    _SKIP_TOKEN +
     r"\$(\d(?:[\d,]*\d)?)(?!\.\d)(?!,\d)(?!\d)(?![kKmMbB])"  # (?!,\d) kills the partial match ending pre-comma ("$1,234.56" → "$1" mangle)
     r"(?!\s+(?:[Mm]illion|[Bb]illion|[Tt]rillion)\b)"  # "$10 million" reads fine; dual-forming yields "ten dollars million"
 )
@@ -97,6 +108,7 @@ _DOLLAR_RE = re.compile(
 # matters on direct calls — in the pipeline apply_orthography rewrites % to
 # " percent" BEFORE spell_dollars runs.
 _DOLLAR_CENTS_RE = re.compile(
+    _SKIP_TOKEN +
     r"\$(\d(?:[\d,]*\d)?)\.(\d{2})(?!\d)(?![kKmMbB%])"
     r"(?!\s+(?:[Mm]illion|[Bb]illion|[Tt]rillion)\b)"  # "$2.25 billion" must stay verbatim
 )
@@ -113,9 +125,21 @@ def _words_under_1000(n: int) -> str:
 
 
 def num_to_words(n: int) -> str:
-    """Cardinal words for 0..999,999 (US style, no 'and')."""
-    if not 0 <= n < 1_000_000:
+    """Cardinal words for 0..999,999,999 (US style, no 'and').
+
+    Millions were out of range until 2026-07-27, which is why spell_dollars had to
+    skip every figure >= 1M and leave it as bare digits for the renderer. That is
+    the exact shape ElevenLabs mis-speaks: it read V05's $1,043,000 as "one
+    thousand forty-three thousand", dropping the millions place. V14 surfaced it at
+    scale -- $1,240,000, the number the whole video is ABOUT, was bare in 6 spoken
+    scenes. Spelling them is the fix; the lint that flagged them is warn-only and
+    never blocked a render."""
+    if not 0 <= n < 1_000_000_000:
         raise ValueError(f"num_to_words out of range: {n}")
+    if n >= 1_000_000:
+        mm, r = divmod(n, 1_000_000)
+        return (_words_under_1000(mm) + " million"
+                + (f" {num_to_words(r)}" if r else ""))
     if n < 1000:
         return _words_under_1000(n)
     th, r = divmod(n, 1000)
@@ -128,12 +152,18 @@ def spell_dollars(text: str) -> str:
     Each risky figure -> {{<words> dollars|$digits}} dual-form (spoken words,
     captioned digits). Whole-thousands read fine; millions+ are gated elsewhere."""
     def repl(m: "re.Match[str]") -> str:
-        raw = m.group(1)
+        if m.group(1):                     # already a {{...}} token — never re-wrap
+            return m.group(1)
+        raw = m.group(2)
         val = int(raw.replace(",", ""))
-        if val >= 1_000_000:                  # ponytail: millions gated by vo_number_lint, not here
+        # Whole millions ($1,000,000, $5,000,000) voice cleanly and read naturally
+        # as digits; NON-round millions ($1,240,000) are the documented hazard.
+        if val >= 1_000_000_000:              # num_to_words stops below 1e9; a
+            return m.group(0)                 # non-round billion used to crash the build
+        if val >= 1_000_000 and val % 1_000_000 == 0:
             return m.group(0)
-        if val >= 1000 and val % 1000 == 0:   # whole-thousands ($18,000) voice cleanly
-            return m.group(0)
+        if val < 1_000_000 and val >= 1000 and val % 1000 == 0:
+            return m.group(0)              # whole-thousands ($18,000) voice cleanly
         return "{{" + num_to_words(val) + " dollars|$" + raw + "}}"
     text = _DOLLAR_RE.sub(repl, text)
     return _DOLLAR_CENTS_RE.sub(_repl_cents, text)
@@ -142,14 +172,16 @@ def spell_dollars(text: str) -> str:
 def _repl_cents(m: "re.Match[str]") -> str:
     # "$31.40" is voiced "thirty-one dollars forty" — spell "and forty cents"
     # (Steve directive 2026-07-04, heard live on the V07 pump line).
-    dollars = int(m.group(1).replace(",", ""))
-    if dollars >= 1_000_000:                  # mirror the integer-path guard; num_to_words raises past 1M
-        return m.group(0)
-    cents = int(m.group(2))
+    if m.group(1):                         # already a {{...}} token — never re-wrap
+        return m.group(1)
+    dollars = int(m.group(2).replace(",", ""))
+    if dollars >= 1_000_000:                  # unchanged: millions-with-cents stay verbatim
+        return m.group(0)                     # (rare, verbose spelled, and not the hazard)
+    cents = int(m.group(3))
     spoken = num_to_words(dollars) + (" dollar" if dollars == 1 else " dollars")
     if cents:
         spoken += " and " + num_to_words(cents) + (" cent" if cents == 1 else " cents")
-    return "{{" + spoken + "|$" + m.group(1) + "." + m.group(2) + "}}"
+    return "{{" + spoken + "|$" + m.group(2) + "." + m.group(3) + "}}"
 
 
 def apply_orthography(text: str) -> str:
@@ -382,6 +414,44 @@ def selftest() -> int:
         "$1,000,000 million kept verbatim": "$1,000,000" in kit and "one million" not in kit,
         "$5M suffix untouched": "$5M" in kit and "five dollars" not in kit,
         "$10 million word-suffix kept verbatim": "$10 million" in kit and "ten dollars" not in kit,
+        # --- NON-ROUND millions (2026-07-27) ---------------------------------
+        # The documented ElevenLabs hazard: it read V05's $1,043,000 as "one
+        # thousand forty-three thousand", dropping the millions place. V14 had
+        # $1,240,000 -- the number the whole video is about -- bare in 6 spoken
+        # scenes. num_to_words was capped below 1M, so spell_dollars had no choice
+        # but to skip them. Whole millions still stay verbatim; only non-round ones
+        # are dual-formed.
+        "non-round million dual-formed": spell_dollars("$1,240,000")
+            == "{{one million two hundred forty thousand dollars|$1,240,000}}",
+        "V05 regression case dual-formed": spell_dollars("$1,043,000")
+            == "{{one million forty-three thousand dollars|$1,043,000}}",
+        "sub-thousand tail preserved": spell_dollars("$1,127,200")
+            == "{{one million one hundred twenty-seven thousand two hundred dollars|$1,127,200}}",
+        "whole millions still verbatim": spell_dollars("$1,000,000") == "$1,000,000"
+            and spell_dollars("$5,000,000") == "$5,000,000",
+        # IDEMPOTENCE (C1): feeding an already-dual-formed figure back in must be a
+        # no-op. Absent this, the tool nested on its own documented rebuild loop.
+        "dual-form is idempotent": spell_dollars("{{one million four thousand dollars|$1,004,000}}")
+            == "{{one million four thousand dollars|$1,004,000}}",
+        "cents dual-form idempotent": spell_dollars("{{one dollar and fifty cents|$1.50}}")
+            == "{{one dollar and fifty cents|$1.50}}",
+        # Idempotence must hold for EVERY spelling generate_vo._DUAL_RE accepts, not
+        # just the exact bytes "|$". A (?<!\|) lookbehind covered only the tight form;
+        # the spaced one is what a human actually types, and it nested. Anchor on the
+        # TOKEN via _SKIP_TOKEN, and pin all four loose spellings here.
+        "idempotent: space after pipe": spell_dollars("{{a dollars| $1,004,000}}")
+            == "{{a dollars| $1,004,000}}",
+        "idempotent: prefixed caption": spell_dollars("{{a dollars|about $1,004,000}}")
+            == "{{a dollars|about $1,004,000}}",
+        "idempotent: spaces both sides": spell_dollars("{{ a dollars | $1,004,000 }}")
+            == "{{ a dollars | $1,004,000 }}",
+        "idempotent: suffixed caption": spell_dollars("{{a dollars|$1,004,000 net}}")
+            == "{{a dollars|$1,004,000 net}}",
+        # ...while a BARE figure outside any token is still dual-formed.
+        "bare figure still wrapped": "{{one million two hundred forty thousand dollars|$1,240,000}}"
+            in spell_dollars("costs $1,240,000 total"),
+        # H1: a non-round BILLION must pass through, not crash num_to_words.
+        "non-round billion passes through": spell_dollars("$1,234,567,890") == "$1,234,567,890",
         # --- lettered scenes + duplicate guard (2026-07-26) -------------------
         # Before these, EVERY mutation of the lettered-scene fix left this suite
         # green — including reverting _SCENE_RE outright. A green run carried no
