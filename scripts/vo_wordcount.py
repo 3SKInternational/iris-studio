@@ -7,7 +7,9 @@ This computes the ground truth from the file so no agent has to eyeball it.
 
 VO for a scene = every non-blank line between that scene's `**VO:**` marker and
 its `**SCENE PROMPT` line (multi-paragraph VO included), with the marker
-stripped. Word count = whitespace tokens (matches `wc -w`; a hyphen removed from
+stripped, EXCLUDING blockquote lines (`> ...`) — those are on-screen figure-card
+copy burned by card_overlay.py, never narrated, and counting them inflates the
+runtime spine (V14: 187 words = +62s of phantom runtime). Word count = whitespace tokens (matches `wc -w`; a hyphen removed from
 a compound word therefore counts as 2 words, same model the reviewer uses).
 
 Timestamps are derived, one rule: a boundary at cumulative VO words W lands at
@@ -29,9 +31,33 @@ import os
 import re
 import sys
 
-SCENE_RE = re.compile(r'^##\s*SCENE\s+(\d+)\b', re.I)
-SCENE_HDR_TS_RE = re.compile(r'^##\s*SCENE\s+(\d+)\s*\[\s*(\d+:\d+)\s*[–—-]\s*(\d+:\d+)\s*\]', re.I)
+# Scene ids are STRINGS, not ints: real scripts split a beat into '4a'/'4b'/'4c'.
+# The old `(\d+)\b` silently failed on those — `\b` needs a non-word char after the
+# digits, and 'a' is a word char. V14 has 28 scenes (1,2,3,4a..14b,15,16); only the
+# 5 bare integers matched, so the lint reported "scene count 5" and told Steve to fix
+# headers that were correct. Worse than a miscount: an unmatched header does not open
+# a new buffer, so scenes 4a-14b's VO all accumulated into scene 3, which then
+# "computed" a 16-minute span. The TOTAL stayed right (every word was still counted,
+# just misattributed) — which is exactly why this survived: the one number a human
+# eyeballs was correct. Ids are only ever identity/display/dict keys here, never
+# arithmetic or ordering (order comes from document position), so a string is safe.
+SCENE_RE = re.compile(r'^##\s*SCENE\s+(\d+[a-z]*)\b', re.I)
+SCENE_HDR_TS_RE = re.compile(r'^##\s*SCENE\s+(\d+[a-z]*)\s*\[\s*(\d+:\d+)\s*[–—-]\s*(\d+:\d+)\s*\]', re.I)
 VO_RE = re.compile(r'^\*\*VO:\*\*', re.I)
+# On-screen figure cards are authored as blockquotes INSIDE the VO span
+# ('> 💳 Figure card: "Age 27 / Your account: $31,480"'). They are burned by
+# card_overlay.py and NEVER spoken, so counting them inflates the runtime spine
+# on exactly the scripts that follow Steve's numbers-on-screen-cards directive.
+# V14: 7 such lines = 187 words = +62s of phantom runtime (3,057 counted vs
+# 2,870 actually narrated). V12 does it too (119 words); V10/V11/V13 don't.
+# Matches the render layer ON THIS POINT SPECIFICALLY: generate_vo.clean_vo_text()
+# drops `^[ \t]*>` lines before TTS, so these words are never spoken and counting
+# them made the gate and the renderer disagree about the same script. NOT a claim
+# that the two agree in general — the render also expands orthography (V14's actual
+# TTS token count is ~3,304 vs 2,870 script words). Script-text words remain the
+# right sizing basis: the wpm rate is measured off finished audio, so it already
+# absorbs that expansion.
+CARD_RE = re.compile(r'^\s*>')
 PROMPT_RE = re.compile(r'^\*\*SCENE PROMPT', re.I)
 CHAPTER_RE = re.compile(r'^\s*(?:[-*]\s*)?(\d+:\d+)\b')  # tolerate a leading "- " / "* " bullet
 
@@ -65,7 +91,7 @@ def scene_counts(text: str):
         m = SCENE_RE.match(ln)
         if m:
             flush()
-            cur, buf, capturing = int(m.group(1)), [], False
+            cur, buf, capturing = m.group(1).lower(), [], False   # str id, see SCENE_RE
             continue
         if VO_RE.match(ln):
             capturing = True
@@ -74,6 +100,8 @@ def scene_counts(text: str):
         if PROMPT_RE.match(ln):
             capturing = False
             continue
+        if capturing and CARD_RE.match(ln):
+            continue                      # on-screen card copy, not narration
         if capturing and ln.strip() not in ('', '---'):
             buf.append(ln.strip())
     flush()
@@ -89,6 +117,18 @@ def derive(counts, wpm: int):
         rows.append((n, w, mmss(cum / wps), mmss((cum + w) / wps)))
         cum += w
     return rows, cum, mmss(cum / wps)
+
+
+def beat_starts(rows):
+    """Chapter marks are per BEAT: scenes 4a/4b/4c are one beat, starting at 4a.
+    Returns the ordered start times, one per beat. On an unlettered script this is
+    exactly one per scene, so it matches the pre-2026-07-26 behaviour."""
+    beats = []
+    for n, _w, s, _e in rows:
+        pref = re.match(r'\d+', n).group(0)
+        if not beats or beats[-1][0] != pref:
+            beats.append((pref, s))
+    return [s for _p, s in beats]
 
 
 def report(text: str) -> str:
@@ -130,7 +170,7 @@ def check(text: str):
         mh = SCENE_HDR_TS_RE.match(ln)
         if not mh:
             continue
-        n, fs, fe = int(mh.group(1)), mh.group(2), mh.group(3)
+        n, fs, fe = mh.group(1).lower(), mh.group(2), mh.group(3)
         seen_span.add(n)
         if n in derived and (fs, fe) != derived[n]:
             bad.append(f"S{n} header [{fs}-{fe}] != computed [{derived[n][0]}-{derived[n][1]}]")
@@ -144,11 +184,17 @@ def check(text: str):
         bad.append("Timestamps section missing")
     else:
         chap = [m.group(1) for m in (CHAPTER_RE.match(l) for l in ts.group(1).splitlines()) if m]
-        starts = [s for _, _, s, _ in rows]
+        # One chapter mark per BEAT, not per scene. A beat split into 4a/4b/4c is
+        # ONE YouTube chapter — the split exists for shot pacing, not navigation, and
+        # a 28-mark list on a 17-minute video is wrong for viewers. The beat's start
+        # is its FIRST scene's start. Identical to the old rule on unlettered scripts
+        # (V10/V11: 14 scenes -> 14 beats), so this is a generalisation, not a change.
+        starts = beat_starts(rows)
         if not chap:
             bad.append("Timestamps section has no parseable chapter marks")
         elif len(chap) != len(starts):
-            bad.append(f"chapter-list count {len(chap)} != scene count {len(starts)}")
+            bad.append(f"chapter-list count {len(chap)} != beat count {len(starts)}"
+                       f" ({len(rows)} scenes)")
         else:
             for i, (c, s) in enumerate(zip(chap, starts)):
                 if c != s:
@@ -182,7 +228,7 @@ def fix(text: str):
     wpm = parse_rate(text)
     rows, total, runtime = derive(counts, wpm)
     derived = {n: (s, e) for n, w, s, e in rows}
-    starts = [s for _, _, s, _ in rows]
+    starts = beat_starts(rows)          # same rule check() uses — never diverge
 
     text = _sub_frontmatter(text, total, runtime)
     trailing_nl = text.endswith("\n")
@@ -193,8 +239,8 @@ def fix(text: str):
     # so a correct header is never cosmetically churned.
     for i, ln in enumerate(lines):
         mh = SCENE_HDR_TS_RE.match(ln)
-        if mh and int(mh.group(1)) in derived:
-            s, e = derived[int(mh.group(1))]
+        if mh and mh.group(1).lower() in derived:
+            s, e = derived[mh.group(1).lower()]
             lines[i] = re.sub(
                 r'\[(\s*)\d+:\d+(\s*[–—-]\s*)\d+:\d+(\s*)\]',
                 lambda m: f'[{m.group(1)}{s}{m.group(2)}{e}{m.group(3)}]', ln, count=1)
@@ -238,7 +284,78 @@ def _selftest():
     )
     # core math
     counts = scene_counts(sample)
-    assert counts == [(1, 6), (2, 6)], counts        # S2 multi-paragraph = 6, prompt excluded
+    assert counts == [('1', 6), ('2', 6)], counts    # S2 multi-paragraph = 6, prompt excluded
+
+    # --- LETTERED SCENE IDS (the V14 bug, 2026-07-26) --------------------------
+    # Real scripts split a beat into 4a/4b/4c. The old `(\d+)\b` could not match
+    # those, and the damage was NOT just a miscount: an unmatched header does not
+    # open a new buffer, so every lettered scene's VO silently accumulated into
+    # the last integer-numbered scene above it. V14 reported "scene count 5" for a
+    # 28-scene script and computed a 16-minute span for scene 3.
+    lettered = (
+        '---\nrate-wpm: 180\nword-count-vo-only: 12\nruntime-target: "0:04"\n---\n'
+        '## SCENE 1 [0:00-0:02]\n'
+        '**VO:** one two three four five six\n'
+        '**SCENE PROMPT (paste):**\n'
+        'Scene: ignored\n'
+        '## SCENE 2a [0:02-0:03]\n'
+        '**VO:** seven eight nine\n'
+        '**SCENE PROMPT (paste):**\n'
+        'Scene: ignored\n'
+        '## SCENE 2b [0:03-0:04]\n'
+        '**VO:** ten eleven twelve\n'
+        '**SCENE PROMPT (paste):**\n'
+        'Scene: ignored\n'
+        '## Timestamps\n0:00 cold open\n0:02 second\n'   # 2 BEATS (1, 2), not 3 scenes
+    )
+    # figure-card blockquotes inside the VO span are NOT narration (V14/V12 shape)
+    carded = (
+        '---\nrate-wpm: 180\nword-count-vo-only: 6\nruntime-target: "0:02"\n---\n'
+        '## SCENE 1 [0:00-0:02]\n'
+        '**VO:** one two three four five six\n'
+        '  > 💳 Figure card: "Age 27 / Your account: $31,480 / Their account: $2,700"\n'
+        '**SCENE PROMPT (paste):**\nScene: ignored\n'
+        '## Timestamps\n0:00 cold open\n'
+    )
+    assert scene_counts(carded) == [('1', 6)], scene_counts(carded)   # card excluded
+    assert check(carded) == [], check(carded)
+
+    lc = scene_counts(lettered)
+    # all three scenes seen, and each keeps ITS OWN words (no accumulation into S1)
+    assert lc == [('1', 6), ('2a', 3), ('2b', 3)], lc
+    assert check(lettered) == [], check(lettered)
+    # beat rule: 3 scenes (1, 2a, 2b) collapse to 2 chapter marks. A per-scene list
+    # must now FAIL — a 28-mark chapter list on a 16-beat video is wrong for viewers.
+    per_scene = lettered.replace('0:00 cold open\n0:02 second\n',
+                                 '0:00 cold open\n0:02 second\n0:03 third\n')
+    assert any('beat count' in b for b in check(per_scene)), check(per_scene)
+    # (the tuple assert above IS the misattribution guard: under the old regex
+    #  it was [('1', 12)] — one scene holding everything. No weaker restatement.)
+    # uppercase suffix normalises to the same id, so a header and its span agree
+    # NOTE: the replace direction matters. `lettered` holds LOWERCASE '2a', so
+    # .replace('## SCENE 2A', ...) is a no-op that asserts nothing — an earlier
+    # cut of this fixture had the arguments backwards and stayed green with
+    # check()'s .lower() deleted. Uppercase must be the REPLACEMENT, not the target.
+    assert scene_counts(lettered.replace('SCENE 2a', 'SCENE 2A'))[1][0] == '2a'
+    # BOTH suffixes uppercased: the --fix fixture below drifts the 2b span, so if
+    # only 2a were uppercased that call site would still see a lowercase id and
+    # fix()'s own .lower() would stay untested (verified: it survived that way).
+    upper = (lettered.replace('## SCENE 2a', '## SCENE 2A')
+                     .replace('## SCENE 2b', '## SCENE 2B'))
+    assert '## SCENE 2A' in upper and '## SCENE 2B' in upper, "fixture must mutate the sample"
+    assert check(upper) == [], check(upper)
+    # a lettered scene missing its span is still caught by the gate
+    assert any('S2b header missing' in b
+               for b in check(lettered.replace('## SCENE 2b [0:03-0:04]', '## SCENE 2b')))
+    # --fix repairs a drifted lettered header too
+    # uppercase so fix()'s own .lower() is exercised (a lowercase-only fixture
+    # leaves that call site as the identity and cannot detect its removal)
+    # ALSO drift a chapter mark: without this, fix()'s `starts = beat_starts(rows)`
+    # is unexercised and swapping it back to per-scene starts survives the suite.
+    ldrift = upper.replace('[0:03-0:04]', '[0:09-0:11]').replace('0:02 second', '0:07 second')
+    lfixed, lresid = fix(ldrift)
+    assert lresid == [] and '[0:03-0:04]' in lfixed, (lresid, lfixed)
+    assert '0:02 second' in lfixed, lfixed        # chapter mark repaired to the beat start
     rows, total, runtime = derive(counts, 180)
     assert total == 12 and runtime == '0:04', (total, runtime)
     assert rows[0][2:] == ('0:00', '0:02') and rows[1][2:] == ('0:02', '0:04'), rows

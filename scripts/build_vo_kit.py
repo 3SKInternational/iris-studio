@@ -44,8 +44,16 @@ from pathlib import Path
 
 # A scene header in the SOURCE script: "## SCENE 4 [1:00-2:10] STAGE 1 - ...".
 # The timing dash may be a hyphen or en-dash; the label is free text after it.
+#
+# The id accepts a LETTER SUFFIX ('4a', '4b', '4c') — scripts split one beat into
+# parts, and V14 does it for 23 of its 28 scenes. The old `(\d+)\s*\[` could not
+# match those, and the failure mode was DATA LOSS, not a loud error: an unmatched
+# header did not start a new block, so the previous scene's block swallowed it, and
+# extract_vo() takes only the FIRST **VO:** in a block — so every lettered scene's
+# narration was silently dropped from the kit and never rendered into the video.
+# V14 escaped only because the contiguity guard below happened to fire first.
 _SCENE_RE = re.compile(
-    r"^##\s+SCENE\s+(\d+)\s*\[([^\]]*)\]\s*(.*?)\s*$",
+    r"^##\s+SCENE\s+(\d+[a-z]*)\s*\[([^\]]*)\]\s*(.*?)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -199,15 +207,40 @@ def parse_scenes(script_text: str) -> list[dict]:
         vo = extract_vo(script_text[start:end])
         if vo is None:
             raise SystemExit(f"SCENE {h.group(1)} has no **VO:** block")
+        src = h.group(1).lower()
         scenes.append({
-            "scene": int(h.group(1)),
+            # KIT ordinal: always a plain 1..N integer, because the kit block format
+            # and generate_vo._BLOCK_RE both require `## Scene <digits>` and the mp3
+            # name is `_VO_Scene_%02d`. Source ids may be lettered; the kit's are not.
+            "scene": len(scenes) + 1,
+            "src": src,
             "timing": h.group(2).strip(),
             "label": h.group(3).strip(),
             "vo": vo,
         })
-    nums = [s["scene"] for s in scenes]
-    if nums != list(range(1, len(nums) + 1)):
-        raise SystemExit(f"scene numbers are not contiguous 1..N: {nums}")
+    # Contiguity guard, preserved in meaning: its job is "no source scene silently
+    # skipped". With lettered ids the sequence is 1,2,3,4a,4b,5a..., so check the
+    # NUMERIC PREFIXES instead — unique prefixes must be exactly 1..M with no gap,
+    # and must appear in non-decreasing order (a jump from 4b back to 3 is a
+    # mis-ordered script, same class of defect the old check caught).
+    prefixes = [int(re.match(r"\d+", s["src"]).group(0)) for s in scenes]
+    if prefixes != sorted(prefixes):
+        raise SystemExit(f"scene numbers are out of order: {[s['src'] for s in scenes]}")
+    uniq = sorted(set(prefixes))
+    if uniq != list(range(1, len(uniq) + 1)):
+        raise SystemExit(f"scene numbers are not contiguous 1..N: {[s['src'] for s in scenes]}")
+    # DUPLICATE ids. The old `nums != list(range(1, N+1))` caught a repeated scene
+    # number as a side effect (1,2,2,3 is not 1..4); the prefix/uniq rewrite above
+    # does NOT, because a repeat leaves the set unchanged. Restored explicitly.
+    # This is the LAST net for it: the kit renumbers positionally, so from a
+    # duplicate onward kit scene N != script scene N, while the shot list and image
+    # manifest stay keyed on SCRIPT numbers — every image after the dupe drifts one
+    # scene out of sync with its narration. vo_wordcount does not catch it either
+    # (its `derived` dict silently collapses duplicate ids and --check reports clean).
+    srcs = [s["src"] for s in scenes]
+    if len(set(srcs)) != len(srcs):
+        dupes = sorted({s for s in srcs if srcs.count(s) > 1})
+        raise SystemExit(f"duplicate scene number(s) {dupes} in: {srcs}")
     return scenes
 
 
@@ -243,6 +276,8 @@ def build_kit(script_text: str, script_path: Path, vid: str) -> str:
     for s in scenes:
         fname = f"Video_{vid}_VO_Scene_{s['scene']:02d}.mp3"
         label = f"{s['label']}, {s['timing']}" if s["label"] else s["timing"]
+        if s["src"] != str(s["scene"]):          # lettered source -> keep traceability
+            label = f"src SCENE {s['src']}; {label}"
         lines.append(f"## Scene {s['scene']} → `{fname}` ({label})")
         lines.append("")
         lines.append(narration_to_kit_body(s["vo"]))
@@ -262,6 +297,46 @@ def default_output(vid: str, script_path: Path) -> Path:
     raise SystemExit(
         f"could not locate Voice_Files/Video_{vid}/ above {script_path}; pass --output explicitly"
     )
+
+
+def _st_script(headers: list[str]) -> str:
+    """Minimal parseable script from a list of scene headers, one VO line each."""
+    out = ["# 3SK FINANCE — VIDEO #99", "## T", ""]
+    for i, h in enumerate(headers):
+        out += [h, "", f"**VO:** narration for block number {i} here.", "",
+                "**SCENE PROMPT:**", "Scene: ignore.", "", "---", ""]
+    return "\n".join(out)
+
+
+def _st_lettered():
+    """(scene_count, src ids, kit ordinals, all-VO-distinct) for a 1/2a/2b/3 script."""
+    sc = parse_scenes(_st_script([
+        "## SCENE 1 [0:00–0:10] A", "## SCENE 2a [0:10–0:20] B",
+        "## SCENE 2b [0:20–0:30] C", "## SCENE 3 [0:30–0:40] D"]))
+    vos = [s["vo"] for s in sc]
+    return (len(sc), [s["src"] for s in sc], [s["scene"] for s in sc],
+            len(set(vos)) == len(vos) and all(v.strip() for v in vos))
+
+
+def _st_raises(headers: list[str], needle: str) -> bool:
+    """parse_scenes(headers) must abort with `needle` in the message."""
+    try:
+        parse_scenes(_st_script(headers))
+    except SystemExit as e:
+        return needle in str(e)
+    return False
+
+
+def _st_dupe_raises(dupe_header: str) -> bool:
+    """A repeated scene id must abort. The kit renumbers positionally, so a dupe
+    silently desyncs every later image (keyed on SCRIPT number) from its narration."""
+    first = dupe_header.split("[")[0].strip()          # e.g. '## SCENE 2a'
+    try:
+        parse_scenes(_st_script([
+            "## SCENE 1 [0:00–0:10] A", f"{first} [0:10–0:20] B", dupe_header]))
+    except SystemExit as e:
+        return "duplicate scene number" in str(e)
+    return False
 
 
 def selftest() -> int:
@@ -307,6 +382,23 @@ def selftest() -> int:
         "$1,000,000 million kept verbatim": "$1,000,000" in kit and "one million" not in kit,
         "$5M suffix untouched": "$5M" in kit and "five dollars" not in kit,
         "$10 million word-suffix kept verbatim": "$10 million" in kit and "ten dollars" not in kit,
+        # --- lettered scenes + duplicate guard (2026-07-26) -------------------
+        # Before these, EVERY mutation of the lettered-scene fix left this suite
+        # green — including reverting _SCENE_RE outright. A green run carried no
+        # information about the one change it was supposed to cover.
+        "lettered scenes all parsed": _st_lettered()[0] == 4,
+        "lettered scene ids preserved": _st_lettered()[1] == ["1", "2a", "2b", "3"],
+        "kit ordinals stay 1..N": _st_lettered()[2] == [1, 2, 3, 4],
+        "no VO swallowed across lettered scenes": _st_lettered()[3] is True,
+        "duplicate scene number raises": _st_dupe_raises("## SCENE 2 [0:1-0:2] B"),
+        "duplicate lettered id raises": _st_dupe_raises("## SCENE 2a [0:1-0:2] B"),
+        # the two guards the prefix-rewrite inherited from the old `nums != 1..N`
+        "gap in scene numbers raises": _st_raises(
+            ["## SCENE 1 [0:0-0:1] A", "## SCENE 2 [0:1-0:2] B", "## SCENE 4 [0:2-0:3] D"],
+            "not contiguous"),
+        "out-of-order scenes raise": _st_raises(
+            ["## SCENE 1 [0:0-0:1] A", "## SCENE 3 [0:1-0:2] C", "## SCENE 2 [0:2-0:3] B"],
+            "out of order"),
     }
     ok = all(checks.values())
     for name, passed in checks.items():
