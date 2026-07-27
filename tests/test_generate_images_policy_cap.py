@@ -144,6 +144,62 @@ class TestPolicyCapGate(unittest.TestCase):
         self.assertIn("Proceeding on --over-cap-ok", p.stdout)
         self.assertNotIn("policy cap:", p.stderr)
 
+    def test_preflight_blocks_when_sdk_missing(self):
+        """preflight_interpreter must refuse, IN-PROCESS — never via a live provider.
+
+        The first cut of this test shelled out with `--provider openai` and tried to
+        make the SDK unimportable via PYTHONPATH. PYTHONPATH PREPENDS; it does not
+        remove site-packages — so under .venv/bin/python (the interpreter this repo
+        renders with) `import openai` succeeded, load_env_key found the live key in
+        image_factory/.env, and the test RENDERED FOR REAL. ~$0.10 per suite run, from
+        the test file whose own _run() helper documents this exact trap and defends
+        against it with --provider flux. A money-guard's tests must be $0 BY
+        CONSTRUCTION. Masking sys.modules keeps it in-process and unbillable."""
+        import unittest.mock
+        with unittest.mock.patch.dict(sys.modules, {"openai": None}):
+            with self.assertRaises(SystemExit) as cm:
+                gi.preflight_interpreter("openai", dry_run=False)
+        self.assertNotEqual(cm.exception.code, 0)
+
+    def test_preflight_is_WIRED_before_any_planning_output(self):
+        """The preflight must be CALLED from main(), ahead of the plan. $0, no network.
+
+        The two in-process checks above prove the function refuses correctly, but
+        neither says it is wired in — deleting the call from main() leaves them green
+        while the V14 defect reproduces live. Ordering IS the premise here: the bug was
+        never a bad exit code, it was ~80 lines of plan and a green spend guard printed
+        first. So assert stdout is EMPTY.
+
+        PYTHONPATH is used the way it actually works: it PRECEDES site-packages, so a
+        stub module that raises ImportError wins even under the venv. The first cut of
+        this test pointed PYTHONPATH at an empty dir and expected that to HIDE the real
+        SDK — it does not, and the test billed ~$0.10 a run instead."""
+        stub = Path(self.dir.name) / "stub"
+        stub.mkdir(exist_ok=True)
+        (stub / "openai.py").write_text('raise ImportError("stubbed for the $0 preflight test")\n')
+        p = subprocess.run(
+            [sys.executable, str(_SCRIPT), str(self.manifest), "--output", str(self.out),
+             "--ledger", str(self.ledger), "--provider", "openai"],
+            capture_output=True, text=True,
+            env={**self.env, "PYTHONPATH": str(stub)}, timeout=60)
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stdout.strip(), "",
+                         "preflight must fire BEFORE any planning output")
+
+    def test_preflight_exempts_dry_run_and_other_providers(self):
+        """The preflight must not fire where no client is constructed."""
+        import unittest.mock
+        with unittest.mock.patch.dict(sys.modules, {"openai": None}):
+            gi.preflight_interpreter("openai", dry_run=True)   # no raise
+            gi.preflight_interpreter("flux", dry_run=False)    # no raise
+
+    def test_dry_run_needs_no_sdk(self):
+        """The preflight must NOT block --dry-run: it constructs no client, and cost
+        checking from any interpreter is the habit we want to keep cheap."""
+        self._widen_manifest(3)
+        p = self._run("--dry-run")
+        self.assertIn("dry run:", p.stdout)
+
     def test_cap_values_are_the_locked_figures(self):
         """Pin the LITERALS. Every other test references the symbols, so changing a
         constant would slide through silently — the value itself is the locked thing

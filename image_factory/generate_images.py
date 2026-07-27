@@ -131,6 +131,34 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+def preflight_interpreter(provider: str, dry_run: bool) -> None:
+    """Fail FAST if THIS interpreter cannot actually render — before any planning.
+
+    WHY (2026-07-27): run under a python without the `openai` package, this script
+    printed the whole manifest header, the plan, and `spend guard: OK — 71 image(s)
+    to render` before dying at client-init. Everything up to that point reads like a
+    successful run, and the failure is one line of stderr under ~80 lines of stdout,
+    so two consecutive V14 attempts were logged as "rendered" when nothing had been
+    billed at all. The dependency is knowable in the first millisecond; checking it
+    at the end is what made a hard failure look like success.
+
+    Names the exact interpreter to re-run with, because the repo venv is the only one
+    that carries the SDK and the system python3 is what a habit reaches for."""
+    if dry_run or provider != "openai":
+        return                          # neither path constructs an OpenAI client
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        venv = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+        if venv.exists():
+            cmd = " ".join([str(venv), *sys.argv])
+            die(f"this interpreter ({sys.executable}) has no `openai` package, so "
+                f"nothing could be rendered. The repo venv has it — re-run:\n\n"
+                f"  {cmd}\n")
+        die("the `openai` package is not installed for this interpreter "
+            f"({sys.executable}) — run: pip install -r requirements.txt")
+
+
 def load_env_key(script_dir: Path) -> str | None:
     """OPENAI_API_KEY from the environment, falling back to a local .env."""
     key = os.environ.get("OPENAI_API_KEY")
@@ -488,6 +516,10 @@ def main() -> None:
     provider = args.provider or manifest.get("provider", DEFAULT_PROVIDER)
     if provider not in VALID_PROVIDERS:
         die(f"unknown provider: {provider}")
+    # FIRST thing after the provider is known, before any planning output: a run
+    # that cannot possibly render must say so now, not after printing a plan and
+    # a green spend guard. See preflight_interpreter's docstring.
+    preflight_interpreter(provider, args.dry_run)
 
     defaults = manifest.get("defaults", {})
     model = args.model or defaults.get("model", DEFAULT_MODEL)

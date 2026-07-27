@@ -85,7 +85,53 @@ def shot_order(video: int, rdir: Path) -> list[str]:
     return present
 
 
-def build(video: int, out: Path) -> int:
+def die(msg: str, code: int = 2):
+    print(f"contact_sheet: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_flags(path: str | None) -> dict[str, str]:
+    """{shot_name: short reason} for shots proposed for RE-RENDER.
+
+    A bare grid makes the reviewer hunt for which cell the prose was about; the
+    reason belongs ON the cell so Steve can agree or overrule per shot without
+    cross-referencing a separate list. Accepts {"name": "reason"} or
+    {"flags": {...}}. Unknown names are reported, not silently dropped — a typo'd
+    shot id would otherwise read as "nothing wrong with that shot"."""
+    if not path:
+        return {}
+    # --flags was EXPLICITLY requested, so any failure to honour it is fatal. Returning
+    # {} produced a sheet byte-identical to the unflagged one at rc 0 — a typo'd path
+    # rendered as "nothing wrong with any shot", which is the worst possible failure
+    # for a review artifact.
+    p = Path(path).expanduser()
+    if not p.exists():
+        die(f"--flags file not found: {p}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"--flags file is not valid JSON: {e}")
+    if isinstance(data, dict) and "flags" in data:
+        if not isinstance(data["flags"], dict):
+            die(f'--flags has a "flags" key that is not an object '
+                f'(got {type(data["flags"]).__name__}) — this silently produced a bogus '
+                f'cell named "flags" at rc 0')
+        data = data["flags"]
+    if not isinstance(data, dict):
+        die(f"--flags must be an object of {{shot_name: reason}} (or {{\"flags\": {{...}}}}), "
+            f"got {type(data).__name__}")
+    return {k: str(v) for k, v in data.items()}
+
+
+def _text_w(draw, s: str, font) -> float:
+    """Rendered width of `s`, across Pillow versions."""
+    try:
+        return font.getlength(s)
+    except AttributeError:                       # very old Pillow
+        return draw.textlength(s, font=font)
+
+
+def build(video: int, out: Path, flags: dict[str, str] | None = None) -> int:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception as e:  # pragma: no cover
@@ -101,8 +147,15 @@ def build(video: int, out: Path) -> int:
         print(f"contact_sheet: no renders found under {rdir}", file=sys.stderr)
         return 3
 
+    flags = flags or {}
+    unknown = [k for k in flags if k not in set(order)]
+    if unknown:
+        print(f"contact_sheet: {len(unknown)} flagged shot(s) not in this render set: "
+              f"{', '.join(sorted(unknown)[:5])}", file=sys.stderr)
+
     COLS = 6
-    CELL_W, CELL_H, LABEL_H, PAD, HEADER = 320, 200, 26, 6, 40
+    # taller label strip when flags are present: the reason rides under the name
+    CELL_W, CELL_H, LABEL_H, PAD, HEADER = 320, 200, (44 if flags else 26), 6, 40
     cell_total_h = CELL_H + LABEL_H
     rows = (len(order) + COLS - 1) // COLS
     W = COLS * (CELL_W + PAD) + PAD
@@ -118,8 +171,10 @@ def build(video: int, out: Path) -> int:
         fh = f
 
     present = sum(1 for n in order if (rdir / f"{n}.png").exists())
-    d.text((PAD, 10), f"Video {nn(video)} — {present}/{len(order)} rendered",
-           fill=(235, 235, 235), font=fh)
+    hdr = f"Video {nn(video)} — {present}/{len(order)} rendered"
+    if flags:
+        hdr += f"   ·   {sum(1 for n in order if n in flags)} flagged for re-render (amber)"
+    d.text((PAD, 10), hdr, fill=(235, 235, 235), font=fh)
 
     for i, name in enumerate(order):
         r, c = divmod(i, COLS)
@@ -136,10 +191,32 @@ def build(video: int, out: Path) -> int:
                 d.rectangle([x, y, x + CELL_W, y + CELL_H], fill=(60, 40, 40))
         else:
             d.rectangle([x, y, x + CELL_W, y + CELL_H], fill=(60, 40, 40))
-        d.rectangle([x, y, x + CELL_W, y + CELL_H], outline=(90, 90, 96), width=1)
+        flagged = name in flags
+        d.rectangle([x, y, x + CELL_W, y + CELL_H],
+                    outline=(212, 161, 28) if flagged else (90, 90, 96),
+                    width=4 if flagged else 1)
         short = name.replace(f"Video_{nn(video)}_Shot_", "").replace(f"Video_{nn(video)}_", "")
-        d.rectangle([x, y + CELL_H, x + CELL_W, y + CELL_H + LABEL_H], fill=(40, 40, 46))
-        d.text((x + 6, y + CELL_H + 4), short, fill=(255, 255, 255), font=f)
+        d.rectangle([x, y + CELL_H, x + CELL_W, y + CELL_H + LABEL_H],
+                    fill=(74, 56, 12) if flagged else (40, 40, 46))
+        d.text((x + 6, y + CELL_H + 4), ("* " if flagged else "") + short,
+               fill=(255, 214, 92) if flagged else (255, 255, 255), font=f)
+        if flagged:
+            # Truncate by MEASURED WIDTH, not character count: a 46-char reason
+            # measures ~335px into a 314px cell (worst case ~695px) and bled over the
+            # gold border into the neighbouring label strip.
+            # Cap first: the shrink loop is O(n) measurements, so a pathological
+            # reason (200k chars) hung. No cell can show more than ~50 chars anyway.
+            full = flags[name][:200]
+            # Reserve the ellipsis width BEFORE measuring — appending "…" after the
+            # loop swapped a 4.45px glyph for a 16px one and re-overshot the cell.
+            ell_w = _text_w(d, "…", f)
+            avail = CELL_W - 12
+            reason = full
+            if _text_w(d, reason, f) > avail:
+                while reason and _text_w(d, reason, f) > avail - ell_w:
+                    reason = reason[:-1]
+                reason += "…"
+            d.text((x + 6, y + CELL_H + 24), reason, fill=(232, 200, 130), font=f)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out)
@@ -154,10 +231,11 @@ def main() -> int:
     p.add_argument("--open", action="store_true", dest="open_",
                    help="Open the sheet in Preview after writing (macOS).")
     p.add_argument("--output", help="Override the output PNG path.")
+    p.add_argument("--flags", help="JSON {shot_name: reason} — cells to mark for re-render.")
     args = p.parse_args()
 
     out = Path(args.output) if args.output else default_output(args.video)
-    rc = build(args.video, out)
+    rc = build(args.video, out, load_flags(args.flags))
     if rc == 0 and args.open_:
         try:
             subprocess.run(["open", "-a", "Preview", str(out)],
