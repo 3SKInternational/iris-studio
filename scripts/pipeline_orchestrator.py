@@ -2791,6 +2791,68 @@ def manifest_thumbnail_entries(manifest_abs: Path, video: int) -> list[str]:
     return sorted(names)
 
 
+_BRIEF_WORD_RE = re.compile(r"(?<![a-z])brief(?![a-z])")
+
+
+def thumbnail_brief_paths(video: int) -> list[str] | None:
+    """Vault-relative paths of every thumbnail-coordinator brief on disk for this
+    video. THREE-valued on purpose:
+
+      * `[]`   — checked, none found. The coordinator never ran, so the thumbnail
+                 art about to be BILLED was authored without the brief that owns
+                 head-height / scale / gesture / title-zone geometry. Caller BLOCKS.
+      * paths  — checked, found.
+      * `None` — could NOT check (neither directory readable). Caller fails OPEN,
+                 matching every sibling guard here: "a guard that can't run is not
+                 a finding." `Path.glob` returns `[]` silently on an unreadable or
+                 non-directory path, so `[]` alone cannot distinguish "no brief"
+                 from "no vault" — and an earlier cut that conflated them emitted
+                 "dispatch thumbnail-coordinator" for what was actually a missing
+                 directory, and broke 5 unrelated tests whose fixtures stub
+                 `vault_abs` to a file.
+
+    Why this is a spend gate (Steve, 2026-07-27): the routing was never wired. At
+    the time this landed, 7 of the first 14 videos had billed thumbnail art with
+    the coordinator never dispatched, and the V14 miss surfaced only because Steve
+    asked "did the thumbnail agent ok these?" AFTER the batch had billed (V14 was
+    then briefed retroactively, same day). Don't re-hardcode the live coverage
+    list in a comment — it moves; call this function. The art renders in
+    the stage-5 billed batch (scene-image-prompt-generator "Thumbnail art in the
+    billed batch"), so the enforcement point is the spend gate, not the manifest
+    contents — an earlier attempt to block thumbnail ENTRIES was premise-wrong
+    and reverted.
+
+    Scope caveat: this answers "did the coordinator ever brief this video", NOT
+    "did it brief THIS batch" — a months-old `_repackage` brief satisfies it. That
+    is deliberate for a routing gate; recency is the reviewer's job."""
+    out: list[str] = []
+    checked = False
+    for sub in ("Thumbnails", "Packaging"):
+        # BOTH dirs are load-bearing: V03's only brief is
+        # Packaging/Video_03_Thumbnail_Brief.md with no Thumbnails/ copy, so
+        # "simplifying" to one directory silently false-blocks it.
+        d = vault_abs(f"{VAULT_REL}/{sub}")
+        if not d:
+            continue
+        try:
+            entries = list(d.iterdir())
+        except OSError:            # missing, unreadable, or not a directory
+            continue
+        checked = True
+        # Match on the LOWERED name: pathlib.glob is case-sensitive even on a
+        # case-insensitive APFS volume, so a `Video_NN_Thumbnail*Brief*.md` glob
+        # silently skipped `Video_08_Thumbnail_B_regen_brief.md` and would have
+        # blocked a video whose coordinator DID run. Lowering the whole comparison
+        # closes the same hole for `Video_`/`Thumbnail`/`.md` too. "brief" is
+        # word-bounded so `_Debrief`/`_Briefing` don't satisfy a spend gate, and
+        # the `.md` tail keeps a stray `..._Brief.md.bak` from counting.
+        pref = f"video_{nn(video)}_thumbnail"
+        out += [f"{VAULT_REL}/{sub}/{p.name}" for p in entries
+                if (nm := p.name.lower()).startswith(pref)
+                and nm.endswith(".md") and _BRIEF_WORD_RE.search(nm)]
+    return sorted(out) if checked else None
+
+
 def _run_manifest_spine_lint(video: int, manifest_abs) -> tuple | None:
     """A-46 (2026-07-24, Steve-✅): deterministic $0 pre-spend spine lint, run
     in-process. cmd_spend_ok calls it twice — before the LLM review loop (cheap
@@ -2939,6 +3001,12 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
                     f"scene-image-prompt-generator def. Drop --force to block.")
             print(line)
             notify(line)
+        if thumbs and thumbs != ["<unreadable>"] and thumbnail_brief_paths(video) == []:
+            line = (f"⚠️ Video {video}: --force spend billing {', '.join(thumbs)} with NO "
+                    f"thumbnail-coordinator brief on disk — the head-height/scale/gesture "
+                    f"geometry is un-briefed. Drop --force to block.")
+            print(line)
+            notify(line)
         # A-46 spine lint: under --force we never block, but a FAIL still shouts —
         # a Steve override shouldn't silently bill dup-named or invented-figure shots.
         res = _run_manifest_spine_lint(video, manifest_abs)
@@ -3000,6 +3068,33 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
                         f"variant before stage 8 for the A/B pair.")
                 print(line)
                 notify(line)
+            # thumbnail-coordinator provenance (Steve, 2026-07-27). Thumbnail art
+            # is about to bill; refuse unless the coordinator brief that owns its
+            # geometry actually exists. Fails CLOSED only when there IS thumbnail
+            # art to gate (a manifest with no thumbnails already blocked above) AND
+            # the directories were actually readable — `None` means the guard could
+            # not run, which fails OPEN like every sibling here.
+            briefs = thumbnail_brief_paths(video)
+            if briefs is None:
+                print(f"⚠️ Video {video}: could not read the brief directories — "
+                      f"skipping the thumbnail-coordinator provenance check "
+                      f"(fail-open; the image-review gate still applies).")
+            elif not briefs:
+                s["note"] = (f"spend refused: no thumbnail-coordinator brief for video "
+                             f"{video} — {len(thumbs)} thumbnail entr(y/ies) would bill "
+                             f"un-briefed")
+                sf.save()
+                line = (f"🛑 Video {video}: {manifest_rel} bills {', '.join(thumbs)} but NO "
+                        f"thumbnail-coordinator brief exists — refusing to spend. The brief "
+                        f"owns head-height/scale/gesture/title-zone geometry; art authored "
+                        f"without it is what shipped V05-07/V09-11 un-briefed. Fix: dispatch "
+                        f"thumbnail-coordinator, save "
+                        f"{VAULT_REL}/Thumbnails/Video_{nn(video)}_Thumbnail_Brief.md, "
+                        f"reconcile the manifest prompts to its Pass A, then re-run spend-ok "
+                        f"(or override with --force).")
+                print(line)
+                notify(line)
+                return 2
         # A-46 deterministic spine lint — fails CLOSED on a lint FAIL (dup image
         # names / untraceable card figures / banned vocab / broken JSON — all $0
         # to catch here, real money after). Lint-side rc 2 (missing script) and

@@ -938,6 +938,113 @@ class TestSpendOkThumbnailGuard(unittest.TestCase):
                 pass
 
 
+class TestSpendOkThumbnailBriefGuard(unittest.TestCase):
+    """thumbnail-coordinator provenance guard inside cmd_spend_ok (2026-07-27).
+
+    Thumbnail ART bills inside the stage-5 batch by design, so "did the coordinator
+    actually run?" must be answered before money moves. It never was: 7 of the first
+    14 videos (V05-07, V09-11, V14) billed thumbnail art with no brief, and V14's
+    miss surfaced only because Steve asked after the fact.
+
+    These pin the WIRING, not the helper (tests/test_thumbnail_brief_guard.py pins
+    the file-matching). Both halves are needed: a mutation pass found that with the
+    helper fully covered, `if False:` at the call site — the gate simply never
+    firing — still left a green suite."""
+
+    def _ready_stages(self):
+        return _mark_done(_stages(), "2_review")
+
+    def _patch(self, briefs):
+        """cmd_spend_ok with a full A/B thumbnail pair, and `thumbnail_brief_paths`
+        stubbed to `briefs` ([] = none found, None = could not check, list = found).
+        Returns (restore, spy)."""
+        manifest = {"images": [
+            {"name": "Video_03_Shot_01", "use_references": True, "prompt": "Three waves."},
+            {"name": "Video_03_Thumbnail_A", "use_references": True, "prompt": "Split."},
+            {"name": "Video_03_Thumbnail_B", "use_references": True, "prompt": "Closeup."},
+        ]}
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_hd.json", delete=False, encoding="utf-8")
+        json.dump(manifest, tmp)
+        tmp.close()
+        manifest_path = Path(tmp.name)
+
+        saved = (po.reconcile_orphans, po.vault_abs, po.notify, po.subprocess.run,
+                 po.run_prompt_review_loop, po._run_manifest_spine_lint,
+                 po.thumbnail_brief_paths)
+        po.reconcile_orphans = lambda _s, _v: None
+        po.vault_abs = lambda rel: manifest_path
+        po.notify = lambda *a, **k: None
+        po._run_manifest_spine_lint = lambda _v, _m: None
+        # Record the video argument, don't discard it. A stub of the form
+        # `lambda _v: briefs` let `thumbnail_brief_paths(video + 1)` survive
+        # mutation testing — which in the real corpus would false-PASS V07 by
+        # gating on V08's brief, the exact miss this gate exists to catch.
+        spy = {"gen": False, "asked": []}
+        po.thumbnail_brief_paths = lambda v: (spy["asked"].append(v), briefs)[1]
+
+        def _spy_run(*a, **k):
+            spy["gen"] = True
+            return _Proc(0, stdout="generated")
+        po.subprocess.run = _spy_run
+        po.run_prompt_review_loop = lambda video, manifest_rel: ("SHIP", "rel", "ok")
+
+        def restore():
+            (po.reconcile_orphans, po.vault_abs, po.notify, po.subprocess.run,
+             po.run_prompt_review_loop, po._run_manifest_spine_lint,
+             po.thumbnail_brief_paths) = saved
+            try:
+                manifest_path.unlink()
+            except OSError:
+                pass
+        return restore, spy
+
+    def test_no_brief_blocks_spend(self):
+        # The V14 case: thumbnail art in the batch, coordinator never dispatched.
+        restore, spy = self._patch([])
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 2)
+            self.assertFalse(spy["gen"], "un-briefed thumbnail art must not bill")
+            # Pin the ARGUMENT too: `lambda _v: briefs` let a mutation to
+            # thumbnail_brief_paths(video + 1) survive, which would gate V07 on
+            # V08's brief — a false PASS of exactly the class this gate catches.
+            self.assertEqual(spy["asked"], [3])
+        finally:
+            restore()
+
+    def test_brief_present_does_not_block(self):
+        # The other direction matters as much: a false BLOCK on the 7 videos that
+        # DID get a brief teaches the next operator to reach for --force.
+        restore, spy = self._patch(["BRANDS/3SK_Finance/Thumbnails/Video_03_Thumbnail_Brief.md"])
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "a briefed batch must spend normally")
+            # Pin the ARGUMENT too: `lambda _v: briefs` let a mutation to
+            # thumbnail_brief_paths(video + 1) survive, which would gate V07 on
+            # V08's brief — a false PASS of exactly the class this gate catches.
+            self.assertEqual(spy["asked"], [3])
+        finally:
+            restore()
+
+    def test_unreadable_brief_dirs_fail_open(self):
+        # None == "could not check". Every sibling guard here fails OPEN on its own
+        # infra failure; conflating that with "no brief" is what broke 5 unrelated
+        # tests whose fixtures stub vault_abs to a file.
+        restore, spy = self._patch(None)
+        try:
+            rc = po.cmd_spend_ok(_FakeSF(self._ready_stages()))
+            self.assertEqual(rc, 0)
+            self.assertTrue(spy["gen"], "a guard that cannot run must not block a spend")
+            # Pin the ARGUMENT too: `lambda _v: briefs` let a mutation to
+            # thumbnail_brief_paths(video + 1) survive, which would gate V07 on
+            # V08's brief — a false PASS of exactly the class this gate catches.
+            self.assertEqual(spy["asked"], [3])
+        finally:
+            restore()
+
+
 class TestSpendOkSpineLintGuard(unittest.TestCase):
     """A-46: the deterministic pre-spend manifest spine lint inside cmd_spend_ok.
 
