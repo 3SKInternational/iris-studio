@@ -137,6 +137,10 @@ INFRA_FAILURE_MARKERS = (
     "resource temporarily unavailable",  # EAGAIN — host fork/thread exhaustion
     "too many open files",               # EMFILE — host fd-limit (launchd RLIMIT_NOFILE)
     "command not found",                 # the claude CLI itself missing from PATH
+    "mutation-run-active",               # build_video.py's mutation-crash guard (self)
+                                         # collided with a LIVE mutation pass, not a dead
+                                         # one — self-clearing in ~100s, same shape as
+                                         # quota-limit. Added MEDIUM-1, 2026-07-27.
     "reviewer-unavailable",              # a BINARY review gate could not RUN (timeout/
                                          # outage/auth-wobble). Treat as infra so the stage
                                          # is left 'ready' and retried — NEVER fail-open
@@ -1150,7 +1154,38 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
         return False, f"build_video.py --assemble timed out after {cfg['timeout']}s"
     if proc.returncode != 0:
         return False, f"build_video.py exited {proc.returncode}: {(proc.stderr or '')[-500:]}"
-    return True, (proc.stdout or "").strip()[-300:]
+    out = (proc.stdout or "").strip()[-300:]
+    warn = (proc.stderr or "").strip()
+    if warn:
+        # MEDIUM-1 (round 18, 2026-07-28). build_video.py's dropped-shot warning
+        # (a shot-shaped image name that failed to parse — currently 18 in
+        # video_04_hd.json, 1 in video_13_hd.json) prints to stderr, which this
+        # function discarded outright on the SUCCESS path (rc==0). Nobody reads
+        # it: the live Telegram line built from a "ran_done" AdvanceResult never
+        # includes `out` at all, and the hourly sweep is --quiet-idle. `out` DOES
+        # land in the stage's state-file `note` via _on_success (`s["note"] =
+        # (out or "")[-300:]`), which is durable and what a human/scanner
+        # actually reads later — so fold stderr in here instead of leaving it
+        # stuck on a pipe nothing drains.
+        #
+        # HIGH-2 (round 20): appending warn[-300:] survives _on_success's own
+        # [-300:] as a BLOCK, but not its HEAD — the cause ("N shot-shaped
+        # name(s) ... DROPPED", the manifest filename) sits at the FRONT of
+        # build_video's warning, so tail-slicing it strips exactly the part a
+        # reader needs and leaves a bare list of shot names. Bound the combined
+        # string to <=300 chars ourselves so _on_success's cut is a no-op, and
+        # head-slice the warning so the cause survives instead of the tail.
+        #
+        # MEDIUM-A (round 22): `out` (above) is the OPPOSITE case — it's
+        # already a TAIL slice (`[-300:]` at the top of this function), and
+        # its one meaningful line, build_video's `done. Draft video -> ...`
+        # artifact path, is printed LAST. So `out` must be tail-sliced again
+        # (`out[-50:]`) while `warn` is head-sliced (`warn[:230]`) — the two
+        # halves slice from opposite ends on purpose, matching where each
+        # one's meaningful content actually sits. Do not "fix" this back to
+        # matching slice directions; that reintroduces a dropped artifact path.
+        out = f"{out[-50:]}\nSTDERR: {warn[:230]}"
+    return True, out
 
 
 def _warn_thumbnail_name_drift(video: int, manifest_abs: Path) -> None:
@@ -3487,6 +3522,55 @@ def cmd_supervise() -> int:
 # === Main ==================================================================
 
 def main() -> int:
+    # Refuse to run if a mutation-testing run died mid-flight on THIS file. Same
+    # guard as build_video.py:1638 — copied, not shared, per that file's own
+    # comment (two 4-line copies beat a shared helper module for this). This is
+    # the OTHER hourly launchd target (com.iris.claude-code-pipeline-sweep runs
+    # --advance-all directly, not via build_video.py), and it owns cmd_spend_ok,
+    # the RENDERS gate and run_script_review_gate — a mutant left on disk here by
+    # a SIGKILL/OOM/power-loss would otherwise execute silently on the next sweep.
+    _orig = Path(__file__).with_suffix(".py.mutate.orig")
+    if _orig.is_file() and not os.environ.get("SK_MUTATION_RUN"):
+        # MEDIUM-1 (round 12, ported round 14): this sidecar also exists BY DESIGN
+        # for ~100s per live 80-mutant gate run, and this is the file the hourly
+        # pipeline sweep runs directly — the exact collision window. The refusal
+        # is correct either way, but the crash-recovery cp/rm advice below is
+        # actively dangerous if followed DURING that window. Same guard as
+        # build_video.py:1649-1673 — copied, not shared, per this block's own
+        # comment above.
+        holder, alive = "", False
+        try:
+            import importlib.util as _ilu
+            _mspec = _ilu.spec_from_file_location(
+                "_mutate_lock_check", Path(__file__).resolve().parent / "mutate.py")
+            _mut = _ilu.module_from_spec(_mspec)
+            _mspec.loader.exec_module(_mut)
+            holder = _mut.LOCK.read_text().split()[0]
+            os.kill(int(holder), 0)
+            alive = True
+        except PermissionError:
+            alive = True
+        except Exception:
+            alive = False
+        if holder and alive:
+            # mutation-run-active: this call is inside main(), before any stage
+            # exists, so INFRA_FAILURE_MARKERS/_is_infra_failure (which classify a
+            # STAGE's error string from run_script_stage) never see it — that
+            # machinery covers build_video's copy of this guard (reached via
+            # run_script_stage), not this one. Here the classification is done by
+            # the exit code alone: 75 = EX_TEMPFAIL, so run_job.sh (which wraps the
+            # hourly --advance-all sweep) treats this as "target unavailable, did
+            # nothing" — silent, no red alert, retry marker dropped instead of
+            # burning a MAX_FAILS slot on a refusal that will clear on its own.
+            die(f"{_orig.name} exists and a mutation run is ACTIVE (pid {holder}) — "
+                f"this refusal is correct and temporary; do NOT cp/rm anything "
+                f"below, just re-run after it finishes. (mutation-run-active)",
+                code=75)
+        die(f"{_orig.name} exists — a mutation-testing run died mid-flight and this "
+            f"file may be MUTATED. Refusing to run. Recover:\n"
+            f"    diff {_orig} {__file__}\n"
+            f"    cp {_orig} {__file__}   # only if the diff is a mutation\n"
+            f"    rm {_orig}")
     install_agent_reaper()  # a dying orchestrator must take its detached agents with it
     p = argparse.ArgumentParser(description="Pipeline orchestrator (deterministic video sequencer).")
     p.add_argument("--video", type=int, default=None,

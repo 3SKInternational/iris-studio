@@ -47,3 +47,16 @@ image_factory/cost_ledger.jsonl
 
 # Watch packs from scripts/watch_video.py — downloaded third-party video frames/transcripts (data, not code)
 video_studies/
+
+# Pre-review gate scratch (scripts/mutate.py): the lock, its pristine sidecar,
+# atomic-write temps, and the self-test victim. All are transient; a crashed run
+# can leave the lock + .orig behind on purpose so the next run can recover.
+.mutate.lock
+*.mut
+*.mutrestore
+# PID-scoped (tests/test_mutate.py runs in parallel): matches
+# _mutate_selftest_victim_<pid>.py / _alpha_<pid>.py / _beta_<pid>.py.
+_mutate_selftest_*.py
+
+# Per-target pristine copies written by scripts/mutate.py
+*.mutate.orig

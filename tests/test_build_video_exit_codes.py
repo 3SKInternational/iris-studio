@@ -18,6 +18,7 @@ or under the suite:
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -204,6 +205,69 @@ class TestBuildVideoArtifactVerify(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_derive_branch_runs_the_kit_ordinal_cross_check(self):
+        """The `verify_derived_ordinals(...)` CALL must exist on the no-shot-list path.
+
+        Mutation testing structurally cannot pin this: a bare `Expr` call statement
+        has no mutant, so deleting the line leaves every suite green (verified).
+        And every other fixture in this class writes a Shot_List.md, so the derive
+        branch is never entered through main() at all — the whole tail-truncation
+        guard was one unasserted line.
+
+        Shape: no Shot_List (forces derive), an annotated kit whose ordinal 4 is
+        script scene `4c`, and a manifest with 04c trimmed away — which passes every
+        structural guard and is caught only by the kit cross-check.
+        """
+        bv = _load_build_video()
+        with tempfile.TemporaryDirectory() as tds:
+            td = Path(tds)
+            (td / "Voice_Files" / "Video_97").mkdir(parents=True)
+            (td / "Raw_Assets" / "Image_Factory" / "manifests").mkdir(parents=True)
+            (td / "Voice_Files" / "Video_97" / "_VO_Session_B_Kit.md").write_text(
+                "# Video_97 VO Kit\n\n"
+                "## Scene 1 -> `a.mp3` (src SCENE 1a; A)\n\nx\n\n---\n\n"
+                "## Scene 2 -> `b.mp3` (src SCENE 1b; B)\n\nx\n\n---\n\n"
+                "## Scene 3 -> `c.mp3` (src SCENE 1c; C)\n\nx\n\n---\n\n"
+                "## Scene 4 -> `d.mp3` (src SCENE 2; D)\n\nx\n\n---\n",
+                encoding="utf-8")
+            (td / "Raw_Assets" / "Image_Factory" / "manifests"
+                / "video_97_hd.json").write_text(json.dumps({"images": [
+                    {"name": "Video_97_Shot_01a_1", "prompt": "p"},
+                    {"name": "Video_97_Shot_01b_1", "prompt": "p"},
+                    {"name": "Video_97_Shot_02_1", "prompt": "p"},
+                ]}), encoding="utf-8")
+            # Stub write_json: build_video authors its orchestrated manifests into
+            # the REPO, not the vault, so an unstubbed run leaves Video_97_*.json
+            # residue in the working tree. A test that dirties the tree it is
+            # verifying is worse than no test.
+            orig_write = bv.write_json
+            bv.write_json = lambda *a, **k: None
+            argv, err = sys.argv, io.StringIO()
+            sys.argv = ["build_video.py", "Video_97"]
+            prior_vault = os.environ.get("SK_VAULT")
+            os.environ["SK_VAULT"] = str(td)
+            try:
+                with self.assertRaises(SystemExit) as cm, \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(err):
+                    bv.main()
+                self.assertNotIn(cm.exception.code, (0, None))
+                self.assertIn("disagree", err.getvalue())
+            finally:
+                bv.write_json = orig_write
+                sys.argv = argv
+                # An unconditional pop() clobbers a real pre-existing SK_VAULT for
+                # every later test in this process — restore what was there, not
+                # just "unset".
+                if prior_vault is None:
+                    os.environ.pop("SK_VAULT", None)
+                else:
+                    os.environ["SK_VAULT"] = prior_vault
+                for stray in (_REPO / "image_factory" / "manifests",
+                              _REPO / "video_factory" / "manifests"):
+                    for f in stray.glob("Video_97_*"):
+                        f.unlink(missing_ok=True)
+
     def test_vo_stage_exit0_no_mp3_fails_build(self):
         bv = _load_build_video()
         with tempfile.TemporaryDirectory() as tds:
@@ -214,6 +278,7 @@ class TestBuildVideoArtifactVerify(unittest.TestCase):
             bv.write_json = lambda *a, **k: None       # ...but no manifest/repo writes
             argv = sys.argv
             sys.argv = ["build_video.py", "Video_99", "--vo"]
+            prior_vault = os.environ.get("SK_VAULT")
             os.environ["SK_VAULT"] = str(td)
             try:
                 with self.assertRaises(SystemExit) as cm, \
@@ -225,7 +290,10 @@ class TestBuildVideoArtifactVerify(unittest.TestCase):
             finally:
                 bv.run, bv.write_json = orig_run, orig_write
                 sys.argv = argv
-                os.environ.pop("SK_VAULT", None)
+                if prior_vault is None:
+                    os.environ.pop("SK_VAULT", None)
+                else:
+                    os.environ["SK_VAULT"] = prior_vault
 
     def test_vo_stage_exit0_with_mp3_passes(self):
         # Same path, but the artifact IS present -> the verify must NOT false-fail.
@@ -241,6 +309,7 @@ class TestBuildVideoArtifactVerify(unittest.TestCase):
             bv.write_json = lambda *a, **k: None
             argv = sys.argv
             sys.argv = ["build_video.py", "Video_99", "--vo"]
+            prior_vault = os.environ.get("SK_VAULT")
             os.environ["SK_VAULT"] = str(td)
             try:
                 with contextlib.redirect_stdout(io.StringIO()), \
@@ -249,7 +318,10 @@ class TestBuildVideoArtifactVerify(unittest.TestCase):
             finally:
                 bv.run, bv.write_json = orig_run, orig_write
                 sys.argv = argv
-                os.environ.pop("SK_VAULT", None)
+                if prior_vault is None:
+                    os.environ.pop("SK_VAULT", None)
+                else:
+                    os.environ["SK_VAULT"] = prior_vault
 
 
 class TestBlankPillDetection(unittest.TestCase):
@@ -345,6 +417,7 @@ class TestBlankPillGuard(unittest.TestCase):
         sys.argv = ["build_video.py", "Video_98", "--assemble", "--no-cta"]
         if use_image_set:
             sys.argv += ["--image-set", "Raw_Assets/Video_98_HD"]
+        prior_vault = os.environ.get("SK_VAULT")
         os.environ["SK_VAULT"] = str(td)
         try:
             buf = io.StringIO()
@@ -358,7 +431,10 @@ class TestBlankPillGuard(unittest.TestCase):
         finally:
             bv.run, bv.write_json = orig_run, orig_write
             sys.argv = argv
-            os.environ.pop("SK_VAULT", None)
+            if prior_vault is None:
+                os.environ.pop("SK_VAULT", None)
+            else:
+                os.environ["SK_VAULT"] = prior_vault
 
     def test_blank_pill_no_spec_aborts(self):
         with tempfile.TemporaryDirectory() as tds:
@@ -525,6 +601,7 @@ class TestDataCardGuard(unittest.TestCase):
         argv = sys.argv
         sys.argv = ["build_video.py", "Video_97", "--assemble", "--no-cta",
                     "--image-set", "Raw_Assets/Video_97_HD"]
+        prior_vault = os.environ.get("SK_VAULT")
         os.environ["SK_VAULT"] = str(td)
         try:
             buf = io.StringIO()
@@ -538,7 +615,10 @@ class TestDataCardGuard(unittest.TestCase):
         finally:
             bv.run, bv.write_json = orig_run, orig_write
             sys.argv = argv
-            os.environ.pop("SK_VAULT", None)
+            if prior_vault is None:
+                os.environ.pop("SK_VAULT", None)
+            else:
+                os.environ["SK_VAULT"] = prior_vault
 
     def test_data_card_no_spec_aborts(self):
         with tempfile.TemporaryDirectory() as tds:

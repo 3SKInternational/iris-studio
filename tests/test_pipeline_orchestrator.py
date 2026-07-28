@@ -17,6 +17,8 @@ assumed), and STATE_DIR is monkeypatched onto a tmpdir only for discover_videos.
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -29,6 +31,10 @@ _MODULE_PATH = _HERE.parent / "scripts" / "pipeline_orchestrator.py"
 _spec = importlib.util.spec_from_file_location("pipeline_orchestrator", _MODULE_PATH)
 po = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(po)
+# NOTE: the module-level `mut` (scripts/mutate.py) import that used to live here
+# was dropped (round 16, 2026-07-27) — TestMutationCrashGuard now runs entirely
+# against a private tmp copy (see its docstring), so nothing in this file reads
+# the production mutate.py module directly any more.
 
 
 def _stages(**overrides):
@@ -1291,6 +1297,157 @@ class TestAssembleImageGate(unittest.TestCase):
         finally:
             (po.run_image_review, po.subprocess.run, po.notify) = saved
 
+    def test_success_folds_stderr_warning_into_the_state_note(self):
+        """MEDIUM-1 (round 18, 2026-07-28). build_video.py's dropped-shot warning
+        prints to stderr, and this function used to return only stdout on the
+        rc==0 path — so the warning never reached _on_success's `s["note"]`,
+        the one place a human/scanner actually reads it later. Pin that it does
+        now, on the SAME build_video.py:~300 shape (a real skipped-name line)."""
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            po.subprocess.run = lambda *a, **k: _Proc(
+                0, stdout="assembled",
+                stderr="warning: video_04_hd.json: 18 shot-shaped name(s) did "
+                       "not parse and were DROPPED — Video_04_Shot_04a2.")
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "SHIP", "rel", "clean")
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertTrue(ok)
+            self.assertIn("STDERR: warning:", msg)
+            self.assertIn("DROPPED", msg)
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+    def test_success_stdout_and_stderr_bounds_in_the_fold(self):
+        """HIGH-2 (round 20) / MEDIUM-A,B (round 22). Retires the round-18
+        fixture that pinned out[-300:]+"\\nSTDERR: "+warn[-300:] as correct —
+        that shape passes run_script_stage but is destroyed by _on_success's
+        OWN [-300:], which strips the FRONT of the combined string, i.e.
+        exactly where build_video's warning puts its cause. The fix bounds
+        the fold itself to out[-50:]+"\\nSTDERR: "+warn[:230] (<=300 total, so
+        _on_success's cut is a guaranteed no-op): warn is head-sliced because
+        the cause sits at the FRONT of build_video's warning, but `out` is
+        ALSO tail-sliced (not head-sliced) because it is already a tail slice
+        of stdout ([-300:] applied earlier in this function) whose one
+        meaningful line — the `done. Draft video -> ...` artifact path — is
+        printed LAST.
+
+        The round-22 fixture regressed this: it used a <=300-char stdout, so
+        the earlier [-300:] was a no-op and out[:50] vs out[-50:] merely
+        picked different characters of the SAME untouched string — it never
+        exercised the two-step truncation the real bug depends on, and its
+        assertion pinned the out[:50] (wrong-direction) value, so a correct
+        out[-50:] fix read as a test failure. Fixed here: stdout_in is >>300
+        chars so the first [-300:] actually truncates, and the marker sits at
+        stdout_in's true last character — the only place a tail-slice-of-a-
+        tail-slice can find it."""
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            # 1050 chars total, clearly longer than the 1157 [-300:] window,
+            # so this fixture exercises out's OWN prior truncation. 'Q' is
+            # the true last character of stdout — it must survive both the
+            # [-300:] and the [-50:] slice.
+            stdout_in = "a" * 1000 + "b" * 49 + "Q"
+            stderr_in = "c" * 229 + "Z" + "c" * 100   # 'Z' is the 230th char (last kept)
+            po.subprocess.run = lambda *a, **k: _Proc(0, stdout=stdout_in, stderr=stderr_in)
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "SHIP", "rel", "clean")
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertTrue(ok)
+            self.assertEqual(msg, "b" * 49 + "Q" + "\nSTDERR: " + "c" * 229 + "Z",
+                              "stdout must be TAIL-sliced (out[-50:]), not "
+                              "head-sliced — the artifact path build_video "
+                              "prints last must survive")
+            self.assertLessEqual(len(msg), 300,
+                                  "combined must fit so _on_success's own cut is a no-op")
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+    def test_success_stderr_cause_survives_on_success_truncation(self):
+        """HIGH-2 (round 20). The round-18 fold survived run_script_stage's
+        return but not the SECOND truncation in _on_success (`s["note"] =
+        (out or "")[-300:]`) — that cut is from the TAIL, and build_video's
+        dropped-shot warning puts its cause (the count, filename, "DROPPED")
+        at the FRONT, so the old tail-sliced fold lost the cause and kept only
+        a bare list of shot names. Runs the composed string through the REAL
+        _on_success (not just run_script_stage's return) with the verbatim
+        476-char V04 warning and asserts the cause is what a scanner reading
+        the state-file note would actually see."""
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            warn = (
+                "warning: video_04_hd.json: 18 shot-shaped name(s) did not parse "
+                "and were DROPPED — Video_04_Shot_04a2, Video_04_Shot_04d2, "
+                "Video_04_Shot_05a2, Video_04_Shot_06a2, Video_04_Shot_06c2, "
+                "Video_04_Shot_07a2, Video_04_Shot_07a3, Video_04_Shot_07c2, "
+                "Video_04_Shot_08a2, Video_04_Shot_08a3, Video_04_Shot_08a4, "
+                "Video_04_Shot_08b2, Video_04_Shot_08c2, Video_04_Shot_08c3, "
+                "Video_04_Shot_08d2, Video_04_Shot_08e2, Video_04_Shot_09a2, "
+                "Video_04_Shot_11b2. Rename to Shot_NNa or Shot_NNa_N."
+            )
+            self.assertEqual(len(warn), 476, "fixture drifted from the real V04 warning")
+            po.subprocess.run = lambda *a, **k: _Proc(0, stdout="assembled", stderr=warn)
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "SHIP", "rel", "clean")
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertTrue(ok)
+
+            saved_art = po._producer_artifact_ok
+            po._producer_artifact_ok = lambda key, video: (True, "")
+            try:
+                s: dict = {}
+                done, _ = po._on_success(s, "6_assemble", 3, msg)
+            finally:
+                po._producer_artifact_ok = saved_art
+            self.assertTrue(done)
+            note = s["note"]
+            self.assertIn("DROPPED", note, f"cause dropped by the second truncation: {note!r}")
+            self.assertIn("video_04_hd", note, f"filename dropped: {note!r}")
+            self.assertIn("18", note, f"count dropped: {note!r}")
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+    def test_success_stdout_alone_truncates_at_exactly_300_chars(self):
+        """Round-20 mutation-gate finding: `out = stdout.strip()[-300:]` (the
+        FIRST slice, line ~1157) survived int+1 '300'->'301' -- nothing pinned
+        it standalone. The stderr-present path bounds its OWN combined string
+        to <=300 regardless (out[:50]+"\\nSTDERR: "+warn[:230]), so that path
+        can never observe this slice's exact boundary; only the no-stderr path,
+        where `out` is returned unchanged, can."""
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            stdout_301 = "Q" + "a" * 300   # marker at position -301
+            po.subprocess.run = lambda *a, **k: _Proc(0, stdout=stdout_301)
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "SHIP", "rel", "clean")
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertTrue(ok)
+            self.assertNotIn("Q", msg, "stdout kept 301+ chars, not 300")
+            self.assertEqual(msg, "a" * 300)
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
+    def test_success_with_no_stderr_has_no_stderr_marker(self):
+        """The flip side of the fixture above: a clean run (no stderr) must NOT
+        grow a 'STDERR:' marker out of nowhere — pins that the fold-in is
+        conditional on `warn`, not unconditional."""
+        saved = (po.run_image_review, po.subprocess.run, po.notify)
+        try:
+            po.subprocess.run = lambda *a, **k: _Proc(0, stdout="assembled")
+            po.notify = lambda *a, **k: None
+            po.run_image_review = lambda mode, video, manifest_rel=None: (
+                "SHIP", "rel", "clean")
+            ok, msg = po.run_script_stage("6_assemble", 3)
+            self.assertTrue(ok)
+            self.assertNotIn("STDERR:", msg)
+            self.assertEqual(msg, "assembled")
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify) = saved
+
 
 class TestCanonicalManifest(unittest.TestCase):
     """canonical_manifest_rel: the ONE billed manifest the reviewer audits, the
@@ -1435,6 +1592,148 @@ class TestRunPromptFixerMissingAgent(unittest.TestCase):
             self.assertIn("not found", detail)
         finally:
             po.AGENTS_DIR = old
+
+
+class TestMutationCrashGuard(unittest.TestCase):
+    """HIGH-2 (round 12 review): the mutation-crash guard build_video.py has
+    must ALSO protect pipeline_orchestrator.py — the OTHER hourly launchd
+    target (com.iris.claude-code-pipeline-sweep runs `--advance-all` on THIS
+    file directly, not via build_video.py). A mutant left on disk by a
+    SIGKILL/OOM/power-loss would otherwise execute silently on the next
+    sweep, and this file owns cmd_spend_ok, the RENDERS gate and
+    run_script_review_gate — strictly worse than the build_video.py case,
+    which is at least spawned BY the (now also guarded) orchestrator.
+
+    Invoked as a real subprocess, not in-process: main() calls
+    install_agent_reaper() right after the guard, which installs process-wide
+    SIGINT/SIGTERM handlers — that must land in a throwaway child process, not
+    hijack the signal handlers of the test runner itself (see that function's
+    own docstring: 'Called from main() ONLY — never at import... would hijack
+    them from any process that merely imports this module (the daemon, the
+    test suites).').
+
+    ISOLATED TREE (round 16, 2026-07-27): a prior cut wrote directly to the
+    REAL `.mutate.lock` / `pipeline_orchestrator.py.mutate.orig` in the repo
+    root — the exact `if exists(): ... write()` TOCTOU shape mutate.py's own
+    module docstring forbids on those primitives (a real mutate.py run racing
+    this fixture gets its lock clobbered then unlinked, and its pristine
+    sidecar deleted out from under it). setUp copies only the guard's
+    dependency closure — this target plus scripts/mutate.py, same relative
+    layout so each file's own __file__-derived paths resolve the same way
+    they do in the real repo — into a private tmp_root per test. Nothing below
+    ever opens the real LOCK or sidecar, so parallel test runs (or a real
+    concurrent mutation pass) cannot collide with this fixture or each other.
+    """
+
+    def setUp(self):
+        self.guard_root = Path(tempfile.mkdtemp(prefix="po_guard_tree_"))
+        (self.guard_root / "scripts").mkdir()
+        shutil.copy(_HERE.parent / "scripts" / "mutate.py",
+                    self.guard_root / "scripts" / "mutate.py")
+        self.guard_target = self.guard_root / "scripts" / "pipeline_orchestrator.py"
+        shutil.copy(_MODULE_PATH, self.guard_target)
+        self.guard_lock = self.guard_root / ".mutate.lock"
+        self.guard_sidecar = self.guard_target.with_suffix(
+            self.guard_target.suffix + ".mutate.orig")
+
+    def tearDown(self):
+        shutil.rmtree(self.guard_root, ignore_errors=True)
+
+    def test_refuses_to_run_with_a_mutate_sidecar_present(self):
+        # This is the CRASH (died-mid-flight) branch. guard_lock is a private
+        # tmp path nothing else can be holding, so — unlike the old fixture,
+        # which shared the real .mutate.lock with mutate.py's own outer pass
+        # and had to skip when nested inside one — no live-lock caveat is
+        # needed here; this scenario is unconditionally the crash branch.
+        self.guard_sidecar.write_text(self.guard_target.read_text(encoding="utf-8"))
+        env = {k: v for k, v in os.environ.items() if k != "SK_MUTATION_RUN"}
+        r = subprocess.run([sys.executable, str(self.guard_target),
+                            "--status", "--video", "999999"],
+                           capture_output=True, text=True, timeout=30, env=env)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mutate.orig", out)
+        self.assertIn("Refusing to run", out)
+
+    def test_stands_down_under_sk_mutation_run(self):
+        # SK_MUTATION_RUN is how the harness tells the guard to stand down
+        # DURING an actual mutation pass (the sidecar exists by design then).
+        # If it didn't stand down, the guard would trivially "kill" every
+        # mutant of itself by refusing to run at all — proving nothing.
+        self.guard_sidecar.write_text(self.guard_target.read_text(encoding="utf-8"))
+        env = dict(os.environ, SK_MUTATION_RUN="1")
+        r = subprocess.run([sys.executable, str(self.guard_target),
+                            "--advance-all", "--video", "1"],
+                           capture_output=True, text=True, timeout=30, env=env)
+        out = r.stdout + r.stderr
+        # Must NOT die with the guard's own message. It should get past the
+        # guard and fail on the very next real check instead (fleet
+        # commands reject --video) — proving the guard stood down rather
+        # than coincidentally refusing for some other reason.
+        self.assertNotIn("mutate.orig", out)
+        self.assertIn("do not pass --video", out)
+
+    def test_refuses_with_active_wording_under_a_live_lock_not_crash_advice(self):
+        # MEDIUM-1 (round 12, ported round 14): end-to-end proof the ported
+        # live-lock branch actually fires in THIS file's guard, not just that
+        # its source text resembles build_video.py's. Same sidecar+lock
+        # scenario as test_derive_shots.py's build_video.py fixture. Writing
+        # our own pid into guard_lock is safe: it is a tmp file this test
+        # owns outright, not the shared production lock.
+        self.guard_sidecar.write_text(self.guard_target.read_text(encoding="utf-8"))
+        self.guard_lock.write_text(f"{os.getpid()} selftest\n")
+        env = {k: v for k, v in os.environ.items() if k != "SK_MUTATION_RUN"}
+        r = subprocess.run([sys.executable, str(self.guard_target),
+                            "--status", "--video", "999999"],
+                           capture_output=True, text=True, timeout=30, env=env)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mutation-run-active", out)
+        self.assertIn("ACTIVE", out)
+        self.assertNotIn("died mid-flight", out)
+        # HIGH-1 (round 20): must be EXACTLY 75 (EX_TEMPFAIL), not merely
+        # nonzero. run_job.sh (which wraps the hourly --advance-all sweep)
+        # special-cases 75 as "target unavailable, did nothing" -- silent, no
+        # red alert, retry marker dropped. Any other nonzero code is a genuine
+        # failure: red Telegram alert + a retry marker the 30-min replayer
+        # picks up, for a condition that is expected and self-clearing.
+        self.assertEqual(r.returncode, 75,
+                          f"must be EX_TEMPFAIL so run_job.sh stays silent, got {r.returncode}")
+
+    def test_active_branch_requires_both_holder_and_alive_not_or(self):
+        # HIGH-2 mutation-gate finding (round 16, 2026-07-27): `holder or alive`
+        # is indistinguishable from `holder and alive` in BOTH subprocess
+        # scenarios above — the crash branch has both falsy (no lock file at
+        # all), the live-lock branch has both truthy (a real running pid) — so
+        # `scripts/pipeline_orchestrator.py --mutate` survived that flip-bool
+        # until this pin was added. Exact same fixture shape as
+        # test_derive_shots.py's build_video.py guard's equivalent check; that
+        # file's copy of this guard already carries it, this one didn't.
+        guard_src = _MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("if holder and alive:", guard_src)
+
+
+class TestMutationRunActiveInfraMarker(unittest.TestCase):
+    """MEDIUM-1 extra credit (round 12 review): build_video.py's lock-ACTIVE
+    refusal text must classify as infra (left ready, retried — bounded by
+    MAX_INFRA) rather than a task failure (consumes MAX_FAILS) — the whole
+    point being that this refusal clears on its own in ~100s and should not
+    park a video after 3 collisions with a healthy mutation pass."""
+
+    def test_marker_recognised_as_infra(self):
+        # This is the actual string build_video.py's guard prints (see
+        # build_video.py's crash-guard block) run through run_script_stage's
+        # exact wrapping (`build_video.py exited N: {stderr[-500:]}`).
+        msg = ("build_video.py exited 1: error: build_video.py.mutate.orig exists "
+               "and a mutation run is ACTIVE (pid 123) — this refusal is correct "
+               "and temporary; do NOT cp/rm anything below, just re-run after it "
+               "finishes. (mutation-run-active)")
+        self.assertTrue(po._is_infra_failure(msg))
+
+    def test_marker_is_a_real_member_of_the_tuple(self):
+        # Guards against the marker being asserted only in the crafted string
+        # above and silently dropping out of INFRA_FAILURE_MARKERS itself.
+        self.assertIn("mutation-run-active", po.INFRA_FAILURE_MARKERS)
 
 
 if __name__ == "__main__":

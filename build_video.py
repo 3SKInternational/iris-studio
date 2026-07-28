@@ -118,6 +118,20 @@ def parse_shot_list(path: Path) -> tuple[list[dict], dict[int, float]]:
         shots.append({
             "scene": scene,
             "sub": sub,
+            # Shot_List path: `scene` is an int and `sub` a bare letter, so this
+            # composition reproduces the header — AND it is what generates the
+            # downstream PNG name, so it round-trips by construction. Real
+            # exception (MEDIUM-2, round 18, 2026-07-28 — corrected from "one"):
+            # `_SHOT_RE`'s trailing `\b` is satisfied by `-`, so SIX `-ii`-suffixed
+            # headers in Video_01_Shot_List.md each collide with their base id —
+            # `4c-ii, 5b-ii, 6f-ii, 7b-ii, 8b-ii, 10b-ii` all parse to `04c, 05b,
+            # 06f, 07b, 08b, 10b`, the SAME id as `### Shot 4c`/`5b`/`6f`/`7b`/`8b`/
+            # `10b` — six V01 shots render another shot's PNG, not one. Pre-existing
+            # and caught downstream by generate_images' duplicate-shot-name warning;
+            # left alone because tightening the terminator would silently DROP
+            # those shots instead.
+            # The manifest-fallback path cannot compose at all and must preserve the
+            # raw match — see derive_shots_from_hd_manifest.
             "id": f"{scene:02d}{sub}",
             "prompt": prompt,
             "no_char": bool(re.search(r"\bno character\b", prompt, re.I)),
@@ -132,10 +146,118 @@ def parse_shot_list(path: Path) -> tuple[list[dict], dict[int, float]]:
     return shots, cadence
 
 
-# HD render-manifest image name -> scene/sub (e.g. "Video_09_Shot_01a" -> 9,"a").
-# Thumbnails ("..._Thumbnail_A") and reference entries don't match and are
-# skipped — exactly the by-hand derivation the V9 assembly used.
-_HD_SHOT_RE = re.compile(r"_Shot_(\d+)([a-z])\b", re.IGNORECASE)
+# HD render-manifest image name -> scene / sub-ordering. Two conventions exist:
+#   V09-V13   "Video_13_Shot_01a"    scene 01, shot 'a'      (letter = shot index)
+#   V14+      "Video_14_Shot_04a_2"  scene '04a', shot 2     (letter = SCENE part)
+# V14's script splits scenes into lettered PARTS (4a/4b/4c), so the letter moved
+# from "which shot" to "which part of the scene" and a numeric shot index was
+# appended. The old pattern matched neither V14 shape: `Shot_01_1` has no letter
+# where one is required, and in `Shot_04a_2` the `\b` after `a` fails because the
+# next char is `_`, itself a word character — the same word-boundary trap that hid
+# lettered scenes from vo_wordcount's SCENE_RE (fixed 2026-07-27, commit 59f61d5).
+# All 76 of V14's shot entries silently failed to match (the other 2 are
+# thumbnails, which never match by design), so assembly died with "no image
+# entries to derive shots from" on a fully-rendered batch. Note the load-bearing
+# fix is making the letter OPTIONAL and moving the terminator past `(?:_(\d+))?`
+# — `(?![\w])` vs `\b` is not the difference; the match always ends on a word
+# char, so those two are equivalent here.
+# Thumbnails ("..._Thumbnail_A") and reference entries still don't match, by design.
+_HD_SHOT_RE = re.compile(r"_Shot_((\d+)([a-z]?)(?:_(\d+))?)(?![\w])", re.IGNORECASE)
+# Deliberately NOT re.DOTALL: `.` must not cross a newline, or an unannotated
+# `## Scene 1` header borrows a later scene's `src SCENE` and the live V14 build
+# false-dies.
+_KIT_SRC_RE = re.compile(r"##\s*Scene\s+(\d+)\b.*?src SCENE\s+(\d+[a-z]?)", re.IGNORECASE)
+# A shot id carrying a scene PART letter (`04a_1`), as opposed to a bare-numbered
+# scene (`01_1`) or a V09-V13 shot letter (`01a`). Parts are what get renumbered.
+_PART_ID_RE = re.compile(r"\d+[a-z]_", re.IGNORECASE)
+
+
+def verify_derived_ordinals(shots: list[dict], vo_kit: Path, manifest_name: str) -> None:
+    """Cross-check POSITION-derived kit ordinals against the kit's own record.
+
+    build_vo_kit annotates each renumbered scene with the script scene it came
+    from (`## Scene 7 -> ... (src SCENE 5a; ...)`). That map is authored
+    independently of the image manifest, so it is real ground truth — and it is
+    the only thing that actually closes position inference.
+
+    The structural guards inside derive_shots_from_hd_manifest (ascending order,
+    scene numbers 1..N, parts contiguous from 'a') catch a lot, but they cannot
+    catch a trimmed TAIL part: a scene whose script parts are a,b,c appearing as
+    only a,b is indistinguishable from a scene that genuinely has two parts. Drop
+    04c and every later ordinal slides down one — scene 5's shots render over
+    scene 4c's VO — with no error, and a kit-mismatch warning identical to the one
+    a benign tail truncation prints. Fully rendered, fully wrong.
+
+    Only scenes the kit actually annotates are compared: scenes that kept their
+    number carry no `src SCENE` note. Three no-oracle cases, deliberately split:
+      * no scene PARTS in the manifest -> return SILENTLY. Ordinal == scene number
+        by identity, so nothing was inferred and there is nothing to verify.
+      * kit FILE absent -> warn and continue. A guard that can't run is not a
+        finding, and the structural guards still stand.
+      * kit present, parts present, ZERO annotations -> DIE. That is a
+        contradiction, not a missing oracle: build_vo_kit annotates whenever
+        src != scene number and a lettered src can never equal a digit string, so
+        any script with a lettered scene yields at least one annotation. Caveat:
+        that annotation landed in 59f61d5 (2026-07-27), so a kit generated before
+        it has none — regenerate the kit rather than weakening this branch."""
+    has_parts = any(_PART_ID_RE.match(str(s["id"])) for s in shots)
+    text = vo_kit.read_text(encoding="utf-8") if vo_kit.is_file() else ""
+    want = {int(o): s.lower() for o, s in _KIT_SRC_RE.findall(text)}
+    if not has_parts:
+        # No scene PARTS means no renumbering, so ordinal == scene number by
+        # identity — there is nothing inferred here to verify. Stay silent rather
+        # than print a scary "cannot verify" line about a risk that structurally
+        # cannot exist (V13 is this case on every build).
+        return
+    if not vo_kit.is_file():
+        print(f"warning: {vo_kit.name} is absent — cannot verify the part-derived "
+              f"ordinals in {manifest_name} against the kit.", file=sys.stderr)
+        return
+    if not want:
+        # Parts present but the kit annotates nothing is a CONTRADICTION, not a
+        # missing oracle: build_vo_kit annotates whenever src != scene number
+        # (scripts/build_vo_kit.py), and a lettered src can never equal a plain
+        # digit string — so a script with any lettered scene always yields at
+        # least one annotation. Parts in the manifest + none in the kit therefore
+        # means the manifest splits scenes the SCRIPT does not have, which is
+        # exactly what silently shifts ordinals.
+        die(f"{manifest_name}: shots are split into scene parts (04a/04b) but "
+            f"{vo_kit.name} annotates no 'src SCENE' renumbering — the manifest is "
+            f"splitting scenes the script does not have, so kit ordinals derived "
+            f"from it would not line up with the VO.")
+    derived: dict[int, str] = {}
+    for s in shots:
+        m = re.match(r"(\d+)([a-z]?)", str(s["id"]))
+        # mutequiv: both id producers guarantee a leading digit (_HD_SHOT_RE
+        # captures `(\d+)...`; parse_shot_list builds f"{scene:02d}{sub}"), so the
+        # False branch is unreachable and no fixture can kill forcing it True.
+        if m:
+            derived.setdefault(s["scene"], f"{int(m.group(1))}{m.group(2)}")
+    # Two DIFFERENT defects land here and the fix differs, so say which. Report
+    # `bad` FIRST when both fire: a dropped middle part causes a shifted mapping
+    # AND a missing tail ordinal, and the shift is the cause while the missing
+    # tail is only its symptom. Leading with the symptom offered "or trim the kit",
+    # which is actively wrong — trimming leaves the surviving ordinals mis-mapped.
+    missing = sorted(o for o in want if derived.get(o) is None)
+    bad = {o: (want[o], derived[o]) for o in want
+           if derived.get(o) is not None and derived[o] != want[o]}
+    if missing and not bad:
+        die(f"{manifest_name}: kit scene(s) {missing} have NO images in the "
+            f"manifest — the timeline is built from shots, so those scenes would "
+            f"be dropped from the cut and their narration never plays. Add the "
+            f"missing shots (or trim the kit).")
+    if bad:
+        preview = "; ".join(f"ordinal {o}: kit says {w}, manifest gives {g}"
+                            # mutequiv: caps how many disagreements the message
+                            # lists — message truncation only, no behaviour.
+                            for o, (w, g) in sorted(bad.items())[:5])
+        tail = (f" (kit scene(s) {missing} also have no images at all — that is the "
+                f"SYMPTOM of this shift, not a separate problem; do not 'fix' it by "
+                f"trimming the kit)" if missing else "")
+        die(f"{manifest_name}: derived kit ordinals disagree with {vo_kit.name} on "
+            f"{len(bad)} scene(s) — {preview}. Ordinals are assigned by document "
+            f"position, so the manifest is missing entries or misordered relative "
+            f"to the script, and shots would render over the wrong VO.{tail}")
 
 
 def derive_shots_from_hd_manifest(path: Path, vid: str) -> list[dict]:
@@ -156,19 +278,141 @@ def derive_shots_from_hd_manifest(path: Path, vid: str) -> list[dict]:
     images = data.get("images") if isinstance(data, dict) else None
     if not isinstance(images, list):
         die(f"HD manifest {path.name} has no 'images' list to derive shots from.")
-    shots: list[dict] = []
+    # WHICH NAMING SCHEME? Both look like NN+letter, so structure alone can't tell
+    # them apart — the tell is the trailing "_<idx>":
+    #   V09-V13  "Shot_01a"     letter = SHOT index; the number IS the scene id.
+    #   V14+     "Shot_04a_2"   letter = SCENE PART; "_2" is the shot index.
+    # This matters because assemble matches images to VO by SCENE NUMBER, and
+    # build_vo_kit renumbers scene-parts to sequential kit ordinals (4a -> 4, 4b -> 5).
+    # Under the V14+ scheme the numeric prefix tops out at 16 while the kit has 28
+    # scenes, so 12 of them had no images: "scene mismatch — in kit but not shot
+    # list: [17..28]" and no video was produced. Remap parts to their ordinal
+    # position, in document order, exactly as build_vo_kit does.
+    parsed = []
+    skipped = []
     for entry in images:
         name = str(entry.get("name", "")) if isinstance(entry, dict) else ""
         m = _HD_SHOT_RE.search(name)
-        if not m:
-            continue  # thumbnail / reference / non-shot entry
-        scene = int(m.group(1))
-        sub = m.group(2).lower()
+        if m:
+            parsed.append((m, entry))
+        elif "_Shot_" in name:
+            skipped.append(name)
+    if skipped:
+        # A shot-shaped name the pattern can't read is a DROPPED shot, and the only
+        # symptom is a video short by that many shots. This is not one file: it is
+        # 19 names across 2 in-tree manifests (MEDIUM-2, round 18, 2026-07-28 —
+        # corrected from "`Video_13_Shot_01b2`... one shot short") — 1 in
+        # video_13_hd.json (`Video_13_Shot_01b2`) and 18 in video_04_hd.json
+        # (the `NNa2` form is genuinely ambiguous — shot "a2", or part a shot 2? —
+        # so widening the regex would be a guess). Name it loudly instead of
+        # widening.
+        #
+        # MEDIUM-1 (round 18, 2026-07-28): stays a WARNING, not die(). die() was
+        # tried and reverted — tests/test_derive_shots.py pins this exact path
+        # ("unparseable shot name warns by name") as continue-with-a-name-warning,
+        # not a hard stop, and that pin is deliberate: V04's 18 and V13's 1 are
+        # ALREADY shipped/public (6_assemble + 10_publish both status:"done" in
+        # their pipeline.json) — die() would only fire on a manual re-assemble of
+        # an already-published video, but it would also turn a partial re-render
+        # (a legitimate, narrower manifest) into a hard block, and no caller of
+        # this path distinguishes the two. The real defect is that the warning
+        # goes nowhere: fixed at the READER, not by making the writer stop —
+        # see pipeline_orchestrator.py's run() docstring for the stderr fix.
+        print(f"warning: {path.name}: {len(skipped)} shot-shaped name(s) did not parse "
+              f"and were DROPPED — {', '.join(sorted(skipped))}. "
+              f"Rename to Shot_NNa or Shot_NNa_N.", file=sys.stderr)
+    idxs = [m.group(4) is not None for m, _ in parsed]
+    lettered_scheme = any(idxs)
+    if lettered_scheme and not all(idxs):
+        # Consensus, not any(): the scheme decides how EVERY entry is read, so one
+        # V14-style "_2" entry appended to a V09-V13 manifest would silently recut
+        # the whole video — each old shot moving to a different VO scene and losing
+        # its `sub`. No manifest in tree is mixed today, and V13's has been edited
+        # in place five times, so this stays cheap and closes that door.
+        die(f"{path.name} MIXES shot-naming schemes: some entries carry a trailing "
+            f"'_<idx>' (Shot_04a_2) and some do not (Shot_01a). Both read differently "
+            f"— pick one scheme for the whole manifest.")
+    ordinal_of: dict[str, int] = {}
+    # NOT just a map build — three die() guards live in this block, and they encode
+    # V14+ invariants (scenes 1..N, parts a.., ascending) that V09-V13 manifests
+    # legitimately violate. Running them unconditionally kills 18 real in-tree
+    # manifests including the live video_13_hd.json.
+    if lettered_scheme:
+        for m, _ in parsed:                       # document order == script order
+            # :03d not :02d — the pad is what makes a plain string sort match
+            # numeric order, and a 2-wide pad breaks at 100 ("100a" < "11a"),
+            # false-dying on the ascending-order guard. 3 wide moves that to 1000.
+            key = f"{int(m.group(2)):03d}{(m.group(3) or '').lower()}"
+            if key not in ordinal_of:
+                ordinal_of[key] = len(ordinal_of) + 1
+        # The ordinals are POSITIONAL — assigned by document position — so anything
+        # that perturbs position silently maps shots onto the wrong VO scene, and a
+        # fully rendered, fully wrong video is the only symptom. Position inference
+        # needs THREE properties; check all three, because the first two are
+        # order-INsensitive (they sort) while ordinal assignment is not:
+        #   1. entries appear in ascending scene order
+        #   2. scene numbers run 1..N with no gap
+        #   3. parts within a number run a, b, c… with no gap
+        # (1) is the one that bites hardest: moving the three Shot_04b_* entries to
+        # the end of the real video_14_hd.json — the most natural hand edit on a
+        # manifest re-rendered in groups — passes (2) and (3) and remaps 68 of 76
+        # shots. The scene SET is unchanged, so the kit-mismatch warning stays
+        # silent too. Manifests DO get hand-edited and trimmed: V14 went 100 -> 76
+        # entries and V13's has been rewritten in place five times.
+        if list(ordinal_of) != sorted(ordinal_of):
+            die(f"{path.name}: shot entries are not in ascending scene order — kit "
+                f"ordinals are assigned by document position, so an out-of-order "
+                f"entry maps shots to the wrong VO scene. Sort the manifest.")
+        seen_parts: dict[int, set] = {}
+        for m, _ in parsed:
+            seen_parts.setdefault(int(m.group(2)), set()).add((m.group(3) or "").lower())
+        nums = sorted(seen_parts)
+        # Anchored at 1, not at nums[0]: kit ordinals start at 1, so a manifest whose
+        # first rendered scene is 4 (1-3 served from north-star or a prior batch) is
+        # "contiguous" yet puts every shot 3 scenes early. Front-truncation is as
+        # plausible as a middle gap. (The downstream kit-mismatch check only
+        # WARNS on this shape, which is why the block has to happen here.)
+        if nums != list(range(1, nums[-1] + 1)):
+            missing = sorted(set(range(1, nums[-1] + 1)) - set(nums))
+            die(f"{path.name}: scene number(s) {missing} missing from the 1..{nums[-1]} "
+                f"run — kit ordinals are positional and start at 1, so a gap (or a "
+                f"missing scene 1) silently maps shots to the wrong VO scene.")
+        for n in nums:
+            ps = sorted(seen_parts[n])
+            if ps == [""]:
+                continue
+            expected = [chr(ord("a") + i) for i in range(len(ps))]
+            if ps != expected:
+                die(f"{path.name}: scene {n} has parts {ps}, expected a contiguous "
+                    f"{expected} — a missing part shifts every later kit ordinal.")
+
+    shots: list[dict] = []
+    for m, entry in parsed:
+        raw_id = m.group(1).lower()            # the shot id EXACTLY as named: "02_3", "01a"
+        part = (m.group(3) or "").lower()      # scene PART: 4a/4b/4c (V14+), else ""
+        idx = m.group(4)                       # shot index within the part (V14+)
+        if lettered_scheme:
+            # :03d must match the width ordinal_of was BUILT with above, or every
+            # lookup KeyErrors.
+            scene = ordinal_of[f"{int(m.group(2)):03d}{part}"]
+            part = ""                          # the part is folded into the ordinal
+        else:
+            scene = int(m.group(2))
+        # `sub` orders shots WITHIN a scene and must sort correctly in both schemes.
+        # V09-V13: the letter IS the order ('a','b','c'), so sub is that letter.
+        # V14+: the part was already folded into the ordinal above (`part = ""`),
+        # so sub is the index ALONE — "02", never "a02". Zero-padded because a
+        # plain string sort puts "10" before "2".
+        sub = f"{part}{int(idx):02d}" if idx is not None else part
         prompt = re.sub(r"\s+", " ", str(entry.get("prompt", ""))).strip()
         shots.append({
             "scene": scene,
             "sub": sub,
-            "id": f"{scene:02d}{sub}",
+            # `id` MUST reproduce the name verbatim: downstream looks up both the
+            # PNG (`<vid>_Shot_<id>.png`) and the card_overlay spec by it. Composing
+            # it from scene+sub produced "0203" for a shot actually named "02_3" —
+            # so every V14 card read as having no burned figure and assembly blocked.
+            "id": raw_id,
             "prompt": prompt,
             "no_char": bool(re.search(r"\bno character\b", prompt, re.I)),
         })
@@ -901,9 +1145,19 @@ def _resolve_image(asset_dir: Path, images_rel: str, vid: str,
     if ppath.is_file():
         return primary, None
     if allow_fallback:
-        north_star = f"Raw_Assets/{vid}/{vid}_Scene_{scene:02d}.png"
-        if (asset_dir / north_star).is_file():
-            return north_star, f"{vid}_Shot_{sid} absent from {images_rel} -> north-star {vid}_Scene_{scene:02d}.png"
+        # The north-star asset is named by SCRIPT scene, but `scene` is the kit
+        # ordinal under the V14+ lettered scheme (5a -> 7), so indexing by it would
+        # silently serve scene 7a's frame for shot 05a_1. `sid` reproduces the shot
+        # name verbatim in BOTH schemes, so take the script scene from there.
+        mnum = re.match(r"(\d+)", sid)
+        # mutequiv: sid is always digit-initial (same invariant as the id parse in
+        # verify_derived_ordinals), so the False branch is unreachable.
+        if mnum:
+            n = int(mnum.group(1))
+            north_star = f"Raw_Assets/{vid}/{vid}_Scene_{n:02d}.png"
+            if (asset_dir / north_star).is_file():
+                return north_star, (f"{vid}_Shot_{sid} absent from {images_rel} "
+                                    f"-> north-star {vid}_Scene_{n:02d}.png")
     return primary, None
 
 
@@ -1387,6 +1641,60 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Refuse to run if a mutation-testing run died mid-flight on THIS file.
+    # scripts/mutate.py rewrites this source in place and restores it, but a
+    # SIGKILL or power loss leaves the mutant on disk with a `.mutate.orig`
+    # pristine copy beside it. The hourly pipeline-sweep invokes this script, so
+    # without this guard the very next sweep renders a real video from mutated
+    # code, silently. mutate.py's own refusal only fires on the next MUTATION run,
+    # which may be days away. Read-only and non-destructive by design: it never
+    # writes, it just stops and names the recovery.
+    # scripts/mutate.py sets SK_MUTATION_RUN: inside the harness the sidecar exists
+    # BY DESIGN and the file is mutated on purpose, so the guard must stand down or
+    # every mutant is trivially "killed" by this refusal and the run proves nothing.
+    # Nothing in production sets it — the sweep, the orchestrator and a human shell
+    # all get the guard.
+    _orig = Path(__file__).with_suffix(".py.mutate.orig")
+    if _orig.is_file() and not os.environ.get("SK_MUTATION_RUN"):
+        # MEDIUM-1 (2026-07-27): this sidecar also exists BY DESIGN for ~100s per
+        # live 80-mutant gate run, and the hourly pipeline sweep can genuinely
+        # collide with that window (~2.8% per gate run — the reviewer's costing).
+        # The refusal is correct either way, but the crash-recovery cp/rm advice
+        # below is actively dangerous if followed DURING that window: it would
+        # score a live mutant falsely. Check the lock mutate.py itself holds
+        # (imported, never re-derived — five earlier rounds were lost to checks
+        # that re-derived a path/formula the production code already owns) and
+        # say which situation this actually is.
+        holder, alive = "", False
+        try:
+            import importlib.util as _ilu
+            _mspec = _ilu.spec_from_file_location(
+                "_mutate_lock_check", Path(__file__).resolve().parent / "scripts" / "mutate.py")
+            _mut = _ilu.module_from_spec(_mspec)
+            _mspec.loader.exec_module(_mut)
+            holder = _mut.LOCK.read_text().split()[0]
+            os.kill(int(holder), 0)
+            alive = True
+        except PermissionError:
+            # pid exists but isn't ours to signal — still alive, same as
+            # mutate.py's own lock-read handling (main(), FileExistsError branch).
+            alive = True
+        except Exception:
+            # no lock file, unreadable lock, dead pid, or the import itself
+            # failed — none of those is "a run is active right now".
+            alive = False
+        if holder and alive:
+            # mutation-run-active: matches INFRA_FAILURE_MARKERS in
+            # pipeline_orchestrator.py, so the sweep retries this instead of
+            # burning one of MAX_FAILS on a refusal that will clear on its own.
+            die(f"{_orig.name} exists and a mutation run is ACTIVE (pid {holder}) — "
+                f"this refusal is correct and temporary; do NOT cp/rm anything "
+                f"below, just re-run after it finishes. (mutation-run-active)")
+        die(f"{_orig.name} exists — a mutation-testing run died mid-flight and this "
+            f"file may be MUTATED. Refusing to build. Recover:\n"
+            f"    diff {_orig} {__file__}\n"
+            f"    cp {_orig} {__file__}   # only if the diff is a mutation\n"
+            f"    rm {_orig}")
     args = parse_args()
     do_images = args.images or args.run
     do_vo = args.vo or args.run
@@ -1437,6 +1745,10 @@ def main() -> None:
               f"(the RENDERS-gated HD manifest). No cadence table or cut-anchors, "
               f"so multi-shot scenes use VO-driven even-split timing.")
         shots = derive_shots_from_hd_manifest(hd_manifest, vid)
+        # The kit is the only real oracle for position-derived ordinals — see
+        # verify_derived_ordinals. Runs ONLY on this branch: with a shot list the
+        # scene numbers are read, not inferred.
+        verify_derived_ordinals(shots, vo_kit, hd_manifest.name)
         cadence = {}
         edit_anchors = {}
     for w in lint_cut_anchors(shots, edit_anchors):
