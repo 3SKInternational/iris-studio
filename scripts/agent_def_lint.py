@@ -14,7 +14,15 @@ through the /adapt queue (where Steve approves each edit), which is the
 mechanism that already governs those files.
 
 Three checks, cheapest first:
-  1. SIZE  (warn)  — def exceeds --max-kb. The growth gate.
+  1. SIZE/GROWTH (warn) — the growth gate, in two tiers:
+       * SIZE   — over --max-kb with NO reviewed baseline. Nobody has audited it.
+       * GROWTH — over its REVIEWED_BASELINES_KB entry by more than
+                  GROWTH_GRACE_KB. Audited once, and has since put on weight.
+       A def over the cap that HAS a baseline and has not grown is silent, but is
+       still listed in the summary. This two-tier split exists because five
+       permanently-warning defs (audited 2026-07-28: no safe deletion available in
+       any of them) would train every reader to scroll past the whole gate. The
+       actionable signal is new bulk, not the absolute number.
   2. FRONT (error) — missing/!malformed frontmatter, or `name:` != filename stem.
                      A name/filename mismatch silently breaks dispatch-by-name.
   3. ROSTER(error) — org_chart.json names a stem with no def on disk, or a
@@ -39,6 +47,38 @@ from pathlib import Path
 DEFAULT_AGENTS_DIR = Path("/Users/steve/.claude/agents")
 DEFAULT_ORG_CHART = Path("/Volumes/AI_Workspace/iris_studio/dashboard/org_chart.json")
 DEFAULT_MAX_KB = 20.0
+
+# Defs audited 2026-07-28 and found to have NO safe deletion available. Raw size
+# alone therefore cannot be the signal for these: it would emit five permanent,
+# un-actionable warnings every Friday, and a gate that always cries wolf is one
+# everybody learns to scroll past. Growth PAST the audited size is the real
+# signal — that is the ADAPTS loop adding bulk nobody has looked at.
+#
+# What the audit measured (06_CEO/Decisions_Log/2026-07-28_agent_def_size_baselines.md):
+#   * ZERO exact-duplicate paragraphs and ZERO near-duplicates (Jaccard > 0.18)
+#     in all five — no internal redundancy to merge.
+#   * The only cross-file duplication is the Master Character Prompt embedded
+#     verbatim, which is a FAIL-SAFE: the agents paste it to the image model, and
+#     a missed file read would otherwise ship off-model BILLED renders.
+#   * thumbnail-coordinator's block marked "LEGACY" is still live — the
+#     orchestrator's 8_thumbnail stage calls run_thumbnail_overlay_stage().
+#   * scene-image-prompt-generator's 12.8KB thumbnail block is live too: that art
+#     renders inside the stage-5 scene batch.
+#   * The largest section in the fleet (14.6KB on-model guardrails) shares only
+#     2% of its text with the protocol doc it cites — not a restatement.
+#
+# Raising a baseline is a deliberate, git-tracked act: do it only after a fresh
+# audit says the growth earned its tokens, and say so in the commit.
+REVIEWED_BASELINES_KB = {
+    "scriptwriter.md": 53.6,
+    "scene-image-prompt-generator.md": 48.9,
+    "thumbnail-coordinator.md": 35.5,
+    "image-reviewer.md": 35.2,
+    "youtube-researcher.md": 23.2,
+}
+# Slack above a baseline before growth is worth reporting. Small enough that a
+# genuinely new rule-block trips it, large enough that a typo fix does not.
+GROWTH_GRACE_KB = 2.0
 
 # Generic dev/tooling agents that intentionally live outside the business org
 # chart (org_chart.json says so itself) — never flagged as roster drift.
@@ -106,15 +146,27 @@ def load_org_stems(org_chart: Path) -> set[str]:
     return stems
 
 
-def lint(agents_dir: Path, org_chart: Path | None, max_kb: float) -> tuple[list[str], list[str]]:
-    """Return (errors, warnings)."""
+def lint(agents_dir: Path, org_chart: Path | None,
+         max_kb: float) -> tuple[list[str], list[str], list[tuple[str, float, float]]]:
+    """Return (errors, warnings, baselined).
+
+    `baselined` is [(name, kb, baseline_kb)] for defs that are over --max-kb but
+    carry a reviewed baseline and have not grown past it. They are deliberately
+    NOT warnings — see REVIEWED_BASELINES_KB — but they are returned so the caller
+    can still show that they exist.
+    """
     errors: list[str] = []
     warnings: list[str] = []
+    # Over-cap but audited and not growing. Held apart from `warnings` so the
+    # steward stays quiet about them, then summarised once at the end — silent is
+    # not the same as hidden, and a reader must still be able to see that five
+    # large defs exist and are being carried deliberately.
+    baselined: list[tuple[str, float, float]] = []
 
     defs = sorted(p for p in agents_dir.glob("*.md") if p.is_file())
     if not defs:
         errors.append(f"no agent defs found in {agents_dir}")
-        return errors, warnings
+        return errors, warnings, baselined
 
     on_disk: set[str] = set()
     for p in defs:
@@ -136,10 +188,30 @@ def lint(agents_dir: Path, org_chart: Path | None, max_kb: float) -> tuple[list[
                 if req not in fm:
                     errors.append(f"FRONT {p.name}: frontmatter has no `{req}:` field")
         if kb > max_kb:
-            warnings.append(
-                f"SIZE  {p.name}: {kb:.1f}KB exceeds {max_kb:.0f}KB "
-                f"(~{int(kb * 1024 / 4):,} tokens paid on every dispatch) "
-                f"— queue a compaction proposal via /adapt")
+            baseline = REVIEWED_BASELINES_KB.get(p.name)
+            # mutequiv: both literals here (1024, 4) are DISPLAY arithmetic — a
+            # rough "~N tokens" hint appended to a message that is already being
+            # emitted. Nothing branches on it: the warn/no-warn decision is
+            # `kb > max_kb` above, and the growth decision is `kb > baseline +
+            # grace` below, neither of which reads this string. Pinning a
+            # bytes-per-token approximation would be asserting a rendering
+            # detail. The KB figure that DOES drive the decision is pinned by
+            # test_reported_size_matches_the_real_file_size.
+            tokens = f"~{int(kb * 1024 / 4):,} tokens paid on every dispatch"
+            if baseline is None:
+                # Never audited: the original growth signal, unchanged.
+                warnings.append(
+                    f"SIZE  {p.name}: {kb:.1f}KB exceeds {max_kb:.0f}KB ({tokens}) "
+                    f"— audit it for a safe compaction, then either queue an /adapt "
+                    f"proposal or record a REVIEWED_BASELINES_KB entry")
+            elif kb > baseline + GROWTH_GRACE_KB:
+                # Audited, but it has since grown — the signal that actually matters.
+                warnings.append(
+                    f"GROWTH {p.name}: {kb:.1f}KB is {kb - baseline:+.1f}KB over its "
+                    f"reviewed {baseline:.1f}KB baseline ({tokens}) — new bulk since "
+                    f"the last audit; re-audit, then compact or re-baseline")
+            else:
+                baselined.append((p.name, kb, baseline))
 
     if org_chart is not None:
         if not org_chart.exists():
@@ -154,7 +226,7 @@ def lint(agents_dir: Path, org_chart: Path | None, max_kb: float) -> tuple[list[
                 errors.append(
                     f"ROSTER `{stem}.md` exists on disk but is absent from org_chart.json "
                     f"(add it, or add the stem to NON_FLEET if it is a tooling agent)")
-    return errors, warnings
+    return errors, warnings, baselined
 
 
 def _selftest() -> int:
@@ -191,7 +263,7 @@ def _selftest() -> int:
         (d / "nofm.md").write_text("no frontmatter here\n")
         write("fat", "name: fat\ndescription: d\nmodel: sonnet\ntools: Read", "x" * 40000)
 
-        errs, warns = lint(d, None, max_kb=20.0)
+        errs, warns, _ = lint(d, None, max_kb=20.0)
         joined = " | ".join(errs)
 
         # Mirrors the real chart's shape: `agent` at the CEO, a `staff` list, and
@@ -201,7 +273,7 @@ def _selftest() -> int:
             "ceo": {"agent": "alpha", "staff": ["nomodel"]},
             "departments": [
                 {"key": "d1", "lead": "mismatch", "members": ["fat", "phantom"]}]}))
-        errs2, _ = lint(d, chart, max_kb=20.0)
+        errs2, _, _ = lint(d, chart, max_kb=20.0)
         j2 = " | ".join(errs2)
 
         # description containing a colon must not break the flat parser
@@ -258,14 +330,26 @@ def main() -> None:
     if not a.agents_dir.is_dir():
         ap.error(f"agents dir not found: {a.agents_dir}")
 
-    errors, warnings = lint(a.agents_dir, None if a.no_roster else a.org_chart, a.max_kb)
+    errors, warnings, baselined = lint(a.agents_dir, None if a.no_roster else a.org_chart, a.max_kb)
     for e in errors:
         print(f"✗ {e}")
     for w in warnings:
         print(f"⚠ {w}")
+    if not a.quiet and baselined:
+        # Not a warning — but never invisible. Someone reading this output must be
+        # able to see which large defs are being carried deliberately, and at what
+        # size, without having to open the source.
+        print(f"\n{len(baselined)} def(s) over {a.max_kb:.0f}KB carried at a reviewed "
+              f"baseline (silent until +{GROWTH_GRACE_KB:.0f}KB growth):")
+        # mutequiv: the sort key indexes into the display tuple — largest-first is
+        # a readability choice, and every element is printed either way. No caller
+        # branches on the order; the presence of the summary IS asserted (see
+        # test_baselined_summary_is_shown_on_a_normal_run), its ordering is not.
+        for name, kb, base in sorted(baselined, key=lambda x: -x[1]):
+            print(f"   · {name}: {kb:.1f}KB (baseline {base:.1f}KB)")
     if not errors and not warnings:
         if not a.quiet:
-            print(f"agent_def_lint: clean — all defs under {a.max_kb:.0f}KB, "
+            print(f"\nagent_def_lint: clean — no unreviewed oversize, "
                   f"frontmatter valid, roster in sync.")
     elif not a.quiet:
         print(f"\nagent_def_lint: {len(errors)} error(s), {len(warnings)} size warning(s).")

@@ -74,6 +74,21 @@ ALLOWED_AGENT_NAMES = frozenset({
     "video-description-writer.md",
     "script-reviewer.md",
     "image-reviewer.md",
+    # Added 2026-07-28 (Steve): the intel layer every content agent reads at
+    # dispatch was the one prompt ADAPTS could never retune, so its calibration
+    # drifted with nothing able to correct it.
+    #
+    # NOT the same shape as the seven above — do not generalise from this entry.
+    # Those are Read/Write/Grep only. This one carries WebSearch + WebFetch +
+    # **Bash** (load-bearing: yt-dlp, watch_video.py, the yt-search skill), it
+    # ingests UNTRUSTED web content, and it fires unattended twice weekly. Its own
+    # intel files are a signal adaptation-proposer reads, so
+    #   web page -> intel file -> proposal -> this prompt
+    # is a closed loop that begins outside our trust boundary. Steve's
+    # per-proposal approval is the human gate; _assert_no_capability_change below
+    # is the deterministic one, so an approved edit can retune WHAT it researches
+    # but never WHAT IT CAN DO.
+    "youtube-researcher.md",
 })
 
 # Proposal queue lives in the vault (the shared brain): visible to Steve, readable
@@ -415,6 +430,130 @@ def _move_proposal(prop: Proposal, dest_dir: Path, new_status: str, extra: dict)
     return dest
 
 
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
+# The frontmatter keys an adaptation may never touch. `tools` is a capability
+# grant; `model` is a locked value whose changes must be reasoned about in the
+# Decisions_Log (an auto-apply would bypass that entirely); `name` is the
+# dispatch key, and rewriting it silently unhooks the agent.
+FROZEN_FRONTMATTER_KEYS = ("tools", "model", "name")
+# How much of the head is compared when the frontmatter cannot be identified (BOM,
+# CR-only endings, leading whitespace). Big enough to contain any real frontmatter
+# — the largest live agent block is well under 3KB — while still letting an edit
+# far down the body of such a file apply. A tuning value, not a magic number:
+# raising it refuses more legitimate body edits, lowering it risks a fence sitting
+# past the window. Pinned by test so it cannot drift silently.
+_UNIDENTIFIABLE_HEAD_BYTES = 8192
+
+
+def _frontmatter_block(text: str) -> str:
+    """The leading `---` fenced block VERBATIM, or "" if there is none.
+
+    The decision half of the freeze, and deliberately not a parser. Two reviews on
+    2026-07-28 found the same root cause wearing different masks: a line-based
+    guard shadowing a YAML consumer disagrees with it, and every disagreement is a
+    bypass. First it was duplicate keys (guard first-wins, YAML last-wins); then
+    plain-scalar continuation —
+
+        tools: Read, Write, Grep
+          , Bash
+
+    — where the second line has no colon, so a line reader skips it while YAML
+    folds it into the value and grants Bash. That one leaves the `tools:` line
+    byte-identical, so a human approver sees nothing wrong either.
+
+    There is no reason to expect those were the last two (anchors, flow mappings,
+    quoted multilines, block scalars all remain). So the decision compares the raw
+    block: any byte-level change to the frontmatter is refused, whatever it means
+    in YAML. Empirically free — none of the 81 adaptations applied to date has
+    ever edited frontmatter, so this refuses nothing the loop actually does.
+    """
+    m = _FRONTMATTER_RE.match(text)
+    if m:
+        return m.group(0)
+    # Fail CLOSED on a shape we cannot identify. `_FRONTMATTER_RE` is anchored
+    # `\A---\r?\n`, so a UTF-8 BOM, a leading blank line or CR-only endings defeat
+    # it — while a YAML loader may still read a frontmatter block there. Returning
+    # "" for both sides would compare ""=="" and allow a `tools:` edit: the guard
+    # would go quiet exactly when it cannot tell what it is looking at.
+    #
+    # The discriminator is deliberately narrow — first real content is a `---`
+    # fence — rather than "a fence appears near the top", so a standards doc whose
+    # BODY contains a horizontal rule is unaffected. Comparing a bounded head (not
+    # the whole file) keeps an edit deep in the body of such a file applyable while
+    # any change near the fence refuses.
+    if text.lstrip("﻿").lstrip().startswith("---"):
+        return "<unidentifiable-frontmatter>" + text[:_UNIDENTIFIABLE_HEAD_BYTES]
+    return ""
+
+
+def _frozen_fields(text: str) -> dict:
+    """The frozen frontmatter fields of an agent def, or {} if it has no block.
+
+    DIAGNOSTIC ONLY. Used to name the changed field in a refusal message — never
+    to decide whether to refuse. See _frontmatter_block for why that split matters.
+
+    Each key maps to the list of EVERY occurrence, not a single resolved value.
+    That is the whole point. An earlier version kept the first occurrence via
+    setdefault, which made this the only parser in the repo resolving duplicate
+    keys first-wins — `agent_def_lint.parse_frontmatter`, this module's own
+    `_parse_frontmatter`, and PyYAML all resolve last-wins. A proposal could
+    therefore APPEND a second `tools:` line rather than edit the existing one:
+    the guard compared first-vs-first, saw no change, and applied an edit that
+    every real loader reads as a capability grant. Verified exploitable end-to-end
+    through apply_proposal on 2026-07-28 (also via CRLF, indented and
+    tab-prefixed duplicates).
+
+    Comparing the full list is immune to which way any consumer resolves
+    duplicates, and is strictly stronger than switching to last-wins: adding,
+    removing or reordering an occurrence all read as a change.
+    """
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    out: dict[str, list[str]] = {}
+    for line in m.group(1).splitlines():
+        key, sep, val = line.partition(":")
+        if sep and key.strip() in FROZEN_FRONTMATTER_KEYS:
+            out.setdefault(key.strip(), []).append(val.strip())
+    return out
+
+
+def _assert_no_capability_change(current: str, updated: str, target: Path) -> None:
+    """Refuse any edit that would alter a target's frontmatter capability lines.
+
+    An adaptation exists to retune WHAT an agent does, never WHAT IT CAN DO. The
+    allowlist above is the trust boundary on *which* files an assumed-hostile
+    proposer may touch; this is the boundary on *what part* of them. It became
+    load-bearing on 2026-07-28, when youtube-researcher joined the allowlist: it
+    is the first entry carrying Bash and web access, and it ingests untrusted
+    content that can reach the proposer through its own intel files. Without this,
+    one approved proposal could hand a new tool to an agent that runs unattended.
+
+    Also catches a quieter failure: `model:` is a locked value that must be
+    justified in the Decisions_Log, and an auto-applied proposal would change a
+    spend tier with no record of why.
+    """
+    before, after = _frontmatter_block(current), _frontmatter_block(updated)
+    if before == after:
+        return
+    # DIAGNOSTIC ONLY — never the decision. The line-based read below exists to
+    # write a helpful message; if it disagrees with YAML the worst outcome is a
+    # vaguer refusal, never a missed one.
+    changed = [k for k in FROZEN_FRONTMATTER_KEYS
+               if _frozen_fields(current).get(k, []) != _frozen_fields(updated).get(k, [])]
+    detail = (f"field(s) {', '.join('`' + k + ':`' for k in changed)} changed"
+              if changed else
+              "no frozen field parses as changed, which is itself the warning sign: "
+              "the block differs in a way a line-based read cannot see (continuation "
+              "line, anchor, flow mapping, quoting)")
+    raise AdaptError(
+        f"proposal would modify the YAML frontmatter of {target.name} — {detail}. "
+        f"Adaptations may retune prompt CONTENT only; the frontmatter carries the "
+        f"agent's capabilities (`tools:`), spend tier (`model:`) and dispatch name, "
+        f"so it is frozen wholesale. Make that change deliberately in a commit."
+    )
+
+
 def apply_proposal(pid: str) -> dict:
     """Apply one pending proposal. Returns a result dict on success; raises
     AdaptError (with a one-line reason) on any refusal — nothing is mutated on a
@@ -450,9 +589,17 @@ def apply_proposal(pid: str) -> dict:
     elif prop.evidence_n is None:
         warnings.append("evidence_n not recorded — sample size behind this signal is unknown")
     # Backup, then atomic single-occurrence replace.
+    # mutequiv: the count argument is unobservable here — the `n == 0` and `n > 1`
+    # guards above mean this line is only reached when OLD occurs EXACTLY once, so
+    # replace(..., 1) and replace(..., 2) are identical. Keep the 1: it states the
+    # invariant at the point of use, and it is the correct value if those guards
+    # are ever loosened.
+    updated = current.replace(prop.old, prop.new, 1)
+    # Checked BEFORE the backup is taken so a refusal really does mutate nothing —
+    # not even a stray .bak- file left behind to confuse the next reader.
+    _assert_no_capability_change(current, updated, target)
     backup = target.with_name(f"{target.name}.bak-pre-adapt-{prop.pid}")
     shutil.copy2(target, backup)
-    updated = current.replace(prop.old, prop.new, 1)
     _atomic_write(target, updated)
     # Stamp the outcome-evaluation horizon: this applied edit is a HYPOTHESIS to be
     # checked on/after this date (see tag_outcome / due_for_review). ISO dates sort
@@ -936,6 +1083,69 @@ def _selftest() -> int:
             self._write("p4", str(self.agent), "NONEXISTENT", "y")
             with self.assertRaises(AdaptError):
                 apply_proposal("p4")
+
+        # --- frozen frontmatter (added 2026-07-28 with youtube-researcher, the
+        # first allowlisted agent carrying Bash + untrusted web input) ----------
+        def _fm_agent(self, tools="Read, Write, Grep", model="sonnet"):
+            p = AGENTS_DIR / "scriptwriter.md"
+            p.write_text(
+                f"---\nname: scriptwriter\ndescription: d\ntools: {tools}\n"
+                f"model: {model}\n---\n\nBody line.\nUse hook style A.\n",
+                encoding="utf-8")
+            return p
+
+        def test_reject_tools_escalation(self):
+            """The whole point: an approved edit must never hand an agent a new
+            capability — least of all one that runs unattended."""
+            a = self._fm_agent()
+            self._write("f1", str(a), "tools: Read, Write, Grep",
+                        "tools: Read, Write, Grep, Bash")
+            with self.assertRaises(AdaptError):
+                apply_proposal("f1")
+            self.assertIn("tools: Read, Write, Grep\n", a.read_text())
+            self.assertNotIn("Bash", a.read_text())
+
+        def test_reject_model_tier_change(self):
+            """`model:` is a locked value needing a Decisions_Log entry; an
+            auto-apply would change a spend tier with no record of why."""
+            a = self._fm_agent()
+            self._write("f2", str(a), "model: sonnet", "model: opus")
+            with self.assertRaises(AdaptError):
+                apply_proposal("f2")
+            self.assertIn("model: sonnet", a.read_text())
+
+        def test_reject_name_rewrite(self):
+            """`name:` is the dispatch key — rewriting it silently unhooks the agent."""
+            a = self._fm_agent()
+            self._write("f3", str(a), "name: scriptwriter", "name: something-else")
+            with self.assertRaises(AdaptError):
+                apply_proposal("f3")
+
+        def test_refusal_leaves_no_backup_behind(self):
+            """Refusals must mutate NOTHING — not even a stray .bak- file."""
+            a = self._fm_agent()
+            self._write("f4", str(a), "tools: Read, Write, Grep", "tools: Bash")
+            with self.assertRaises(AdaptError):
+                apply_proposal("f4")
+            self.assertEqual(list(AGENTS_DIR.glob("*.bak-pre-adapt-*")), [])
+            self.assertTrue((QUEUE_DIR / "f4.md").exists(), "proposal stays pending")
+
+        def test_body_edit_on_a_frontmatter_file_still_applies(self):
+            """The guard must not block the legitimate case it sits next to."""
+            a = self._fm_agent()
+            self._write("f5", str(a), "Use hook style A.", "Use hook style B.")
+            apply_proposal("f5")
+            self.assertIn("hook style B.", a.read_text())
+            self.assertIn("tools: Read, Write, Grep", a.read_text())
+
+        def test_youtube_researcher_is_allowlisted(self):
+            """Steve's 2026-07-28 decision, pinned so a refactor can't drop it."""
+            self.assertIn("youtube-researcher.md", ALLOWED_AGENT_NAMES)
+
+        def test_proposer_still_cannot_edit_itself(self):
+            """The no-self-modification invariant must survive any allowlist growth."""
+            self.assertNotIn("adaptation-proposer.md", ALLOWED_AGENT_NAMES)
+            self.assertNotIn("skeptical-code-reviewer.md", ALLOWED_AGENT_NAMES)
 
         def test_ambiguous_match(self):
             self.agent.write_text("dup\ndup\n", encoding="utf-8")

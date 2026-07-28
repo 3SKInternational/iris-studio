@@ -82,10 +82,82 @@ class TestFrontmatterErrors(unittest.TestCase):
         body = "x" * 30000
         p = d / "fat.md"
         p.write_text(f"---\nname: fat\ndescription: d\nmodel: sonnet\ntools: Read\n---\n\n{body}")
-        _, warnings = adl.lint(d, None, max_kb=20.0)
+        _, warnings, _ = adl.lint(d, None, max_kb=20.0)
         expected = f"{p.stat().st_size / 1024:.1f}KB"
         self.assertTrue(any(expected in w for w in warnings),
                         f"expected {expected} in {warnings}")
+
+
+class TestSizeBaselines(unittest.TestCase):
+    """Over-cap defs with a reviewed baseline are silent; growth past it warns.
+
+    The point of the baseline is that five permanently-warning defs train everyone
+    to ignore the gate. But going silent must NOT mean going blind: growth past the
+    audited size has to still fire, or the mechanism just deletes the signal.
+    """
+
+    def _def(self, d: Path, name: str, kb: float):
+        """Write `name` sized to approximately `kb` kilobytes."""
+        head = "---\nname: %s\ndescription: d\nmodel: sonnet\ntools: Read\n---\n\n" % name
+        p = d / f"{name}.md"
+        p.write_text(head + "x" * max(0, int(kb * 1024) - len(head)))
+        return p
+
+    def _lint(self, entries, baselines):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = Path(td.name)
+        for name, kb in entries:
+            self._def(d, name, kb)
+        orig = adl.REVIEWED_BASELINES_KB
+        adl.REVIEWED_BASELINES_KB = baselines
+        self.addCleanup(lambda: setattr(adl, "REVIEWED_BASELINES_KB", orig))
+        return adl.lint(d, None, max_kb=20.0)
+
+    def test_unreviewed_oversize_still_warns(self):
+        """The original signal must survive: a def nobody audited still shouts."""
+        _, warnings, baselined = self._lint([("newbie", 40.0)], {})
+        self.assertTrue(any("SIZE" in w and "newbie.md" in w for w in warnings), warnings)
+        self.assertEqual(baselined, [])
+
+    def test_baselined_def_at_its_baseline_is_silent(self):
+        _, warnings, baselined = self._lint([("big", 40.0)], {"big.md": 40.0})
+        self.assertEqual(warnings, [])
+        self.assertEqual([n for n, _, _ in baselined], ["big.md"])
+
+    def test_growth_past_the_grace_warns(self):
+        """Literal sizes, NOT values derived from GROWTH_GRACE_KB — a fixture that
+        moves with the constant cannot detect the constant changing."""
+        _, warnings, baselined = self._lint([("big", 43.0)], {"big.md": 40.0})
+        self.assertTrue(any("GROWTH" in w and "big.md" in w for w in warnings), warnings)
+        self.assertEqual(baselined, [], "a grown def is a warning, not a silent carry")
+
+    def test_growth_within_the_grace_stays_silent(self):
+        _, warnings, _ = self._lint([("big", 41.0)], {"big.md": 40.0})
+        self.assertEqual(warnings, [], "a 1KB drift must not nag")
+
+    def test_the_grace_is_two_kb(self):
+        """Pins the constant itself, in both directions, so a silent widening of
+        the grace (which would suppress real growth) fails here."""
+        self.assertEqual(adl.GROWTH_GRACE_KB, 2.0)
+
+    def test_shrinking_below_the_baseline_is_silent_not_negative_growth(self):
+        """A def that got SMALLER than its baseline is a win, never a warning."""
+        _, warnings, baselined = self._lint([("big", 25.0)], {"big.md": 40.0})
+        self.assertEqual(warnings, [])
+        self.assertEqual([n for n, _, _ in baselined], ["big.md"])
+
+    def test_baselined_def_under_the_cap_is_not_reported_at_all(self):
+        """Below --max-kb nothing applies — not a warning, not a carry."""
+        _, warnings, baselined = self._lint([("small", 5.0)], {"small.md": 40.0})
+        self.assertEqual((warnings, baselined), ([], []))
+
+    def test_real_baselines_cover_exactly_the_known_oversize_defs(self):
+        """Guards against a baseline entry outliving the def it excused."""
+        self.assertEqual(
+            set(adl.REVIEWED_BASELINES_KB),
+            {"scriptwriter.md", "scene-image-prompt-generator.md",
+             "thumbnail-coordinator.md", "image-reviewer.md", "youtube-researcher.md"})
 
 
 class TestRosterCollector(unittest.TestCase):
@@ -150,25 +222,25 @@ class TestRosterTier(unittest.TestCase):
 
     def test_charted_agent_with_no_def_on_disk_errors(self):
         d, chart = self._fixture(["alpha"], {"ceo": {"agent": "alpha", "staff": ["ghost"]}})
-        errors, _ = adl.lint(d, chart, max_kb=20.0)
+        errors, _, _ = adl.lint(d, chart, max_kb=20.0)
         self.assertTrue(any("ghost" in e and "does not exist" in e for e in errors),
                         f"expected a missing-def ROSTER error, got {errors}")
 
     def test_def_on_disk_absent_from_chart_errors(self):
         d, chart = self._fixture(["alpha", "orphan"], {"ceo": {"agent": "alpha"}})
-        errors, _ = adl.lint(d, chart, max_kb=20.0)
+        errors, _, _ = adl.lint(d, chart, max_kb=20.0)
         self.assertTrue(any("orphan" in e and "absent from org_chart" in e for e in errors),
                         f"expected an absent-from-chart ROSTER error, got {errors}")
 
     def test_matching_roster_produces_no_error(self):
         d, chart = self._fixture(["alpha", "beta"],
                                  {"ceo": {"agent": "alpha", "staff": ["beta"]}})
-        errors, _ = adl.lint(d, chart, max_kb=20.0)
+        errors, _, _ = adl.lint(d, chart, max_kb=20.0)
         self.assertEqual(errors, [])
 
     def test_non_fleet_tooling_agent_is_not_flagged(self):
         d, chart = self._fixture(["alpha", "echo"], {"ceo": {"agent": "alpha"}})
-        errors, _ = adl.lint(d, chart, max_kb=20.0)
+        errors, _, _ = adl.lint(d, chart, max_kb=20.0)
         self.assertEqual(errors, [], "echo is in NON_FLEET and must be exempt")
 
     def test_missing_org_chart_errors_instead_of_raising(self):
@@ -176,7 +248,7 @@ class TestRosterTier(unittest.TestCase):
         is a recurring failure here (the FDA/cask incident). The steward must get
         a routed ROSTER error, not a FileNotFoundError traceback."""
         d, _ = self._fixture(["alpha"], {"ceo": {"agent": "alpha"}})
-        errors, _ = adl.lint(d, Path("/nonexistent/definitely/not/here.json"), max_kb=20.0)
+        errors, _, _ = adl.lint(d, Path("/nonexistent/definitely/not/here.json"), max_kb=20.0)
         self.assertTrue(any("org chart not found" in e for e in errors),
                         f"expected a ROSTER not-found error, got {errors}")
 
@@ -186,7 +258,7 @@ class TestRosterTier(unittest.TestCase):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         empty = Path(td.name)
-        errors, warnings = adl.lint(empty, None, max_kb=20.0)
+        errors, warnings, _ = adl.lint(empty, None, max_kb=20.0)
         self.assertTrue(any("no agent defs found" in e for e in errors))
         self.assertEqual(warnings, [])
 
@@ -205,7 +277,7 @@ class TestLintTiers(unittest.TestCase):
     def test_oversize_warns_and_does_not_error(self):
         d = self._dir_with("fat", "name: fat\ndescription: d\nmodel: sonnet\n"
                                   "tools: Read", "x" * 40000)
-        errors, warnings = adl.lint(d, None, max_kb=20.0)
+        errors, warnings, _ = adl.lint(d, None, max_kb=20.0)
         self.assertEqual(errors, [])
         self.assertTrue(any("fat.md" in w for w in warnings))
 
@@ -214,12 +286,12 @@ class TestLintTiers(unittest.TestCase):
         silently — the loudest possible failure is the right one."""
         d = self._dir_with("real", "name: WRONG\ndescription: d\nmodel: sonnet\n"
                                    "tools: Read")
-        errors, _ = adl.lint(d, None, max_kb=20.0)
+        errors, _, _ = adl.lint(d, None, max_kb=20.0)
         self.assertTrue(any("real.md" in e and "!=" in e for e in errors))
 
     def test_clean_small_def_is_silent(self):
         d = self._dir_with("ok", "name: ok\ndescription: d\nmodel: sonnet\ntools: Read")
-        errors, warnings = adl.lint(d, None, max_kb=20.0)
+        errors, warnings, _ = adl.lint(d, None, max_kb=20.0)
         self.assertEqual((errors, warnings), ([], []))
 
 
@@ -283,6 +355,41 @@ class TestCli(unittest.TestCase):
         broken = self._agents_dir(bad=("nope\n", "body\n"))
         r2 = self._run("--agents-dir", str(broken), "--no-roster", "--quiet")
         self.assertIn("FRONT", r2.stdout, "quiet must still report defects")
+
+    # These drive the CLI against the REAL REVIEWED_BASELINES_KB by naming the
+    # fixture after a baselined def — so they exercise the actual wiring rather
+    # than an injected dict, and would catch the constant being emptied.
+    _BASELINED = "scriptwriter.md"          # real baseline 53.6KB, grace 2.0KB
+
+    def _sized(self, kb):
+        """A dir holding one def named after a baselined agent, sized to `kb`."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = Path(td.name)
+        stem = self._BASELINED[:-3]
+        head = f"---\nname: {stem}\ndescription: d\nmodel: sonnet\ntools: Read\n---\n\n"
+        (d / self._BASELINED).write_text(head + "x" * (int(kb * 1024) - len(head)))
+        return d
+
+    def test_baselined_summary_is_shown_on_a_normal_run(self):
+        """Silent must not mean hidden. If the carried defs stop printing, nobody
+        can see what is being carried without reading the source — which is how a
+        baseline quietly becomes a permanent excuse."""
+        r = self._run("--agents-dir", str(self._sized(53.6)), "--no-roster")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("reviewed baseline", r.stdout)
+        self.assertIn(self._BASELINED, r.stdout)
+
+    def test_baselined_summary_is_suppressed_under_quiet(self):
+        """--quiet is the cron path: problems only, never routine carry noise."""
+        r = self._run("--agents-dir", str(self._sized(53.6)), "--no-roster", "--quiet")
+        self.assertEqual(r.stdout.strip(), "",
+                         "quiet must be silent for a baselined, non-growing def")
+
+    def test_growth_is_reported_even_under_quiet(self):
+        """The one thing --quiet must never swallow."""
+        r = self._run("--agents-dir", str(self._sized(60.0)), "--no-roster", "--quiet")
+        self.assertIn("GROWTH", r.stdout)
 
     def test_missing_agents_dir_is_a_usage_error(self):
         r = self._run("--agents-dir", "/nonexistent/definitely/not/here", "--no-roster")
