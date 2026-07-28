@@ -43,6 +43,11 @@ Section 5 of metrics has hard sizes for the three files loaded into the daemon p
 - **TODO.md** cap: 80 lines. Same enforcement.
 - **CLAUDE_CODE_HANDOFF.md** cap: 150 KB. **Execute the rotation** (E9 — the ONE build-action the steward performs; see the carve-out in Hard bans): run `python3 /Volumes/AI_Workspace/iris_studio/scripts/rotate_bridge.py`. It is size-gated (a no-op when under the cap, so running it every audit is safe), atomic, takes a timestamped backup, asserts byte-conservation before writing, and only MOVES whole entries to `CLAUDE_CODE_HANDOFF_Archive.md` (never deletes, never edits the content inside an entry). Report the before/after KB it prints in the audit-log entry + daily-note bullet.
 
+**Agent-def size + roster gate.** Run `python3 /Volumes/AI_Workspace/iris_studio/scripts/agent_def_lint.py`. Read-only — it never edits a def. It reports three things:
+- `✗ FRONT` / `✗ ROSTER` (exit 1) — a broken agent def (missing frontmatter, `name:` not matching the filename → dispatch-by-name silently fails) or roster drift between `~/.claude/agents/` and `dashboard/org_chart.json` (a charted agent with no def renders a broken dashboard node). These are **defects**: route to **bridge entry** (Claude Code lane) to fix.
+- `⚠ SIZE` — a def over 20 KB. This is the ADAPTS-growth gate: the loop only ever APPENDS (measured 2026-07-27: scene-image-prompt-generator 11 KB → 50 KB in five weeks), and every dispatch pays that prompt before it reads a single file. Report the current over-cap list + each one's KB in the audit-log entry so the trend is visible audit-to-audit.
+- **Do NOT compact a def yourself** — that is banned build-action territory and, more importantly, every rule in those files traces to a defect someone paid for (a 2026-07-27 check found ZERO duplicate paragraphs in the 50 KB file — there is no free reduction). A compaction belongs in the `/adapt` queue where Steve approves each exact edit, which is the mechanism that already governs those files. Route it as a **proposal recommendation**, not an edit.
+
 Also check Section 7 (MCP audit) for `✗ Failed to connect` rows — every failed MCP pays the schema-load tax for zero payoff. If a failure has persisted ≥2 audits, route to **bridge entry** (Claude Code lane) for either fix or removal.
 
 ### Pass 5 — Append to the ledger + write blueprints + route

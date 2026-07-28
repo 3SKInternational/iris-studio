@@ -114,7 +114,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -223,9 +223,16 @@ DAILY_BRIEFING_BAK_DIR = WORKSPACE_DIR / "07_Archive" / "daily_briefing_baks"
 DAILY_BRIEFING_BAK_RETENTION = 30
 TODO_FILE = WORKSPACE_DIR / "TODO.md"
 DECISIONS_DIR = WORKSPACE_DIR / "06_CEO" / "Decisions_Log"
-# C-suite org briefs (written daily 04:25 ET by the org-briefs Claude Code job).
-# The morning brief opens with today's <DATE>_ceo.md when present.
+# C-suite org briefs (written WEEKLY, Mondays 04:25 ET, by the org-briefs Claude
+# Code job — daily until 2026-07-27). The morning brief opens with the NEWEST
+# <DATE>_ceo.md, labelled with that date, so a weekly cadence doesn't blank the
+# section six days out of seven. See _read_latest_ceo_brief.
 ORG_BRIEFS_DIR = WORKSPACE_DIR / "06_CEO" / "Org_Briefs"
+# Serving the newest brief forever would turn a permanently-dead org-briefs job
+# into a silent degradation: the section keeps rendering and nothing ever says the
+# producer stopped. Past this age the read returns nothing, which re-arms the
+# morning brief's explicit "no CEO brief" line. Sized at two missed weekly fires.
+CEO_BRIEF_MAX_AGE_DAYS = 15
 SESSIONS_DIR = WORKSPACE_DIR / "_Iris_Memory" / "Sessions"
 RECENT_DECISIONS_LIMIT = 3
 RECENT_SESSIONS_LIMIT = 3
@@ -650,7 +657,7 @@ AUTONOMOUS_DISPATCHES: list[dict] = [
             "and write a verification snapshot to "
             "06_CEO/Status_Reports/[YYYY-MM-DD]_status.md. Cover: drift (where queue "
             "markers / bridge claims disagree with disk + git — lead with this), job "
-            "health (dead/stale launchd jobs + retry backlog, for chief-technology to "
+            "health (dead/stale launchd jobs + retry backlog, for the technology dept brief to "
             "consume), what actually shipped (verified against disk + git, do NOT "
             "trust queue markers blindly), what's in flight (owner + last real "
             "movement), what's blocked (categorize: Steve / dependency / "
@@ -1297,19 +1304,68 @@ def _format_history_for_cloud(history: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _read_todays_ceo_brief() -> str:
-    """Today's CEO brief (06_CEO/Org_Briefs/<today-ET>_ceo.md), written by the
-    04:25 ET org-briefs job. Returns "" if absent (job hasn't run yet / failed)
-    so the morning brief degrades gracefully instead of fabricating a status.
-    ET date matches the org-briefs file-naming (today's ISO date, local ET)."""
-    today = datetime.now(TIMEZONE).date().isoformat()
-    path = ORG_BRIEFS_DIR / f"{today}_ceo.md"
-    # Expected-absent before the 04:25 job runs — degrade silently (no WARNING
-    # log noise that would trip the pre-brief error scan). Other read errors
-    # still surface via _read_file.
-    if not path.exists():
-        return ""
-    return _read_file(path)
+def _ceo_brief_is_stale(brief_date: str, today_iso: str) -> bool:
+    """True when a brief is too old to serve at all (see CEO_BRIEF_MAX_AGE_DAYS).
+
+    An unparseable date reads as stale: a filename we cannot age is one we cannot
+    honestly label, and silently serving it is the failure mode being prevented.
+    """
+    try:
+        age = (date.fromisoformat(today_iso) - date.fromisoformat(brief_date)).days
+    except ValueError:
+        return True
+    return age > CEO_BRIEF_MAX_AGE_DAYS
+
+
+def _read_latest_ceo_brief(today_iso: str | None = None) -> tuple[str, str]:
+    """The NEWEST CEO brief (06_CEO/Org_Briefs/<DATE>_ceo.md) and its ISO date.
+
+    Returns ("", "") when none exists OR when the newest is older than
+    CEO_BRIEF_MAX_AGE_DAYS, so the morning brief degrades to its explicit
+    "no CEO brief" line instead of fabricating a status.
+
+    Reads the newest rather than strictly today's (changed 2026-07-27, when the
+    org-briefs job moved from daily to weekly): a weekly cadence would otherwise
+    blank this section six days out of seven. The date is returned so the caller
+    can label the brief's age honestly; a stale brief presented as current is
+    exactly the fabrication this pipeline exists to prevent.
+
+    The age ceiling exists because serving the newest brief UNBOUNDED trades a
+    loud failure for a silent one: a permanently-dead org-briefs job would keep
+    rendering last month's numbers with nothing ever announcing that the producer
+    stopped (run_claude_job.sh only catches a nonzero exit, so an agent that
+    writes nothing and returns 0 is invisible). Past the ceiling the section
+    disappears, which is the signal.
+
+    `today_iso` is injectable so the ceiling is testable without freezing the clock.
+    """
+    # No is_dir() pre-check: Path.glob returns [] and never raises when the path
+    # is missing, is a file rather than a directory, or is unreadable (verified
+    # on 3.14 and 3.12 for all three), so the empty guard below already covers
+    # every not-a-usable-directory case. A separate is_dir() branch was provably
+    # an equivalent mutant — an untestable line. Don't add one back.
+    # Filenames are ISO-dated (<YYYY-MM-DD>_ceo.md); the glob is anchored to that
+    # shape so a stray non-ISO name can't sort last, win, and yield a junk label.
+    briefs = sorted(p for p in ORG_BRIEFS_DIR.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_ceo.md"))
+    if not briefs:
+        return "", ""
+    latest = briefs[-1]
+    if _ceo_brief_is_stale(latest.name[:len("YYYY-MM-DD")],
+                           today_iso or datetime.now(TIMEZONE).date().isoformat()):
+        return "", ""
+    return _read_file(latest), latest.name[:len("YYYY-MM-DD")]
+
+
+def _ceo_brief_age_label(brief_date: str, today_iso: str) -> str:
+    """How the CEO brief's age is announced in the daemon prompt.
+
+    "today's" ONLY when the brief really is from today; otherwise "dated <ISO>".
+    Extracted from the prompt f-string so it can be tested: the wrong branch here
+    presents a week-old brief's numbers as current, which is exactly the
+    fabrication the anti-fabrication rules exist to prevent, and inlined in the
+    f-string no test could reach it.
+    """
+    return "today's" if brief_date == today_iso else f"dated {brief_date}"
 
 
 def load_system_prompt_cloud(history: list[dict]) -> str:
@@ -1333,7 +1389,7 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
     blueprint = _read_file(BLUEPRINT_FILE)
     addendum = _read_file(CONTEXT_FILE)
     vault_moc = _read_file(VAULT_MOC_FILE)
-    ceo_brief = _read_todays_ceo_brief()
+    ceo_brief, ceo_brief_date = _read_latest_ceo_brief()
     inbox = _read_file(INBOX_FILE)
     briefing = _read_file(DAILY_BRIEFING_FILE)
     build_queue = _read_file(BUILD_QUEUE_FILE)
@@ -1359,10 +1415,14 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
             + vault_moc
         )
     if ceo_brief:
+        _age = _ceo_brief_age_label(
+            ceo_brief_date, datetime.now(TIMEZONE).date().isoformat())
         sections.append(
-            "# === CEO BRIEF (today's executive top layer — state of the company, "
+            f"# === CEO BRIEF ({_age} executive top layer — state of the company, "
             "per-department roll-up, this week's single highest-leverage move, "
-            "ranked recommended dispatches) ===\n\n" + ceo_brief
+            "ranked recommended dispatches). Written weekly; if the date above is "
+            "not today, treat its numbers as of that date and say so rather than "
+            "presenting them as current. ===\n\n" + ceo_brief
         )
     if inbox:
         sections.append(
@@ -3389,17 +3449,22 @@ MORNING_BRIEFING_PROMPT = (
     "are out of scope for the brief.\n\n"
     "STRATEGIC LAYER (lead with this). Draw it from the '# === CEO BRIEF' "
     "section in your system prompt and emit these four blocks IN ORDER:\n"
-    "🏛️ STATE OF THE COMPANY — 2-3 sentences from the CEO brief's state-of-the-company.\n"
+    "🏛️ STATE OF THE COMPANY — 2-3 sentences from the CEO brief's state-of-the-company. "
+    "The CEO brief is written WEEKLY (Mondays), and its header states the date it was "
+    "written. If that date is NOT today, you MUST open this block with 'As of "
+    "<that date>:' — its numbers are that day's, not today's. Never present a "
+    "prior-day brief's figures as current; that is the one unacceptable error here.\n"
     "🎯 HIGHEST-LEVERAGE MOVE — this week's single highest-leverage move, verbatim intent.\n"
     "📊 DEPT ROLL-UP — the five department one-liners (Marketing / Intelligence / "
     "Quality / Finance / Technology). If the CEO brief marks a department "
     "missing or stale, show it as '⚠ <dept>: no current brief' — never invent a status.\n"
     "🤖 RECOMMENDED DISPATCHES — the CEO brief's ranked dispatches (max 6). These are "
     "SUGGESTIONS Steve one-taps to fire — recommend, never imply they already ran.\n"
-    "If there is NO '# === CEO BRIEF' section in your context (the org-briefs job "
-    "did not run today), SKIP the four blocks and emit a single line '⚠ no CEO brief "
-    "today' instead — then continue to the operational layer. NEVER fabricate the "
-    "strategic blocks from other context.\n\n"
+    "If there is NO '# === CEO BRIEF' section in your context — meaning no CEO brief "
+    "is on disk at all, or the newest one is too old to serve (the weekly org-briefs "
+    "job has been failing) — SKIP the four blocks and emit a single line "
+    "'⚠ no current CEO brief — check the org-briefs job' instead, then continue to "
+    "the operational layer. NEVER fabricate the strategic blocks from other context.\n\n"
     "— — —\n\n"
     "OPERATIONAL LAYER (after the strategic layer). Concise mobile-friendly plain prose:\n"
     "1. One opening sentence on overall situation (use the current date)\n"

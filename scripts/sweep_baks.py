@@ -19,7 +19,14 @@ Usage:
   sweep_baks.py                      # dry-run: list what WOULD move
   sweep_baks.py --apply              # move them
   sweep_baks.py --min-age-days 14    # only sweep baks older than 14 days
+  sweep_baks.py --also ~/.claude/agents --apply   # also sweep a tree with no
+                                     # archive of its own, into the vault's
   sweep_baks.py --selftest           # offline logic check
+
+The scheduled job (com.iris.claude-code-bak-sweep, Sun 04:40) runs
+`--apply --also /Users/steve/.claude/agents`: the agents dir accumulates a .bak
+on every applied ADAPTS adaptation (67 had piled up by 2026-07-27) and has no
+archive of its own, so its backups are parked under the vault's.
 """
 from __future__ import annotations
 import argparse
@@ -84,15 +91,32 @@ def _free_dest(dest: Path) -> Path:
         i += 1
 
 
-def sweep(vault: Path, min_age_days: float, apply: bool) -> int:
+def archive_dest_root(vault: Path, archive_root: Path | None) -> Path:
+    """Where swept baks land. Default (archive_root=None) = the swept tree's own
+    07_Archive/bak_sweep — the original vault behaviour, byte-identical.
+
+    When sweeping a tree that has no archive of its own (e.g. ~/.claude/agents),
+    pass --archive-root to park the baks in the vault instead, under a subdir
+    named for the swept tree so provenance stays obvious and the two sweeps stay
+    in separate namespaces. (Not an absolute guarantee: a top-level dir in the
+    vault sharing the swept tree's basename would map to the same path. None
+    exists today, and _free_dest prevents clobbering if one ever does.)
+    """
+    if archive_root is None or archive_root == vault:
+        return vault / ARCHIVE_SUBDIR
+    return archive_root / ARCHIVE_SUBDIR / vault.name
+
+
+def sweep(vault: Path, min_age_days: float, apply: bool,
+          archive_root: Path | None = None) -> int:
     now = time.time()
     files = find_sweepable(vault, min_age_days, now)
-    dest_root = vault / ARCHIVE_SUBDIR
+    dest_root = archive_dest_root(vault, archive_root)
     if not files:
         print(f"sweep_baks: nothing to sweep (0 cold .bak files older than {min_age_days}d).")
         return 0
     print(f"sweep_baks: {len(files)} cold .bak file(s) "
-          f"{'MOVING' if apply else 'would move'} → {ARCHIVE_SUBDIR}/")
+          f"{'MOVING' if apply else 'would move'} → {dest_root}/")
     for p in files:
         rel = p.relative_to(vault)
         age_d = _age_days(p, now)
@@ -151,8 +175,25 @@ def _selftest() -> int:
         n2 = _free_dest(d); n2.write_text("g2")
         n3 = _free_dest(d); n3.write_text("g3")
         no_clobber = len({n1, n2, n3}) == 3 and all(x.exists() for x in (n1, n2, n3))
+        # archive-root routing: default is unchanged; a foreign archive-root parks
+        # under a subdir named for the swept tree (so a vault sweep and an agents
+        # sweep can never land on the same rel-path).
+        other = v / "elsewhere"
+        other.mkdir(parents=True, exist_ok=True)
+        # Reported as three SEPARATE checks, not one `and` chain: a chain hides
+        # which leg broke, and an and->or slip inside it still returns 0 (the
+        # selftest cannot catch its own weakening). One entry per property.
+        dest_default = archive_dest_root(v, None)
+        dest_same = archive_dest_root(v, v)
+        dest_foreign = archive_dest_root(v, other)
         checks = {
             "selects exactly the sweepable set (injected future-now)": ok,
+            "archive-root default → the swept tree's own archive":
+                dest_default == v / ARCHIVE_SUBDIR,
+            "archive-root == vault → same as default (no extra nesting)":
+                dest_same == v / ARCHIVE_SUBDIR,
+            "archive-root foreign → nests under the swept tree's name":
+                dest_foreign == other / ARCHIVE_SUBDIR / v.name,
             "ctime guard: backdated-mtime files read fresh vs real-now": not fresh_found,
             "is_bak marker": is_bak("x.md.bak") and is_bak("x.bak-1")
                               and not is_bak("x.backup") and not is_bak("x.bak.md"),
@@ -169,7 +210,23 @@ def _selftest() -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sweep stale .bak files to 07_Archive/bak_sweep/.")
-    ap.add_argument("--vault", type=Path, default=DEFAULT_VAULT)
+    ap.add_argument("--vault", type=Path, default=DEFAULT_VAULT,
+                    help="tree to sweep (default: the 3SK vault)")
+    ap.add_argument("--archive-root", type=Path, default=None,
+                    help="park swept baks under THIS tree's 07_Archive/bak_sweep/<name>/ "
+                         "instead of the swept tree's own. Use when sweeping a tree with "
+                         "no archive of its own, e.g. --vault ~/.claude/agents "
+                         "--archive-root /Users/steve/Documents/3SK/outputs")
+    ap.add_argument("--also", type=Path, action="append", default=[], metavar="TREE",
+                    help="additionally sweep TREE, archiving into --vault's "
+                         "07_Archive/bak_sweep/<name>/. Repeatable. For trees that "
+                         "accumulate baks but have no archive of their own — notably "
+                         "~/.claude/agents, where the ADAPTS loop backs up an agent def "
+                         "on every applied adaptation. A missing TREE is skipped with a "
+                         "note, not an error, so one absent path can't kill the sweep. "
+                         "NOTE: an --also tree always archives into --vault's "
+                         "07_Archive/bak_sweep/<name>/; --archive-root applies to the "
+                         "primary --vault sweep only.")
     ap.add_argument("--min-age-days", type=float, default=7.0,
                     help="only sweep baks older than this (default 7)")
     ap.add_argument("--apply", action="store_true", help="actually move (default: dry-run)")
@@ -179,7 +236,22 @@ def main() -> None:
         sys.exit(_selftest())
     if not a.vault.is_dir():
         ap.error(f"vault not found: {a.vault}")
-    sys.exit(sweep(a.vault, a.min_age_days, a.apply))
+    if a.archive_root is not None and not a.archive_root.is_dir():
+        ap.error(f"archive-root not found: {a.archive_root}")
+    # No return-code accumulation across sweeps: sweep() returns 0 on every path
+    # (a real failure surfaces as an exception from shutil.move, which exits
+    # non-zero on its own). An `rc = sweep(...) or rc` accumulator was provably
+    # dead — mutation flipped its `or` to `and` with nothing observable, because
+    # every operand is always 0. Dead plumbing that looks like error handling is
+    # worse than none: it implies a failure path that does not exist.
+    sweep(a.vault, a.min_age_days, a.apply, a.archive_root)
+    for extra in a.also:
+        if not extra.is_dir():
+            print(f"sweep_baks: --also {extra} does not exist — skipped.")
+            continue
+        print()
+        sweep(extra, a.min_age_days, a.apply, archive_root=a.vault)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

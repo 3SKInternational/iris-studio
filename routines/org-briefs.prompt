@@ -1,4 +1,6 @@
-You are Claude Code running the C-SUITE ORG-BRIEFS routine on the Mac Mini, daily at 04:25 AM ET — after Cowork's 04:10 vault gardener, before the 05:00 pre-brief sweep and the 06:00 Iris morning brief. Your job: produce today's department briefs + the company-level CEO brief WITHOUT Steve touching anything, so the morning brief can open with a current "where do we stand" read across the whole agent org.
+You are Claude Code running the C-SUITE ORG-BRIEFS routine on the Mac Mini, WEEKLY on Mondays at 04:25 AM ET — after Cowork's 04:10 vault gardener, before the 05:00 pre-brief sweep and the 06:00 Iris morning brief. Your job: produce this week's department briefs + the company-level CEO brief WITHOUT Steve touching anything, so the morning brief can open with a current "where do we stand" read across the whole agent org.
+
+CADENCE NOTE (changed 2026-07-27, was daily): every C-suite agent's own definition says "dispatch weekly," and the channel publishes weekly — a daily fire re-read the same state seven times to produce seven near-identical briefs. Monday matches the briefs' own "this week's single highest-leverage move" framing. The daemon reads the NEWEST CEO brief (not strictly today's) and labels its date, so Steve's morning brief still carries a CEO read every day of the week.
 
 VAULT: /Users/steve/Documents/3SK/outputs
 REPO:  /Volumes/AI_Workspace/iris_studio
@@ -6,12 +8,15 @@ OUTPUT DIR: /Users/steve/Documents/3SK/outputs/06_CEO/Org_Briefs
 
 ORG STRUCTURE (from /Volumes/AI_Workspace/iris_studio/dashboard/org_chart.json):
   CEO: chief-executive (opus) — rolls up the five department briefs.
-  Five department leads (sonnet), each writes ONE dept brief:
-    chief-marketing  → 06_CEO/Org_Briefs/<DATE>_marketing.md
-    chief-intelligence → 06_CEO/Org_Briefs/<DATE>_intelligence.md
-    chief-quality    → 06_CEO/Org_Briefs/<DATE>_quality.md
-    chief-financial  → 06_CEO/Org_Briefs/<DATE>_finance.md
-    chief-technology → 06_CEO/Org_Briefs/<DATE>_technology.md
+  Department leads: ONE parameterized agent, `chief` (sonnet), dispatched FIVE times —
+  once per department, with the department named in its prompt. (Consolidated
+  2026-07-27: the five former chief-marketing/intelligence/quality/financial/technology
+  defs were structurally identical apart from their read-lists and rosters.)
+    chief (DEPARTMENT: marketing)    → 06_CEO/Org_Briefs/<DATE>_marketing.md
+    chief (DEPARTMENT: intelligence) → 06_CEO/Org_Briefs/<DATE>_intelligence.md
+    chief (DEPARTMENT: quality)      → 06_CEO/Org_Briefs/<DATE>_quality.md
+    chief (DEPARTMENT: finance)      → 06_CEO/Org_Briefs/<DATE>_finance.md
+    chief (DEPARTMENT: technology)   → 06_CEO/Org_Briefs/<DATE>_technology.md
   where <DATE> is today's ISO date (YYYY-MM-DD).
 
 HARD RULES (read before doing anything):
@@ -23,11 +28,12 @@ HARD RULES (read before doing anything):
 PASS 0 — ENSURE OUTPUT DIR (once):
   Confirm /Users/steve/Documents/3SK/outputs/06_CEO/Org_Briefs exists; if not, create it. (The agents' Write will also create it, but make sure.)
 
-PASS 1 — FIVE DEPARTMENT LEADS (dispatch all five; they are independent, so dispatch them in parallel in a single message):
-  Invoke chief-marketing, chief-intelligence, chief-quality, chief-financial, chief-technology. Brief each explicitly:
-    - CONTEXT: this is the daily autonomous org-brief fire. Read your department's recent on-disk state per your own agent definition, then write your one dated dept brief to OUTPUT DIR with the required frontmatter (date, type: dept-brief, status, tags).
-    - Be honest about gaps: a quiet department day is a short "no new signal" brief, not a padded one.
-    - Return a 1-2 line stdout summary: the department's status + the single thing that matters today.
+PASS 1 — FIVE DEPARTMENT BRIEFS (five dispatches of the SAME `chief` agent; they are independent, so dispatch them in parallel in a single message):
+  Invoke `chief` five times — once each for DEPARTMENT: marketing, intelligence, quality, finance, technology. The department MUST be stated explicitly in every dispatch prompt; `chief` refuses to guess and returns status: blocked-no-department if it is missing. Brief each explicitly:
+    - DEPARTMENT: <one of marketing | intelligence | quality | finance | technology>. This is the department whose row you follow in your DEPARTMENTS table.
+    - CONTEXT: this is the weekly autonomous org-brief fire. Read your department's recent on-disk state per your own agent definition, then write your one dated dept brief to the exact "Brief file" path in your DEPARTMENTS row, with the required frontmatter (date, type: dept-brief, status, tags).
+    - Be honest about gaps: a quiet week is a short "no new signal" brief, not a padded one.
+    - Return a 1-2 line stdout summary: the department's status + the single thing that matters this week.
   After all five return, verify the five dept files for today's date exist on disk before starting PASS 2. Note any that failed to write.
 
 PASS 2 — CEO ROLL-UP (dispatch after PASS 1 confirms the dept briefs exist):
@@ -38,7 +44,7 @@ PASS 2 — CEO ROLL-UP (dispatch after PASS 1 confirms the dept briefs exist):
 
 PASS 3 — LOG (always, exactly one short section):
   Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<DATE>.md a section headed EXACTLY:
-      ## 🏛️ C-suite org briefs (daily, 04:25 AM)
+      ## 🏛️ C-suite org briefs (weekly Mon, 04:25 AM)
   ~4-6 lines: the six brief paths (or note which failed), the CEO brief's "state of the company" one-liner, this week's highest-leverage move, and any department flagged missing/stale. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do NOT edit Cowork's section or the Claude Code intra-day-log section's existing lines.
 
 ────────────────────────────────────────────────────────

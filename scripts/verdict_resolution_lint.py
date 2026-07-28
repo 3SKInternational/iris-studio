@@ -7,7 +7,7 @@ linters (receipt_surface_id_lint / triad_sync_check / youtube_reality_check) and
 manifest_spine_lint. This one closes a different drift: a REVISE/HOLD verdict
 file is a fact about a MOMENT, but nothing on the file changes when the verdict
 is superseded (a fix applied, Steve ships-as-is, or the video publishes). So a
-downstream scanner (chief-quality dept brief -> CEO brief -> morning brief) reads
+downstream scanner (the quality dept brief -> CEO brief -> morning brief) reads
 the file, not the bridge/daily where the superseding event was recorded, and
 escalates a closed verdict as an open gate forever.
 
