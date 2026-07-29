@@ -89,6 +89,10 @@ def parse_args() -> argparse.Namespace:
                    default="public", help="Target privacy (default: public).")
     p.add_argument("--publish-at", help="ISO8601 UTC scheduled publish time "
                    "(e.g. 2026-10-01T13:00:00Z). Keeps status private + publishAt.")
+    p.add_argument("--clear-schedule", action="store_true",
+                   help="Explicitly DROP an existing scheduled publishAt (unschedule). "
+                        "Without this flag an existing schedule is PRESERVED across a "
+                        "metadata refresh — omitting publishAt on a status update clears it.")
     p.add_argument("--category", help="Override categoryId (default: keep the video's current one).")
     p.add_argument("--allow-public", action="store_true",
                    help="Required to publish public OR schedule a publish.")
@@ -104,6 +108,118 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Validate + print the plan; touch no network.")
     return p.parse_args()
+
+
+def build_status(target_privacy: str, live_status: dict, publish_at: str | None,
+                 clear_schedule: bool) -> dict:
+    """Build the writable `status` part for videos.update.
+
+    videos.update REPLACES the status part wholesale, so every field we want kept
+    must be re-sent. Extracted from main() 2026-07-28 (two-pass codebase audit,
+    lane C) specifically so the schedule-preservation rule below is testable —
+    the defect it fixes was silent, and an inline branch had no runnable check.
+
+    Rules:
+      - explicit publish_at            -> schedule it
+      - clear_schedule                 -> drop any schedule (omission clears it)
+      - existing publishAt, staying private -> PRESERVE it
+      - going public OR unlisted       -> never carry publishAt (YouTube pairs a
+                                        schedule with privacyStatus=private ONLY;
+                                        schedule_publish.py:170 records this too)
+    """
+    status = {
+        "privacyStatus": target_privacy,
+        # selfDeclaredMadeForKids is the WRITABLE form; madeForKids is its read-only
+        # echo. Preserve the video's current kids designation (prefer the declared
+        # value, fall back to the read-only one) so we never flip it unexpectedly.
+        "selfDeclaredMadeForKids": bool(
+            live_status.get("selfDeclaredMadeForKids", live_status.get("madeForKids", False))
+        ),
+    }
+    for k in ("license", "embeddable", "publicStatsViewable"):
+        if k in live_status:
+            status[k] = live_status[k]
+
+    if publish_at:
+        # Scheduled: privacyStatus stays 'private' (set by the caller via
+        # target_privacy) and publishAt flips it public at that time.
+        status["publishAt"] = publish_at.replace("Z", "+00:00")
+    elif clear_schedule:
+        # Explicit unschedule. Omitting publishAt on a status update is what clears
+        # it server-side, so this branch deliberately does nothing.
+        pass
+    elif live_status.get("publishAt") and target_privacy == "private":
+        # PRESERVE an existing schedule. publishAt used to be written ONLY when
+        # --publish-at was passed, while the live publishAt was never read back — so
+        # the documented metadata-refresh form
+        #     publish_video.py Video_09 --privacy private
+        # silently CANCELLED a scheduled release: the video went private with no
+        # publishAt and never published, with no warning (going_public is False, so
+        # the release gate never fires). The receipt write then stored
+        # publish_at: None, destroying the local record, and youtube_reality_check
+        # compared private-vs-private and reported CLEAN — the same command rewrote
+        # the receipt the tripwire diffs against. 9 of 13 in-tree receipts carry a
+        # publish_at. Sibling schedule_publish.py:173-176 has always done this and
+        # names the reason: "re-send so an omission can't clear an existing schedule."
+        #
+        # ROUND-2 REGRESSION (2026-07-28 review): `!= "public"` also matched
+        # "unlisted", but YouTube requires privacyStatus=private to PAIR with a
+        # scheduled publishAt (schedule_publish.py:170 records this as required);
+        # a `--privacy unlisted` update on a scheduled video would have sent an
+        # illegal privacyStatus+publishAt combination and most likely 400'd. main()
+        # now die()s that combination explicitly before it reaches the API (see
+        # the unlisted+schedule guard ahead of build_status's call site).
+        status["publishAt"] = live_status["publishAt"]
+    return status
+
+
+def unlisted_schedule_conflict_message(target_privacy: str, clear_schedule: bool,
+                                       live_status: dict, vid: str) -> str | None:
+    """None if safe to proceed; else the die() message for main().
+
+    --privacy unlisted cannot carry a schedule -- YouTube pairs a scheduled
+    publishAt with privacyStatus=private only (schedule_publish.py:170 records
+    this as a required pairing). Extracted to a pure function (mirrors
+    upload_video.reupload_guard_message) so this refuses BEFORE the API call
+    with an actionable message, instead of surfacing as an opaque 400
+    (round-2 audit finding, 2026-07-28). --clear-schedule is exempt -- that IS
+    how you get out of this state."""
+    if (target_privacy == "unlisted" and not clear_schedule
+            and live_status.get("publishAt")):
+        return (f"{vid} has a scheduled publishAt {live_status['publishAt']}; "
+                "--privacy unlisted cannot carry a schedule (YouTube pairs a scheduled "
+                "publish with privacyStatus=private only) — pass --clear-schedule to "
+                "unschedule, or --privacy private to keep the schedule.")
+    return None
+
+
+def schedule_notice(status: dict, live_status: dict, publish_at: str | None,
+                    clear_schedule: bool) -> list[str]:
+    """Operator-facing line(s) about what is happening to an existing schedule.
+
+    Returns a LIST — empty when there is nothing schedule-related to say — rather
+    than a string-or-None the caller branches on. Extracting this from main()
+    (2026-07-28) pinned the logic but left `if notice:` at the call site, which
+    survived mutation because no suite drives main(). Returning a list lets the
+    caller loop, so the silent case is structural and there is no wiring branch
+    left to be wrong.
+
+    Callers print these AFTER the live fetch: the plan block runs before the
+    fetch and cannot know the current publishAt, so this is the first point where
+    the schedule's fate is both known and still changeable.
+    """
+    if status.get("publishAt") and not publish_at:
+        return [f"schedule   : PRESERVING existing publishAt {status['publishAt']} "
+                "(pass --clear-schedule to drop it)"]
+    # `and not publish_at`: with BOTH --publish-at and --clear-schedule, the run
+    # SETS a new schedule (build_status writes publish_at first), so announcing
+    # "CLEARING existing publishAt <old>" described the opposite of what happened
+    # — the operator was told a schedule was being dropped on the very run that
+    # installed one (round-3 review, 2026-07-28).
+    if clear_schedule and live_status.get("publishAt") and not publish_at:
+        return [f"schedule   : CLEARING existing publishAt {live_status['publishAt']} "
+                "(--clear-schedule)"]
+    return []
 
 
 def main() -> None:
@@ -254,23 +370,15 @@ def main() -> None:
     else:
         snippet["categoryId"] = live_snippet.get("categoryId") or "27"  # required by update.
 
-    status = {
-        "privacyStatus": target_privacy,
-        # selfDeclaredMadeForKids is the WRITABLE form; madeForKids is its read-only
-        # echo. Preserve the video's current kids designation (prefer the declared
-        # value, fall back to the read-only one) so we never flip it unexpectedly.
-        "selfDeclaredMadeForKids": bool(
-            live_status.get("selfDeclaredMadeForKids", live_status.get("madeForKids", False))
-        ),
-    }
-    for k in ("license", "embeddable", "publicStatsViewable"):
-        if k in live_status:
-            status[k] = live_status[k]
-    if publish_at:
-        # Scheduled: privacyStatus stays 'private' (set above via target_privacy)
-        # and publishAt flips it public at that time. Non-scheduled omits publishAt
-        # entirely (no stale value carried over, since we built status fresh).
-        status["publishAt"] = publish_at.replace("Z", "+00:00")
+    conflict_msg = unlisted_schedule_conflict_message(
+        target_privacy, args.clear_schedule, live_status, vid)
+    if conflict_msg:
+        die(conflict_msg)
+
+    status = build_status(target_privacy, live_status, publish_at, args.clear_schedule)
+
+    for _line in schedule_notice(status, live_status, publish_at, args.clear_schedule):
+        print(_line)
 
     body = {"id": video_id, "snippet": snippet, "status": status}
 

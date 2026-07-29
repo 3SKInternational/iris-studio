@@ -387,11 +387,19 @@ def lint(path: Path) -> dict:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
+        # should_alert=True, NOT False. Hardened 2026-07-28 (two-pass codebase audit,
+        # lane E). This is the REACHABLE arm of the "crashed linter reads as clean"
+        # class — lint_and_report's own except almost never fires because this one
+        # catches first. An unreadable deliverable is exactly the recorded FDA /
+        # X9-unmounted failure mode, and iris.py's A2 auto-pass gate computes
+        # `lint_clean = not should_alert`, so returning False let an UNCHECKED
+        # deliverable auto-suppress the whole content surface.
+        # Regression: test_lint_crash_alerts() in scripts/test_agent_output_lint.py.
         return {
             "path": str(path),
             "error": f"read failed: {exc}",
             "ok": False,
-            "should_alert": False,
+            "should_alert": True,
         }
 
     banned = check_banned_vocab(text)
@@ -529,12 +537,19 @@ def lint_and_report(deliverable: Path) -> dict:
             report.write_text(format_report(result), encoding="utf-8")
             result["report_path"] = str(report)
         return result
-    except Exception as exc:  # pragma: no cover — defensive
+    except Exception as exc:
+        # should_alert=True, NOT False. Hardened 2026-07-28 (two-pass codebase audit,
+        # lane E): this returned False, and iris.py's A2 auto-pass gate computes
+        # `lint_clean = not (lint_result and lint_result.get("should_alert"))` — so a
+        # CRASHED linter read as lint-CLEAN and could auto-suppress the entire content
+        # surface. A checker that could not run must never be indistinguishable from a
+        # checker that ran and found nothing; fail toward being seen.
+        # Regression: test_lint_crash_alerts() in scripts/test_agent_output_lint.py.
         return {
             "path": str(deliverable),
             "error": f"lint exception: {exc!r}",
             "ok": False,
-            "should_alert": False,
+            "should_alert": True,
         }
 
 

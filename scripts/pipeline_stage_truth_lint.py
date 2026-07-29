@@ -214,13 +214,20 @@ def write_report(findings, n_inflight, n_published):
     return verdict
 
 
-def summary_line(verdict, findings):
+def summary_line(verdict, findings, n_pipelines=None, n_inflight=None):
     if verdict == "STALE-OPEN":
         v, stage, status, _, _ = findings[0]
         extra = (" (+%d more)" % (len(findings) - 1)) if len(findings) > 1 else ""
         return ("pipeline_stage_truth_lint: 🔴 STALE-OPEN — Video_%s %s is '%s' but its "
                 "review is resolution-stamped%s" % (nn(v), stage, status, extra))
-    return "pipeline_stage_truth_lint: CLEAN"
+    # Scanned counts in the line a human reads. write_report already recorded them, but
+    # only into a report file nobody opens on a clean run, so the visible surface was a
+    # bare "CLEAN" indistinguishable from "scanned nothing" (2026-07-28 two-pass audit,
+    # lane E). Modelled on triad_sync_check.py's summary_line.
+    scope = ""
+    if n_pipelines is not None and n_inflight is not None:
+        scope = " [scanned %d pipeline file(s), %d in-flight]" % (n_pipelines, n_inflight)
+    return "pipeline_stage_truth_lint: CLEAN%s" % scope
 
 
 def notify(msg):
@@ -245,9 +252,29 @@ def main(argv=None):
     if args.selftest:
         return selftest()
 
-    findings, n_inflight, n_published = run_check(glob.glob(PIPELINE_GLOB))
+    pipelines = glob.glob(PIPELINE_GLOB)
+
+    # ZERO-SCAN GUARD (2026-07-28 two-pass audit, lane E). An empty PIPELINE_GLOB
+    # produced a bare "CLEAN" and exit 0 — identical output to having scanned every
+    # pipeline and found every stage truthful. One renamed vault path would have
+    # reported green forever. Exit 75 = EX_TEMPFAIL, distinguishable from a clean 0
+    # and silent-on-stderr so a transient unmount doesn't page.
+    # CONSUMER (corrected 2026-07-28 round-2 review — this is NOT a run_job.sh job;
+    # it is never registered as its own scheduled task): routines/pre-brief.prompt
+    # §18 shells out to this script directly and reads the exit code itself. Its
+    # decision table now has an explicit SKIP/75 row (was binary CLEAN/FLAG only,
+    # which read a 75-with-empty-stdout as "note nothing" — the exact silent-green
+    # this guard exists to kill).
+    if not pipelines:
+        print("pipeline_stage_truth_lint: SKIP — scan target unavailable "
+              "(0 pipeline files via %s). Nothing scanned; this is NOT a clean result."
+              % PIPELINE_GLOB, file=sys.stderr)
+        return 75
+
+    findings, n_inflight, n_published = run_check(pipelines)
     verdict = write_report(findings, n_inflight, n_published)
-    line = summary_line(verdict, findings)
+    line = summary_line(verdict, findings,
+                        n_pipelines=len(pipelines), n_inflight=n_inflight)
 
     if verdict == "STALE-OPEN":
         print(line)

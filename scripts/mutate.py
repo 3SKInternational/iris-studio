@@ -58,10 +58,25 @@ def _sidecar(target):
 
 def _atomic(path, text):
     """Write via tmp + os.replace. write_text truncates in place, so an interrupted
-    write leaves a half-file where a source used to be."""
+    write leaves a half-file where a source used to be.
+
+    PRESERVES THE MODE. os.replace swaps in a freshly created file (default 0644),
+    so every mutate/restore cycle silently stripped the exec bit off any 0755
+    target — the mandatory gate quietly un-chmod'ing the repo one file per run,
+    and re-dirtying `git diff --summary` with `100755 => 100644` after any manual
+    fix. Nothing caught it: the integrity check at exit compares the sha, and the
+    content is byte-identical — only the mode changed. Fixed here rather than in
+    restore(), because the mutation loop restores through THIS function and never
+    reaches restore()'s branch on a clean run. Round-7 review, 2026-07-29."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        mode = None
     tmp = path.with_suffix(path.suffix + ".mut")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+    if mode is not None:
+        os.chmod(path, mode)
 
 
 def sha(p):
@@ -299,10 +314,45 @@ def run(tests, timeout):
     return True
 
 
+def _relevance_ordered(tests, target):
+    """Suites most likely to kill a mutant in `target`, first.
+
+    run() short-circuits on the first FAILING suite, so ordering decides how much
+    wall clock a killed mutant costs — not whether it is killed. Three tiers:
+      1. name match  — test_<stem>.py for the target's stem (the usual killer)
+      2. content match — the suite's source mentions the target's module name
+      3. everything else, in the caller's original order
+
+    Ordering is STABLE within each tier, so a run is reproducible.
+
+    This never changes a verdict: a mutant is killed if ANY suite fails (an
+    order-independent property), and a SURVIVOR still runs every suite before it
+    is reported alive. Pinned by tests/test_mutate.py.
+    """
+    stem = pathlib.Path(target).stem
+    named, mentions, rest = [], [], []
+    for t in tests:
+        if pathlib.Path(t).stem in (f"test_{stem}", f"{stem}_test"):
+            named.append(t)
+            continue
+        try:
+            body = pathlib.Path(t).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Unreadable here is NOT a reason to drop a suite — run() must still
+            # execute it and fail loudly. Order it last rather than losing it.
+            rest.append(t)
+            continue
+        (mentions if stem in body else rest).append(t)
+    return named + mentions + rest
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("target")
     ap.add_argument("tests", nargs="+")
+    ap.add_argument("--no-reorder", action="store_true",
+                    help="Keep the caller's suite order (diagnostic; slower). "
+                         "Reordering never changes the verdict, only the wall clock.")
     # Default None = NO CAP. --diff-only already scopes the run to the changed
     # lines, and a cap there is the difference between certifying coverage and
     # certifying a sample. A cap now BLOCKS rather than silently truncating.
@@ -411,6 +461,12 @@ def main():
 
     src = target.read_text(encoding="utf-8")
     before = sha(target)
+    # Capture the mode alongside the sha — restore() re-creates the file via
+    # os.replace, which would otherwise drop the exec bit (see restore()).
+    try:
+        _mode_before = target.stat().st_mode
+    except OSError:
+        _mode_before = None
     # Sidecar pristine copy: signal handlers cannot run on SIGKILL or power loss,
     # so the only recovery for "mutant left on disk" is a copy that outlives the
     # process. The hourly pipeline sweep invokes build_video.py, so a mutated file
@@ -435,12 +491,36 @@ def main():
             tmp = target.with_suffix(target.suffix + ".mutrestore")
             tmp.write_text(src, encoding="utf-8")
             os.replace(tmp, target)
+            # Carry the ORIGINAL mode across. os.replace swaps in a fresh file
+            # created at the default 0644, so restore silently stripped the exec
+            # bit off every executable it mutated — the gate quietly un-chmod'ing
+            # the repo, one file per run, and re-dirtying `git diff --summary`
+            # with `100755 => 100644` after any manual fix. Nothing caught it
+            # because the integrity assert below compares CONTENT (sha) only:
+            # byte-identical, mode changed. Found 2026-07-29, round-7 review.
+            if _mode_before is not None:
+                os.chmod(target, _mode_before)
         sidecar.unlink(missing_ok=True)
         LOCK.unlink(missing_ok=True)
 
     atexit.register(restore)
     for s in (signal.SIGINT, signal.SIGTERM):
         signal.signal(s, lambda *_: sys.exit(130))
+
+    # Order suites most-likely-killer-first. run() short-circuits on the FIRST
+    # failing suite, so a mutant in commit_expense.py that its own suite would
+    # kill in 0.1s instead burned ~20s of unrelated suites, because precheck
+    # passes them in glob order (all of tests/ before scripts/). Measured: one
+    # full pass is ~23s, dominated by test_quota_infra_classification (8.0s) and
+    # test_derive_shots (5.3s); commit_expense's 43 mutants spent ~14 minutes
+    # almost entirely on suites that could never have killed them.
+    #
+    # This CANNOT change any verdict: "killed by at least one suite" is
+    # order-independent, and a SURVIVOR still runs every suite before it is
+    # declared alive. Only the detection order — and therefore the wall clock —
+    # changes. tests/test_mutate.py pins that reordering leaves results identical.
+    if not args.no_reorder:
+        args.tests = _relevance_ordered(args.tests, target)
 
     try:
       try:

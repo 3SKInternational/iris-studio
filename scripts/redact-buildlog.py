@@ -106,12 +106,31 @@ CRED_PATTERNS = [
     (r"\b\d{8,10}:AA[A-Za-z0-9_\-]{30,}\b", "[REDACTED]"),         # Telegram bot token
     (r"(?i)\bclient_secret[A-Za-z0-9_\-]*\.json\b", "[REDACTED]"),  # OAuth client-secret filename
     (r"-----BEGIN[A-Z ]*PRIVATE KEY-----", "[REDACTED]"),          # PEM private key header
-    (r"(?i)\b((?:api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|token))(\s*[:=]\s*)['\"]?[A-Za-z0-9_\-./+]{8,}['\"]?",
+    # Prefix-tolerant: the old leading \b could NOT match after an underscore
+    # (`_` is a word char), so every .env-style name — ELEVENLABS_API_KEY,
+    # TELEGRAM_BOT_TOKEN, YOUTUBE_CLIENT_SECRET, MY_PASSWORD, i.e. THIS repo's own
+    # variable names and the dominant real shape — sailed straight through. And
+    # because the fail-closed residual check is built from this same list, it was
+    # blinded identically: all four printed "REDACTION OK", rc=0, byte-for-byte
+    # intact. Same fail-open mechanism as the pass-ordering bug fixed above, one
+    # layer over. `(?<![A-Za-z0-9])` + a lazy prefix admits FOO_API_KEY while
+    # still anchoring at a token boundary; verified over all 24 maintained books
+    # with ZERO byte differences (no over-redaction). Found 2026-07-29, round-6
+    # lane-1 review. Regression: the ELEVENLABS_API_KEY fixture in the test file.
+    (r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9_\-]*?(?:api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|token))(\s*[:=]\s*)['\"]?[A-Za-z0-9_\-./+]{8,}['\"]?",
      r"\1\2[REDACTED]"),                                           # generic NAME=secret
     (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED]"),  # any email
 ]
 for pat, repl in CRED_PATTERNS:
-    s = re.sub(pat, repl, s)
+    # IGNORECASE so the substitution scope EXACTLY matches the residual check below
+    # (line scans CRED_PATTERNS with re.IGNORECASE). Without it, a case-flipped secret
+    # (SK-ANT-…, GHP_…, akia…) survived the sub yet tripped the check -> fail-closed but
+    # unconvergeable (routines/build-logger.prompt:10 turns the exit 1 into
+    # ROUTINE_INCOMPLETE, discarding the draft while the unredacted secret it wrote to P
+    # at step 6 above stays on disk). Same drift class redact-book.py closed 2026-06-28;
+    # round-2 audit (2026-07-28) found it recurred here. Patterns with an inline (?i) are
+    # unaffected; the alpha char-classes were already both-case.
+    s = re.sub(pat, repl, s, flags=re.IGNORECASE)
 
 # 5) Company + person identifiers (case-insensitive). Runs AFTER credentials so it can't
 #    corrupt an email/token (see step 4). The brand word "Iris" is deliberately ABSENT

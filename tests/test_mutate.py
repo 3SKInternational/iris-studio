@@ -440,6 +440,57 @@ def main():
         (REPO / f"_mutate_selftest_victim_{os.getpid()}.py").unlink(missing_ok=True)
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # --- _relevance_ordered (2026-07-28): suite ordering, wall-clock only -------
+    # run() short-circuits on the first FAILING suite, so ordering decides how long
+    # a killed mutant takes, never whether it is killed. Measured before the change:
+    # a commit_expense.py mutant burned ~20s of unrelated suites because its own
+    # suite sat at position 25 in glob order. The properties asserted here are the
+    # SAFETY ones — no suite dropped, added, or duplicated — because a reordering
+    # that silently loses a suite is a false green in the gate itself, which is the
+    # one defect class this whole file exists to prevent.
+    # --- _atomic preserves the file MODE (2026-07-29) -------------------------
+    # os.replace swaps in a freshly created file at the default 0644, so every
+    # mutate/restore cycle silently stripped the exec bit off any 0755 target —
+    # the mandatory gate quietly un-chmod'ing the repo one file per run, and
+    # re-dirtying `git diff --summary` with `100755 => 100644` after any manual
+    # fix. Nothing caught it because the integrity check at exit compares the
+    # SHA: content byte-identical, mode changed. Mode is not content, so it needs
+    # its own assertion.
+    _mode_probe = REPO / f"_mutate_mode_probe_{os.getpid()}.py"
+    try:
+        _mode_probe.write_text("x = 1\n", encoding="utf-8")
+        os.chmod(_mode_probe, 0o755)
+        _before_mode = _mode_probe.stat().st_mode
+        mut._atomic(_mode_probe, "x = 2\n")          # mutate
+        _mid_mode = _mode_probe.stat().st_mode
+        mut._atomic(_mode_probe, "x = 1\n")          # restore
+        check("_atomic preserves mode on the MUTATE write",
+              _mid_mode == _before_mode,
+              f"{oct(_mid_mode)} != {oct(_before_mode)} — exec bit stripped")
+        check("_atomic preserves mode on the RESTORE write",
+              _mode_probe.stat().st_mode == _before_mode,
+              f"{oct(_mode_probe.stat().st_mode)} != {oct(_before_mode)}")
+        check("_atomic still wrote the content",
+              _mode_probe.read_text(encoding="utf-8") == "x = 1\n", "")
+    finally:
+        _mode_probe.unlink(missing_ok=True)
+
+    ro = mut._relevance_ordered
+    _suites = ["tests/test_aaa.py", "scripts/test_commit_expense.py",
+               "tests/test_zzz.py", "scripts/test_contact_sheet.py"]
+    _out = ro(_suites, pathlib.Path("scripts/commit_expense.py"))
+    check("reorder: own suite goes first",
+          pathlib.Path(_out[0]).name == "test_commit_expense.py", str(_out))
+    check("reorder: no suite dropped, added, or duplicated",
+          sorted(_out) == sorted(_suites), f"{sorted(_out)} != {sorted(_suites)}")
+    check("reorder: unrelated target leaves order unchanged",
+          ro(_suites, pathlib.Path("scripts/no_such_module.py")) == _suites,
+          str(ro(_suites, pathlib.Path("scripts/no_such_module.py"))))
+    _with_missing = _suites + ["tests/test_does_not_exist_at_all.py"]
+    check("reorder: unreadable suite kept (run + fail loudly), not dropped",
+          sorted(ro(_with_missing, pathlib.Path("scripts/commit_expense.py")))
+          == sorted(_with_missing), "an unreadable suite was lost")
+
     if FAILS:
         print(f"\ntest_mutate: FAIL ({len(FAILS)}): {', '.join(FAILS)}")
         return 1

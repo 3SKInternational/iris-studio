@@ -164,7 +164,17 @@ def classify_path(path):
     except (OSError, UnicodeDecodeError):
         return None
     fm, body_start = _frontmatter(text)
-    resolved = bool(re.search(r'^\s*resolution\s*:', fm, re.MULTILINE))
+    # Column-0 anchored + non-empty value, matching the sibling gate
+    # pipeline_stage_truth_lint.RESOLUTION_RE. Was `^\s*resolution\s*:`, whose leading
+    # \s* also matched a NESTED yaml mention — e.g. `prior-reviews:\n  - … resolution: …`
+    # — so the file classified `closed`, and run_check concludes the whole (video, gate)
+    # series on any one closed member, suppressing every genuinely-open unstamped verdict
+    # beside it. Four in-tree corpus files match only via an indented key
+    # (Video_13_Description_Review_v3..v6). Tightening makes this reporter over-report a
+    # possible stale-open for a human to eyeball, which is the safe direction — see the
+    # sibling's note that these must not be synced by LOOSENING the gate.
+    # 2026-07-28 two-pass audit, lane E.
+    resolved = bool(re.search(r'^resolution:[^\S\n]*\S', fm, re.MULTILINE))
     mv = re.search(r'^\s*video\s*:\s*(.+)$', fm, re.MULTILINE)
     fm_video = mv.group(1).strip().strip('"').strip("'") if mv else None
     video = _norm_video(fm_video) or _video_from_name(name)
@@ -328,13 +338,22 @@ def write_report(findings, n_receipted, n_flags):
     return verdict
 
 
-def summary_line(verdict, n_flags, findings):
+def summary_line(verdict, n_flags, findings, n_reviews=None, n_receipts=None):
     if verdict == "FLAG":
         f = findings[0]
         extra = " (+%d more)" % (n_flags - 1) if n_flags > 1 else ""
         return ("verdict_resolution_lint: 🔴 FLAG — %s (%s) unstamped open verdict%s"
                 % (f[0], f[1], extra))
-    return "verdict_resolution_lint: CLEAN (0 unstamped open verdicts on shipped renders)"
+    # Carry the SCANNED COUNTS in the line a human actually reads. A bare "CLEAN" cannot
+    # be told apart from "scanned nothing" (2026-07-28 two-pass audit, lane E); the
+    # zero-scan case now exits 75 before reaching here, and these counts are how a
+    # shrinking-but-nonzero scan stays visible. Modelled on triad_sync_check.py's
+    # summary_line, the one sibling in this family that already did it.
+    scope = ""
+    if n_reviews is not None and n_receipts is not None:
+        scope = " [scanned %d review files / %d receipts]" % (n_reviews, n_receipts)
+    return ("verdict_resolution_lint: CLEAN (0 unstamped open verdicts on shipped "
+            "renders)%s" % scope)
 
 
 def notify(msg):
@@ -360,9 +379,33 @@ def main(argv=None):
         return selftest()
 
     receipts = glob.glob(RECEIPT_GLOB)
-    findings, n_receipted, n_flags = run_check(_collect_review_files(), receipts)
+    review_files = _collect_review_files()
+
+    # ZERO-SCAN GUARD (2026-07-28 two-pass audit, lane E). Neither an empty receipt glob
+    # nor an empty review set is "clean" — it is "this check did not run." Both were
+    # silently indistinguishable from CLEAN, and an empty RECEIPT_GLOB *alone* forced
+    # CLEAN even when all review files parsed fine, because run_check drops every
+    # non-receipted group. One renamed vault path would have reported green forever.
+    # Exit 75 = EX_TEMPFAIL, distinguishable from a clean 0 and silent-on-stderr so a
+    # transient unmount doesn't page.
+    # CONSUMER (corrected 2026-07-28 round-2 review): this script currently has NO
+    # scheduled caller at all — it is not wired into routines/pre-brief.prompt, any
+    # scripts/*.sh, or any launchd plist (grep-verified). Exit 75 today is observed
+    # only by a human running it ad hoc. It is not a run_job.sh job either — nothing
+    # here goes through that wrapper. Wire it into a routine before this exit code
+    # means anything to an unattended run.
+    if not receipts or not review_files:
+        print("verdict_resolution_lint: SKIP — scan target unavailable "
+              "(%d receipts via %s, %d review files via %s). "
+              "Nothing scanned; this is NOT a clean result."
+              % (len(receipts), RECEIPT_GLOB, len(review_files), "/".join(REVIEW_DIRS)),
+              file=sys.stderr)
+        return 75
+
+    findings, n_receipted, n_flags = run_check(review_files, receipts)
     verdict = write_report(findings, n_receipted, n_flags)
-    line = summary_line(verdict, n_flags, findings)
+    line = summary_line(verdict, n_flags, findings,
+                        n_reviews=len(review_files), n_receipts=len(receipts))
 
     if verdict == "FLAG":
         print(line)
@@ -626,6 +669,24 @@ def selftest():
         ("Video_11_Script_Review_b_",
          "resolution: closed-by-steve-decision-2026-07-12\n", "VERDICT: REVISE"),
     ], 0)
+
+    # 17. HIGH-2 (round-2 review, 2026-07-28): a `resolution:` key NESTED under
+    #     `prior-reviews:` (describing a DIFFERENT file) must NOT be read as
+    #     THIS file's own stamp -- that is exactly what the tightened
+    #     column-0-anchored regex (`^resolution:[^\S\n]*\S`, was `^\s*resolution
+    #     \s*:`) exists to fix. Reverting to the old \s*-prefixed regex leaves
+    #     this fixture green (0 flags where 1 is correct) with the whole rest
+    #     of the suite unchanged -- proven: new = 1 flag, reverted = 0 flags.
+    #     Mirrors the real corpus defect: Video_13_Description_Review_v3..v6
+    #     match only via an indented `resolution:` under `prior-reviews:`
+    #     describing `Video_13_Description_Review.md`, a DIFFERENT file.
+    check("17 nested-resolution-not-column0",
+          "---\ndate: 2026-07-06\ntype: vo-review\nstatus: ok\nvideo: Video_11\n"
+          "prior-reviews:\n"
+          "  - file: Video_10_Review.md\n"
+          "    verdict: REVISE\n"
+          "    resolution: closed-fix-applied-2026-07-01\n"
+          "---\n\nVERDICT: REVISE\n", "Video_11_", 1)
 
     if fails:
         print("verdict_resolution_lint selftest: FAIL")

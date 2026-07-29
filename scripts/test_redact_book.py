@@ -4,7 +4,7 @@
 # `iris[_.]\w` residual check flagged it -> fail-closed on an un-rewritten path).
 # Runs the real script as a subprocess on a temp file (the script executes at import time,
 # so subprocess is the honest way to exercise it). No frameworks.
-import subprocess, sys, tempfile, os, glob
+import ast, subprocess, sys, tempfile, os, glob
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redact-book.py")
 # The redact gate now builds its video-ID set from the channel's upload receipts and fails
@@ -68,6 +68,42 @@ def main():
         assert code == 0 and "[REDACTED]" in out, \
             f"case-flipped secret {secret!r} should redact clean: {code} {out!r}"
 
+    # 4e) PASS-ORDER regression (two-pass audit, lane E): a credential whose VALUE contains an
+    #     identity token. When the identity scrub ran first it rewrote the value to
+    #     `[ASSISTANT]_studio_live_…`, putting a `[` where the generic NAME=secret pattern
+    #     expects [A-Za-z0-9_\-./+] — so the substitution missed it AND the residual check
+    #     (which re-scans the same CRED_PATTERNS) was blinded identically. Result: exit 0,
+    #     "REDACTION OK", secret tail sitting on disk. Assert the SECRET is gone, not just
+    #     that we exited clean — exit 0 was exactly what the bug produced.
+    secret_tail = "9f3a2b7c1d"
+    code, out, msg = run(f"api_key = iris_studio_live_{secret_tail}\n")
+    assert secret_tail not in out, \
+        f"fail-OPEN: credential tail survived the scrub (identity pass ran before creds?): {out!r}"
+    assert "[REDACTED]" in out, f"credential not redacted: {code} {out!r}"
+
+    # 4f) Same class for an email whose DOMAIN contains an identity token: `founder@3sk.com`
+    #     became `founder@[COMPANY].com`, killing the email pattern (`[` is not in its domain
+    #     class) and leaving the local part intact. The local part is the identifying half.
+    code, out, msg = run("Mail founder@3sk.com to reach us.\n")
+    assert "founder" not in out, \
+        f"fail-OPEN: email local part survived (identity pass ran before creds?): {out!r}"
+    assert "[REDACTED]" in out, f"email not redacted: {code} {out!r}"
+
+    # 4g) PREFIXED credential names (round-6 lane-1 review, 2026-07-29). The
+    #     generic NAME=secret pattern led with \b, which cannot match after an
+    #     underscore (`_` is a word char) — so every .env-style name, i.e. THIS
+    #     repo's own variables and the dominant real shape, sailed through. The
+    #     fail-closed residual check is built from the SAME list, so it was
+    #     blinded identically: "REDACTION OK", rc=0, secret byte-for-byte intact.
+    #     Assert the SECRET is gone, not the exit code — rc=0 was the bug.
+    for _name in ("ELEVENLABS_API_KEY", "TELEGRAM_BOT_TOKEN",
+                  "YOUTUBE_CLIENT_SECRET", "MY_PASSWORD"):
+        _secret = "a1b2c3d4e5f6g7h8i9j0"
+        code, out, msg = run(f"{_name}={_secret}\n")
+        assert _secret not in out, \
+            f"fail-OPEN: {_name} value survived the scrub: {out!r}"
+        assert "[REDACTED]" in out, f"{_name} not redacted: {code} {out!r}"
+
     # 5) Clean text passes.
     code, _, msg = run("This text has nothing to redact.")
     assert code == 0 and "REDACTION OK" in msg, f"clean text should pass: {msg!r}"
@@ -79,7 +115,27 @@ def main():
     assert "DY2RVnuUb64" not in out and "LWWGbGUFFNk" not in out, f"video id survived: {out!r}"
     assert "[VIDEO_ID]" in out, f"video id not scrubbed to token: {out!r}"
 
-    print("test_redact_book: 6/6 pass")
+    # 7) _ids_from_receipt_dict (round-2 audit, 2026-07-28): deleted_video_id may be
+    #    a LIST now (upload_video.write_receipt_preserving_dead_id can retire >1 dead
+    #    id per receipt). redact-book.py executes fully on import (no __main__ guard,
+    #    reads a live file via sys.argv[1]), so a plain import isn't safe here -- this
+    #    isolates the ONE pure helper via AST extraction + exec into a blank namespace,
+    #    same "unit-test a helper embedded in a script" technique, no live vault needed.
+    tree = ast.parse(open(SCRIPT, encoding="utf-8").read())
+    fn_node = next(n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "_ids_from_receipt_dict")
+    ns = {}
+    exec(compile(ast.Module(body=[fn_node], type_ignores=[]), "<redact_book_fn>", "exec"), ns)
+    ids_from = ns["_ids_from_receipt_dict"]
+    assert ids_from({"video_id": "abc12345678"}) == {"abc12345678"}
+    assert ids_from({"video_id": None, "deleted_video_id": "ClJVIUtwsVE"}) == {"ClJVIUtwsVE"}
+    # THE fix: a LIST of dead ids must contribute BOTH, not just one / none.
+    assert ids_from({"video_id": "NEW1", "deleted_video_id": ["OLD1", "OLD2"]}) == \
+        {"NEW1", "OLD1", "OLD2"}, "both list entries must survive, not be silently dropped"
+    assert ids_from({}) == set()
+    assert ids_from({"deleted_video_id": [None, "", "  ", "REAL1"]}) == {"REAL1"}
+
+    print("test_redact_book: 10/10 pass")
 
 
 if __name__ == "__main__":

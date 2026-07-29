@@ -146,6 +146,14 @@ try:
         "_script_to_docx", PROJECT_DIR / "scripts" / "script_to_docx.py"
     )
     _script_to_docx = _importlib_util.module_from_spec(_docx_spec)
+    # Register before exec_module — same reason as _adaptation below, applied here
+    # BEFORE it bites rather than after. This loader is the other guarded one, so
+    # it has the same silent-degradation shape: script_to_docx.py already carries
+    # `from __future__ import annotations`, and one future @dataclass in it would
+    # disable auto-docx permanently while every suite stayed green (verified by
+    # experiment during the round-6 review — 44 suites green with the hook dark).
+    # Fixing only _adaptation would have been fixing the symptom.
+    sys.modules["_script_to_docx"] = _script_to_docx
     _docx_spec.loader.exec_module(_script_to_docx)
 except Exception as _docx_load_exc:  # noqa: BLE001 - never block daemon boot
     _script_to_docx = None
@@ -160,6 +168,20 @@ try:
         "_adaptation", PROJECT_DIR / "scripts" / "adaptation.py"
     )
     _adaptation = _importlib_util.module_from_spec(_adapt_spec)
+    # REGISTER BEFORE exec_module. adaptation.py combines `from __future__ import
+    # annotations` with @dataclass, and dataclasses resolves string annotations via
+    # `sys.modules.get(cls.__module__).__dict__` — unregistered, that lookup is
+    # None and raises `AttributeError: 'NoneType' object has no attribute
+    # '__dict__'`. The best-effort except below then swallowed it and degraded to
+    # "/adapt disabled" FOR FOUR WEEKS: the warning appears in four consecutive
+    # rotated daemon logs (2026-07-05/12/19/26), so every `/adapt list|show|
+    # approve|reject|outcome` Steve sent in Telegram was refused, while
+    # `scripts/adaptation.py --apply` kept working (there __module__ is
+    # "__main__", which IS registered). Found 2026-07-29, round-6 review.
+    # The three sibling loaders in this file are unaffected only because none of
+    # them defines a dataclass — do not treat their pattern as proof this is safe.
+    # Regression: tests/test_adapt_core_loads.py.
+    sys.modules["_adaptation"] = _adaptation
     _adapt_spec.loader.exec_module(_adaptation)
 except Exception as _adapt_load_exc:  # noqa: BLE001 - never block daemon boot
     _adaptation = None
@@ -2888,6 +2910,86 @@ def _save_partial_dispatch_output(d_id: str, agent_name: str, prompt: str,
         return None
 
 
+def lint_log_records(lint_result, d_id="", agent_name=""):
+    """[(logger_level, message)] for the A-23 lint log line — EMPTY when silent.
+
+    The linter alerts on its OWN crash too (`should_alert=True` on both error
+    arms of agent_output_lint), so "could not run" must be distinguishable from
+    "ran and found N" — otherwise a crash logs a misleading
+    "0 banned-vocab occurrence(s)", which reads as a clean-ish result for output
+    that was never checked at all.
+
+    Returns a LIST rather than a sentinel the caller branches on. Extracting this
+    from _finish_dispatch (2026-07-28) pinned the logic but moved the untested
+    boundary out to the wiring: `if level == "warning"` / `elif level == "info"`
+    at the call site each survived mutation, because no suite reaches
+    _finish_dispatch's body. A list makes the silent case structural — the caller
+    loops, so there is no call-site branch left for a mutant to live on.
+    """
+    if not (lint_result and lint_result.get("should_alert")):
+        return []
+    err = lint_result.get("error")
+    if err:
+        return [("warning", f"A-23 lint COULD NOT RUN for dispatch {d_id} "
+                            f"({agent_name}): {err} — treating as NOT lint-clean.")]
+    banned_n = len(lint_result.get("banned", []))
+    return [("info", f"A-23 lint flagged dispatch {d_id} ({agent_name}): "
+                     f"{banned_n} banned-vocab occurrence(s). "
+                     f"Report: {lint_result.get('report_path')}")]
+
+
+async def _run_a23_lint(deliverable, d_id, agent_name):
+    """Executor-wrapped A-23 lint call for _finish_dispatch. Returns a lint_result
+    dict, NEVER None on an exception.
+
+    Extracted (round-2 audit, 2026-07-28) so this fix is directly unit-testable
+    without mocking _finish_dispatch's other five subsystems (expense ingest, docx
+    conversion, V1 status hook, A2 gate, Telegram) — same "pin the seam, not the
+    whole function" pattern _run_pipeline_subprocess already uses.
+
+    THE THIRD ARM of the "crashed linter reads as clean" class: agent_output_lint's
+    own lint()/lint_and_report() were hardened to should_alert=True on THEIR
+    internal failures (an unreadable deliverable). This closes the gap one level up
+    -- the run_in_executor call itself can raise (e.g. a RuntimeError from a loop
+    torn down mid-shutdown) -- where the OLD code left lint_result at its None
+    default. The A2 gate reads `lint_clean = not (lint_result and
+    lint_result.get("should_alert"))`, which is True on None, so an executor-path
+    exception auto-passed an UNLINTED deliverable — precisely the failure class the
+    hardening above exists to prevent, just one frame higher."""
+    try:
+        loop = asyncio.get_event_loop()
+        lint_result = await loop.run_in_executor(
+            None, lambda: _agent_output_lint.lint_and_report(Path(deliverable))
+        )
+        for _level, _msg in lint_log_records(lint_result, d_id, agent_name):
+            getattr(logger, _level)(_msg)
+        return lint_result
+    except Exception as exc:
+        logger.warning(f"A-23 lint failed for dispatch {d_id}: {exc}")
+        return {"error": str(exc), "ok": False, "should_alert": True}
+
+
+def lint_telegram_suffix(lint_result, vault_rel):
+    """The A-23 lint suffix appended to the Telegram completion message, or "".
+
+    Same distinction as lint_log_records: a linter that COULD NOT RUN must say so,
+    because "0 banned-vocab occurrence(s)" on unchecked output is worse than
+    silence — it asserts a check that never happened.
+
+    `vault_rel` is injected rather than referenced globally so this stays pure
+    and testable.
+    """
+    if not (lint_result and lint_result.get("should_alert")):
+        return ""
+    err = lint_result.get("error")
+    if err:
+        return f"\n\n⚠️ Lint COULD NOT RUN: {err} — output is unchecked, not clean."
+    banned_n = len(lint_result.get("banned", []))
+    report = lint_result.get("report_path")
+    return (f"\n\n⚠️ Lint: {banned_n} banned-vocab occurrence(s). "
+            f"Report: {vault_rel(report) if report else '(in-memory)'}")
+
+
 async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
                            returncode, stdout, stderr, timed_out,
                            partial_path=None, autonomous_label=None):
@@ -3000,20 +3102,7 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
     lint_result = None
     if (status == "completed" and deliverable
             and agent_name not in (DISPATCH_ECHO_AGENT, "expense-categorizer")):
-        try:
-            loop = asyncio.get_event_loop()
-            lint_result = await loop.run_in_executor(
-                None, lambda: _agent_output_lint.lint_and_report(Path(deliverable))
-            )
-            if lint_result and lint_result.get("should_alert"):
-                banned_n = len(lint_result.get("banned", []))
-                logger.info(
-                    f"A-23 lint flagged dispatch {d_id} ({agent_name}): "
-                    f"{banned_n} banned-vocab occurrence(s). "
-                    f"Report: {lint_result.get('report_path')}"
-                )
-        except Exception as exc:
-            logger.warning(f"A-23 lint failed for dispatch {d_id}: {exc}")
+        lint_result = await _run_a23_lint(deliverable, d_id, agent_name)
 
     # A2 — Lint-gated calibration auto-pass (Redesign Night 3, 2026-06-12).
     # AUTONOMOUS fire + lint clean + status:ok + NOT first-of-kind → suppress
@@ -3075,13 +3164,10 @@ async def _finish_dispatch(d_id, agent_name, chat_id, started_epoch,
                     msg += "\n\n⚠️ Deliverable frontmatter has no `status:` field (V1 contract — agent file may predate the 2026-06-10 update)."
                 elif sc == "no-frontmatter":
                     msg += "\n\n⚠️ Deliverable has no YAML frontmatter (V1 contract — cannot verify semantic status)."
-            if lint_result and lint_result.get("should_alert"):
-                banned_n = len(lint_result.get("banned", []))
-                report = lint_result.get("report_path")
-                msg += (
-                    f"\n\n⚠️ Lint: {banned_n} banned-vocab occurrence(s). "
-                    f"Report: {_vault_rel(report) if report else '(in-memory)'}"
-                )
+            # Unconditional: lint_telegram_suffix returns "" when there is nothing
+            # to say, and `msg += ""` is a no-op. An `if` here would be a wiring
+            # branch no suite reaches, i.e. a permanent mutation survivor.
+            msg += lint_telegram_suffix(lint_result, _vault_rel)
             await _send_telegram(chat_id, msg)
     elif status == "timed_out":
         if partial_path:
@@ -3272,36 +3358,96 @@ async def _fire_autonomous_dispatch(entry: dict, chat_id: int) -> None:
 PIPELINE_SCRIPT = PROJECT_DIR / "scripts" / "pipeline_orchestrator.py"
 _PIPELINE_FLAGS = {"advance": "--advance", "status": "--status", "spend-ok": "--spend-ok"}
 
+# Shared bound for every orchestrator subprocess /pipeline spawns. 3600s matches
+# the orchestrator's own documented worst-case single-stage timeout (5_images —
+# see pipeline_stale_state_lint.py's STALE_RUNNING_HOURS margin, built against
+# this same number) — long enough that a legitimate advance/advance-all running
+# under the hourly pipeline-sweep is never mistaken for a hang, short enough
+# that a genuinely wedged subprocess is eventually reaped instead of leaking a
+# process + asyncio task on every impatient retry (2026-07-28 two-pass audit).
+PIPELINE_SUBPROCESS_TIMEOUT = 3600
+# Bounded re-drain/reap window after kill() — mirrors _run_dispatch's M3 fix
+# (same literal, same rationale: a killed process's pipes close almost
+# immediately in every real case; this only bounds the pathological one).
+# Named (not inline) so a test can pin the exact value via the symbol instead
+# of re-deriving it from source text.
+PIPELINE_REDRAIN_TIMEOUT = 5
+# Telegram message length caps for the two success-path formats below. Named so
+# a test can pin the exact cutoff via the symbol rather than a bare slice.
+PIPELINE_STDOUT_TRUNC = 3500
+PIPELINE_RC_MSG_TRUNC = 3000
 
-async def _run_pipeline_command(video: int, action: str, chat_id) -> None:
-    """Run the orchestrator subprocess for ONE fixed action and relay stdout.
-    `action` is one of _PIPELINE_FLAGS (validated by the caller); no free-form
-    input ever reaches the shell. Never raises (logs + notifies on crash)."""
-    flag = _PIPELINE_FLAGS[action]
-    cmd = [sys.executable, str(PIPELINE_SCRIPT), "--video", str(video), flag]
+
+async def _run_pipeline_subprocess(cmd: list, chat_id, label: str) -> None:
+    """Spawn one orchestrator subprocess, relay stdout/stderr to `chat_id`, and
+    never hang forever. Shared by the per-video and fleet /pipeline runners —
+    both used to duplicate a bare `await proc.communicate()` with NO timeout,
+    while `_run_dispatch` (above) already has the correct
+    wait_for -> kill() -> bounded re-drain -> reap pattern for the identical
+    "subprocess may never finish" hazard. The orchestrator takes a BLOCKING
+    flock(LOCK_EX) for its ENTIRE run and `com.iris.claude-code-pipeline-sweep`
+    runs --advance-all hourly, so `/pipeline N status` during a sweep could
+    block Telegram forever with no message, and each impatient retry leaked a
+    permanently blocked process + asyncio task. Never raises (logs + notifies
+    on crash)."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(PROJECT_DIR),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        out_b, err_b = await proc.communicate()
+        timed_out = False
+        try:
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(), timeout=PIPELINE_SUBPROCESS_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            # Bounded re-drain + reap after kill() — mirrors _run_dispatch's M3
+            # fix: re-draining half-consumed pipes can itself hang.
+            try:
+                out_b, err_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=PIPELINE_REDRAIN_TIMEOUT
+                )
+            except Exception:
+                out_b, err_b = b"", b""
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=PIPELINE_REDRAIN_TIMEOUT)
+                except Exception:
+                    pass
         out = (out_b or b"").decode(errors="replace").strip()
         err = (err_b or b"").decode(errors="replace").strip()
+        if timed_out:
+            await _send_telegram(
+                chat_id,
+                f"⏱️ {label} timed out after {PIPELINE_SUBPROCESS_TIMEOUT}s and was "
+                f"killed — likely blocked on the orchestrator's flock during a sweep. "
+                f"Retry later, or check `/pipeline all status` for what's holding it."
+            )
+            return
         if proc.returncode == 0 and out:
-            await _send_telegram(chat_id, out[:3500])
+            await _send_telegram(chat_id, out[:PIPELINE_STDOUT_TRUNC])
         elif out or err:
             await _send_telegram(
-                chat_id,
-                f"/pipeline {video} {action} (rc={proc.returncode}):\n{(out or err)[:3000]}",
+                chat_id, f"{label} (rc={proc.returncode}):\n{(out or err)[:PIPELINE_RC_MSG_TRUNC]}"
             )
         else:
-            await _send_telegram(
-                chat_id,
-                f"/pipeline {video} {action} finished (rc={proc.returncode}, no output).",
-            )
+            await _send_telegram(chat_id, f"{label} finished (rc={proc.returncode}, no output).")
     except Exception as exc:
-        logger.exception(f"/pipeline {video} {action} crashed: {exc}")
-        await _send_telegram(chat_id, f"⚠️ /pipeline {video} {action} crashed: {exc}")
+        logger.exception(f"{label} crashed: {exc}")
+        await _send_telegram(chat_id, f"⚠️ {label} crashed: {exc}")
+
+
+async def _run_pipeline_command(video: int, action: str, chat_id) -> None:
+    """Run the orchestrator subprocess for ONE fixed per-video action.
+    `action` is one of _PIPELINE_FLAGS (validated by the caller); no free-form
+    input ever reaches the shell."""
+    flag = _PIPELINE_FLAGS[action]
+    cmd = [sys.executable, str(PIPELINE_SCRIPT), "--video", str(video), flag]
+    await _run_pipeline_subprocess(cmd, chat_id, f"/pipeline {video} {action}")
 
 
 # Fleet flags carry NO --video — they sweep every Video_NN_pipeline.json. Both
@@ -3314,32 +3460,10 @@ _PIPELINE_FLEET_FLAGS = {"advance": "--advance-all", "status": "--supervise"}
 
 async def _run_pipeline_fleet_command(action: str, chat_id) -> None:
     """Run the orchestrator subprocess for ONE fixed fleet action (advance-all |
-    supervise) and relay stdout. `action` is validated by the caller. Never raises."""
+    supervise). `action` is validated by the caller."""
     flag = _PIPELINE_FLEET_FLAGS[action]
     cmd = [sys.executable, str(PIPELINE_SCRIPT), flag]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=str(PROJECT_DIR),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out_b, err_b = await proc.communicate()
-        out = (out_b or b"").decode(errors="replace").strip()
-        err = (err_b or b"").decode(errors="replace").strip()
-        if proc.returncode == 0 and out:
-            await _send_telegram(chat_id, out[:3500])
-        elif out or err:
-            await _send_telegram(
-                chat_id,
-                f"/pipeline all {action} (rc={proc.returncode}):\n{(out or err)[:3000]}",
-            )
-        else:
-            await _send_telegram(
-                chat_id,
-                f"/pipeline all {action} finished (rc={proc.returncode}, no output).",
-            )
-    except Exception as exc:
-        logger.exception(f"/pipeline all {action} crashed: {exc}")
-        await _send_telegram(chat_id, f"⚠️ /pipeline all {action} crashed: {exc}")
+    await _run_pipeline_subprocess(cmd, chat_id, f"/pipeline all {action}")
 
 
 async def _reconcile_orphaned_dispatches():

@@ -736,9 +736,21 @@ def main() -> None:
             bcfg = cfg if cfg is not None else ma.load_config()
             with budget_lock(script_dir / ".vo_budget.lock"):
                 # Re-read state INSIDE the lock so a parallel run's increment isn't
-                # lost; commit is replace-by-note, so a re-render/top-up of this
-                # video supersedes its prior cycle entry (no double-book, no extra
-                # v2 slot) rather than stacking on top of it.
+                # lost. commit() is ADDITIVE-BY-NOTE for credits and
+                # SLOT-SUPERSEDING for v2_count:
+                #   * credits_used ALWAYS stacks, including on a --force re-render.
+                #     ElevenLabs meters per SUBMITTED character, so re-rendering a
+                #     kit is a SECOND REAL CHARGE, not an edit of the first.
+                #   * only v2_count supersedes — a note holds at most one premium
+                #     slot however many times it re-renders.
+                # CORRECTED 2026-07-29 (round-6 review). This said "supersedes its
+                # prior cycle entry (no double-book) rather than stacking", which
+                # was true at HEAD and made FALSE by the same-day fix to
+                # model_allocator.commit. This is that function's ONLY production
+                # call site, so it is the comment someone debugging a doubled
+                # credits_used reads FIRST — and it stated exactly the wrong
+                # conclusion, the one that leads to restoring the reversal and
+                # re-opening the hard-402-mid-batch bug.
                 state = ma.load_state(bcfg)
                 # REPLACE the prior same-note entry only when THIS run covers the
                 # whole kit -- i.e. a bare --force re-render. Any partial run is an

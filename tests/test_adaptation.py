@@ -19,7 +19,9 @@ first entry with Bash and web access, ingests untrusted content, and runs
 unattended — see 06_CEO/Decisions_Log/2026-07-28_adapts_allowlist_youtube_researcher.md.
 """
 import importlib.util
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -318,6 +320,72 @@ class TestFrontmatterFreeze(unittest.TestCase):
 
     def test_frozen_keys_cover_all_three(self):
         self.assertEqual(set(adapt.FROZEN_FRONTMATTER_KEYS), {"tools", "model", "name"})
+
+
+class TestAuditLogOrdering(unittest.TestCase):
+    """2026-07-28 two-pass audit: apply_proposal must write the audit log entry
+    BEFORE calling _move_proposal, not after. By the time _move_proposal runs,
+    the target (agent def / canon doc) is ALREADY mutated on disk -- that
+    function only relocates the proposal's own tracking file between queue
+    dirs. Logging-after meant a failure inside _move_proposal (disk full,
+    permission error, a crash between the two steps) left a live self-edit to
+    an agent definition file with NO audit trail at all."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._orig = {name: getattr(adapt, name) for name in (
+            "AGENTS_DIR", "ADAPT_DIR", "QUEUE_DIR", "APPLIED_DIR",
+            "REJECTED_DIR", "LOG_FILE", "_move_proposal")}
+        self.addCleanup(self._restore)
+
+        agents_dir = (self.tmp / "agents").resolve()
+        agents_dir.mkdir()
+        adapt.AGENTS_DIR = agents_dir
+        adapt.ADAPT_DIR = self.tmp / "Adaptations"
+        adapt.QUEUE_DIR = adapt.ADAPT_DIR / "queue"
+        adapt.APPLIED_DIR = adapt.ADAPT_DIR / "applied"
+        adapt.REJECTED_DIR = adapt.ADAPT_DIR / "rejected"
+        adapt.LOG_FILE = adapt.ADAPT_DIR / "_log.md"
+        adapt.ensure_dirs()
+        self.agent = agents_dir / "scriptwriter.md"
+        self.agent.write_text("Use hook style A.\n", encoding="utf-8")
+
+    def _restore(self):
+        for name, val in self._orig.items():
+            setattr(adapt, name, val)
+
+    def _write(self, pid, target, old, new):
+        adapt.QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        (adapt.QUEUE_DIR / f"{pid}.md").write_text(
+            f"---\nid: {pid}\nstatus: pending\ntarget: {target}\n"
+            f"confidence: high\nsummary: test {pid}\n---\n\n"
+            f"## Rationale\nbecause\n\n{adapt.OLD_OPEN}\n{old}\n{adapt.OLD_CLOSE}\n\n"
+            f"{adapt.NEW_OPEN}\n{new}\n{adapt.NEW_CLOSE}\n",
+            encoding="utf-8",
+        )
+
+    def test_log_entry_survives_a_move_failure(self):
+        """THE regression: a crash inside _move_proposal must not erase the
+        audit trail for a target that was ALREADY mutated. If the ordering
+        ever regresses back to log-after-move, this raises before the log
+        write runs and the assertions below go red."""
+        self._write("z1", str(self.agent), "Use hook style A.", "Use hook style B.")
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk-full during proposal relocation")
+        adapt._move_proposal = _boom
+
+        with self.assertRaises(OSError):
+            adapt.apply_proposal("z1")
+
+        # The target WAS mutated -- this is the live state the log must describe.
+        self.assertIn("hook style B.", self.agent.read_text())
+        # The log entry exists despite _move_proposal blowing up right after it.
+        log_text = adapt.LOG_FILE.read_text(encoding="utf-8")
+        self.assertIn("APPLIED", log_text)
+        self.assertIn("z1", log_text)
+        self.assertIn(str(self.agent), log_text)
 
 
 if __name__ == "__main__":

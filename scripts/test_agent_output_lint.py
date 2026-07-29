@@ -84,9 +84,31 @@ def test_full_lint_and_render(tmp: Path):
     print("full lint + A-23 regression: pass")
 
 
+def test_lint_crash_alerts(tmp: Path):
+    """A linter that CANNOT RUN must not read as lint-clean.
+
+    iris.py's A2 auto-pass gate computes `lint_clean = not should_alert`, so
+    should_alert=False on the exception path let a CRASHED linter auto-suppress the
+    entire content surface — the output was never checked, but the gate could not tell
+    that apart from "checked and clean". Two-pass codebase audit, lane E, 2026-07-28.
+    """
+    missing = tmp / "no_such_dir" / "Video_99_Script.md"
+    res = m.lint_and_report(missing)
+    assert res.get("error"), f"expected the exception path to be taken: {res}"
+    assert res.get("should_alert") is True, \
+        f"a crashed lint must alert, not read clean: {res}"
+    # Recompute the exact expression iris.py uses, so this test fails if that gate's
+    # meaning is inverted here rather than only if the literal flips.
+    lint_clean = not (res and res.get("should_alert"))
+    assert lint_clean is False, "crashed lint must NOT satisfy the A2 auto-pass gate"
+    print("lint crash fails loud: pass")
+
+
 if __name__ == "__main__":
     import tempfile
     test_vo_density()
     with tempfile.TemporaryDirectory() as d:
         test_full_lint_and_render(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_lint_crash_alerts(Path(d))
     print("ALL PASS")

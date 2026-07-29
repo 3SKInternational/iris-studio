@@ -605,14 +605,23 @@ def apply_proposal(pid: str) -> dict:
     # checked on/after this date (see tag_outcome / due_for_review). ISO dates sort
     # lexicographically, so the due-check is a plain string compare.
     eval_after = (_dt.date.today() + _dt.timedelta(days=EVAL_HORIZON_DAYS)).isoformat()
+    detail = f"backup {backup.name}; evaluate_after {eval_after}"
+    if warnings:
+        detail += f"; WARN: {'; '.join(warnings)}"
+    # Logged BEFORE _move_proposal, not after (2026-07-28 two-pass audit). The
+    # target file (the agent def / canon doc) is ALREADY mutated by
+    # _atomic_write above at this point — _move_proposal only relocates the
+    # proposal's own tracking file between queue dirs. If THAT raises (disk
+    # full, permission error, a crash between the two steps), logging-after
+    # left a live self-edit to an agent definition file with NO audit trail at
+    # all — the log is the only durable record that this target changed.
+    # Logging first means a move failure instead leaves a stray queue file
+    # next to a truthful log entry, a strictly safer failure to hand a human.
+    _append_log("APPLIED", prop, detail)
     moved = _move_proposal(
         prop, APPLIED_DIR, "applied",
         {"applied": _now(), "backup": str(backup), "evaluate_after": eval_after},
     )
-    detail = f"backup {backup.name}; evaluate_after {eval_after}"
-    if warnings:
-        detail += f"; WARN: {'; '.join(warnings)}"
-    _append_log("APPLIED", prop, detail)
     return {
         "pid": prop.pid,
         "target": str(target),

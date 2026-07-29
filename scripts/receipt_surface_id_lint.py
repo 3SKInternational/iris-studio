@@ -101,7 +101,12 @@ WARN_WINDOW = 30  # chars of context each side of an unknown-id occurrence
 def load_receipts(paths):
     """Return (live, dead): {id -> video_label}. live = current video_id,
     dead = deleted_video_id. A receipt with video_id null (deleted) contributes
-    only to dead."""
+    only to dead.
+
+    `deleted_video_id` may be a single string (the historical shape, one dead
+    id ever) or a list of strings (upload_video.py's write_receipt_preserving_
+    dead_id, 2026-07-28 round-2 fix -- a receipt can accumulate more than one
+    dead id across repeated re-uploads; none may be silently dropped here)."""
     live, dead = {}, {}
     for p in sorted(paths):
         try:
@@ -116,6 +121,10 @@ def load_receipts(paths):
             live[vid.strip()] = label
         if isinstance(dvid, str) and dvid.strip():
             dead[dvid.strip()] = label
+        elif isinstance(dvid, list):
+            for x in dvid:
+                if isinstance(x, str) and x.strip():
+                    dead[x.strip()] = label
     return live, dead
 
 
@@ -236,12 +245,23 @@ def write_report(findings, n_live, n_dead, n_flags, n_warns):
     return verdict
 
 
-def summary_line(verdict, n_flags, n_warns, findings):
+def summary_line(verdict, n_flags, n_warns, findings, n_surfaces=None, n_receipts=None):
     if verdict == "FLAG":
         f = next(x for x in findings if x[1] == "FLAG")
         return ("receipt_surface_id_lint: 🔴 FLAG — %s line %d asserts dead id %s"
                 % (f[0], f[3], f[2]))
-    return "receipt_surface_id_lint: %s (%d flags, %d warns)" % (verdict, n_flags, n_warns)
+    # Scanned counts in the line a human reads — a bare CLEAN can't be told apart from a
+    # shrinking scan set (2026-07-28 two-pass audit, lane E). Modelled on
+    # triad_sync_check.py's summary_line, the sibling that already did this.
+    # present/total, not a bare count — run_check has always silently `continue`d past an
+    # unreadable surface (line 197), so "scanned 1" and "scanned 3" produced identical
+    # CLEAN output. Showing 1/3 is what makes a quietly-vanished surface visible.
+    scope = ""
+    if n_surfaces is not None and n_receipts is not None:
+        scope = " [scanned %d/%d surfaces, %d receipts]" % (
+            n_surfaces, len(SURFACES), n_receipts)
+    return ("receipt_surface_id_lint: %s (%d flags, %d warns)%s"
+            % (verdict, n_flags, n_warns, scope))
 
 
 def notify(msg):
@@ -266,9 +286,34 @@ def main(argv=None):
         return selftest()
 
     receipts = glob.glob(RECEIPT_GLOB)
-    findings, n_live, n_dead, n_flags, n_warns = run_check(SURFACES, receipts)
+    present_surfaces = [(nm, p) for nm, p in SURFACES if os.path.isfile(p)]
+
+    # ZERO-SCAN GUARD (2026-07-28 two-pass audit, lane E). An empty RECEIPT_GLOB alone
+    # makes a FLAG structurally UNREACHABLE: run_check builds live={}/dead={} from the
+    # receipts, so scan_surface's `tok in dead` branch can never fire and main() returns
+    # 0 unconditionally — a green light that proves nothing. Missing surface files are
+    # the same class from the other end. Exit 75 = EX_TEMPFAIL, distinguishable from a
+    # clean 0 and silent-on-stderr so a transient unmount doesn't page.
+    # CONSUMER (corrected 2026-07-28 round-2 review): this script currently has NO
+    # scheduled caller at all — it is not wired into routines/pre-brief.prompt, any
+    # scripts/*.sh, or any launchd plist (grep-verified). Exit 75 today is observed
+    # only by a human running it ad hoc. It is not a run_job.sh job either — nothing
+    # here goes through that wrapper. Wire it into a routine before this exit code
+    # means anything to an unattended run.
+    if not receipts or not present_surfaces:
+        missing = [nm for nm, p in SURFACES if not os.path.isfile(p)]
+        print("receipt_surface_id_lint: SKIP — scan target unavailable "
+              "(%d receipts via %s; %d/%d surfaces present%s). "
+              "Nothing scanned; this is NOT a clean result."
+              % (len(receipts), RECEIPT_GLOB, len(present_surfaces), len(SURFACES),
+                 (", missing: " + ", ".join(missing)) if missing else ""),
+              file=sys.stderr)
+        return 75
+
+    findings, n_live, n_dead, n_flags, n_warns = run_check(present_surfaces, receipts)
     verdict = write_report(findings, n_live, n_dead, n_flags, n_warns)
-    line = summary_line(verdict, n_flags, n_warns, findings)
+    line = summary_line(verdict, n_flags, n_warns, findings,
+                        n_surfaces=len(present_surfaces), n_receipts=len(receipts))
 
     if verdict == "FLAG":
         print(line)
@@ -349,12 +394,35 @@ def selftest():
     for r in receipts:
         os.unlink(r)
 
+    # 10. LIST-shaped deleted_video_id (round-2 audit, 2026-07-28 — a receipt can
+    #     accumulate >1 dead id via upload_video.write_receipt_preserving_dead_id).
+    #     BOTH ids in the list must be caught, not just one.
+    DEAD2 = "FJljsipxTkA"  # a second real dead-id shape (from redact-book.py's supplement)
+    r_multi_dead = _receipt("Video_13", video_id=None, deleted_video_id=[DEAD, DEAD2])
+    check_multi = [r_multi_dead]
+    s = _tmp("| 13 | Retirement Math | published `%s` | also published `%s` |\n" % (DEAD, DEAD2))
+    f, _, _, nf, nw = run_check([("t", s)], check_multi)
+    os.unlink(s)
+    os.unlink(r_multi_dead)
+    # mutequiv: if-test->False here (making this fixture vacuous) cannot hide the
+    # defect it guards. PROVEN, not argued (2026-07-28): disabling the list arm in
+    # load_receipts turned scripts/test_receipt_surface_id_lint.py RED at
+    # test_list_shaped_deleted_video_id_flags_both_dead_ids ("must FLAG (rc 1), got
+    # 0") — a gate-discovered suite driving production main(), independent of this
+    # selftest, which also went red. So this assertion is belt-and-braces over
+    # coverage that already exists in the gate. Verified by BREAKING the production
+    # code and watching the OTHER check go red, per feedback_mutequiv_markers_decay
+    # (an equivalence marker claims coverage ELSEWHERE — prove the elsewhere). If
+    # that wrapper test is ever deleted, delete this marker with it.
+    if nf != 2:
+        fails.append("10 list-shaped-dead-ids: expected 2 FLAG (both list entries caught), got %d" % nf)
+
     if fails:
         print("receipt_surface_id_lint --selftest: FAIL")
         for f in fails:
             print("  ✗ " + f)
         return 1
-    print("receipt_surface_id_lint --selftest: PASS (9/9 fixtures)")
+    print("receipt_surface_id_lint --selftest: PASS (10/10 fixtures)")
     return 0
 
 

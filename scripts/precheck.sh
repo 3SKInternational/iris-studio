@@ -33,6 +33,20 @@ cd "$(dirname "$0")/.." || exit 2
 # phase and the mutate phase (which build `env` from os.environ) inherit it.
 export PYTHONDONTWRITEBYTECODE=1
 
+# ...and PURGE what is already there. The export above stops NEW caches; by the
+# comment's own words it does nothing about a cache that already exists, so the
+# stated hazard was diagnosed but never actually closed. It bit for real on
+# 2026-07-29: a review agent reverted a statement ordering in adaptation.py to
+# check that a fixture bites, then restored it — within the same clock second,
+# and a pure statement reorder is byte-length identical. CPython validates a
+# .pyc on (mtime_seconds, size), so BOTH matched and the stale bytecode won.
+# The gate then failed `test_adaptation` against source that was completely
+# correct, and the executing code had the opposite ordering to the file on disk.
+# ~20 minutes to diagnose, and it would have read as a real BLOCK to anyone who
+# trusted it. Purging is cheap and unconditional; .venv is excluded because
+# site-packages caches are not ours and are expensive to rebuild.
+find . -name '__pycache__' -type d -not -path './.venv/*' -prune -exec rm -rf {} + 2>/dev/null || true
+
 VERBOSE=""
 declare -a MUTATE=()
 while [ $# -gt 0 ]; do
@@ -51,7 +65,23 @@ SKIPPABLE='googleapiclient|google|PIL|moviepy|openai|requests|numpy|yaml|dotenv'
 pass=0 fail=0 envskip=0 lockskip=0
 declare -a FAILED=() SKIPPED=() LOCKSKIPPED=() PASSED=()
 
-for t in tests/test_*.py; do
+# Discover suites in EVERY directory that holds them, not just tests/. This globbed
+# `tests/test_*.py` alone until 2026-07-28, while 7 suites lived in scripts/ and 2 in
+# image_factory/ — so the gate printed "ALL SUITES GREEN" with 9 suites never run,
+# including the regression tests guarding the redaction fail-open and the
+# crashed-linter-reads-clean defects. That is the same false-green class this gate
+# exists to catch, in the gate itself. Kept as an explicit directory list rather than a
+# repo-wide find so a stray test_*.py in .venv or a scratch dir can't join the run;
+# adding a directory here is the one manual step.
+#
+# The REPO ROOT was still missing until 2026-07-28 (round-3 review) — the same
+# false-green, one directory further out: `test_dual_form.py` (the Video_05 VO/SRT
+# dual-form guard, unique, nowhere else) had never run in the gate. Fixing an
+# instance of this does not fix the class, so `test_precheck.py` now WALKS the real
+# tree and fails if any directory containing a `test_*.py` is absent from this line.
+# That assertion, not this comment, is what pins the set.
+for t in ./test_*.py tests/test_*.py scripts/test_*.py image_factory/test_*.py; do
+    [ -e "$t" ] || continue          # glob with no match expands to itself
     name=$(basename "$t" .py)
     out=$(python3 "$t" 2>&1); rc=$?
     if [ $rc -eq 0 ]; then

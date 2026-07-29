@@ -96,6 +96,109 @@ def die(msg: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+def _existing_video_id(receipt_path: Path) -> str | None:
+    """The `video_id` already on disk at `receipt_path`, or None if there is no
+    receipt, it's unreadable, or the id is empty/whitespace."""
+    try:
+        d = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    vid = d.get("video_id")
+    return vid.strip() if isinstance(vid, str) and vid.strip() else None
+
+
+def reupload_guard_message(receipt_path: Path, allow_reupload: bool) -> str | None:
+    """None if it is safe to proceed to videos().insert(); else the die() message.
+
+    THE DEFECT (2026-07-28 two-pass codebase audit): main() went straight from
+    the preflight signoff to videos().insert() with no check of the receipt it
+    was about to overwrite. No programmatic caller exists (pipeline_orchestrator
+    never calls this script), so the only way to hit this is a human re-run —
+    but a human re-run duplicates a LIVE video, and the unconditional receipt
+    write that followed then clobbered the only pointer to the FIRST video in
+    the same act, so the duplicate wasn't even discoverable afterward. Fail
+    closed: refuse unless the operator explicitly opts in."""
+    existing_id = _existing_video_id(receipt_path)
+    if not existing_id or allow_reupload:
+        return None
+    return (
+        f"receipt {receipt_path.name} already carries a live video_id "
+        f"({existing_id}, https://youtu.be/{existing_id}) — re-running would upload "
+        f"a DUPLICATE video. If the original was deliberately deleted from the "
+        f"channel and this is an intentional re-upload, pass --allow-reupload."
+    )
+
+
+def write_receipt_preserving_dead_id(path: Path, data: dict) -> None:
+    """write_receipt(), but never silently drop a dead video_id -- inherited
+    from disk OR newly retired by this write.
+
+    Pre-fix (v1), this script overwrote the receipt unconditionally: a
+    re-upload wrote the NEW id over the old one, destroying the only on-disk
+    pointer to the first video in the same act that duplicated it.
+
+    THE REGRESSION IN v1's OWN FIX (round-2 audit, 2026-07-28): v1 only moved
+    an id THIS write displaces (`_existing_video_id(path) != new_id`) into
+    `deleted_video_id`. It never looked at whether the disk copy ALREADY had a
+    `deleted_video_id` of its own. A receipt shaped like the real Video_04 one
+    (`video_id: null, deleted_video_id: "ClJVIUtwsVE"`) lost the inherited dead
+    id the instant it was re-uploaded: `_existing_video_id` reads `video_id`
+    (null here, so the old-id branch never fires), and the fresh `receipt_data`
+    dict then overwrote the file wholesale via plain write_receipt.
+
+    Fix: union the dead ids from three sources, deduped, order-preserved --
+    (1) an explicit `deleted_video_id` the CALLER already set in `data` wins
+    outright (an explicit choice, not a merge candidate -- e.g. a caller doing
+    its own reconciliation); otherwise (2) whatever `deleted_video_id` is
+    already on disk (scalar, the historical shape, OR a list -- this fix's own
+    output once >1 id has ever been retired) plus (3) the on-disk `video_id`
+    this write is retiring (old_id != new_id). 1 dead id keeps the scalar
+    shape receipt_surface_id_lint.py has always read; >1 becomes a list, read
+    by the same key (receipt_surface_id_lint.py and redact-book.py both
+    updated to accept either shape)."""
+    disk: dict = {}
+    # mutequiv: if-test->True (always attempt the read) is unobservable -- a
+    # nonexistent path raises FileNotFoundError (an OSError subclass), caught
+    # by the except below, landing on the identical disk={} either way. The
+    # OTHER direction (if-test->False, always skip) is real and IS killed --
+    # it would drop a live disk's deleted_video_id entirely (see
+    # test_inherited_deleted_video_id_survives_a_reupload).
+    if path.exists():
+        try:
+            disk = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            disk = {}
+
+    def _as_ids(v) -> list[str]:
+        """Accept BOTH shapes — scalar (historical) and list (this fix's output) —
+        dropping None/non-str/whitespace garbage."""
+        if isinstance(v, list):
+            return [x.strip() for x in v if isinstance(x, str) and x.strip()]
+        return [v.strip()] if isinstance(v, str) and v.strip() else []
+
+    # A caller-supplied deleted_video_id JOINS the union; it does not replace it.
+    # ROUND-3 (2026-07-28 review): this used to short-circuit — an explicit value
+    # wrote straight through and the on-disk history was destroyed, so a receipt
+    # holding ["D1","D2","D3"] plus an explicit "OLDZ" lost all four ids but one.
+    # That is the exact class this function exists to prevent, re-entering through
+    # the "explicit caller wins" door. Caller's ids lead (their ordering choice is
+    # preserved); disk history and the id being retired follow.
+    dead_ids: list[str] = _as_ids(data.get("deleted_video_id"))
+    dead_ids += _as_ids(disk.get("deleted_video_id"))
+
+    old_id = _existing_video_id(path)
+    new_id = data.get("video_id")
+    if old_id and new_id and old_id != new_id:
+        dead_ids.append(old_id)
+
+    seen: set[str] = set()
+    dead_ids = [x for x in dead_ids if not (x in seen or seen.add(x))]
+
+    if dead_ids:
+        data["deleted_video_id"] = dead_ids[0] if len(dead_ids) == 1 else dead_ids
+    write_receipt(path, data)
+
+
 def vault() -> Path:
     return Path(os.path.expanduser(os.environ.get("SK_VAULT", DEFAULT_VAULT))).resolve()
 
@@ -774,6 +877,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-caption-sweep", action="store_true",
                    help="Skip the post-upload verify-and-backfill caption sweep over all videos.")
     p.add_argument("--no-thumbnail", action="store_true", help="Skip thumbnail set.")
+    p.add_argument("--allow-reupload", action="store_true",
+                   help="Override the receipt guard and upload even though the "
+                        "receipt already carries a live video_id (a deliberate "
+                        "re-upload after the original was removed from the channel).")
     p.add_argument("--skip-preflight", action="store_true",
                    help="Skip the deterministic pre-upload signoff (cut freshness + completeness). "
                         "Escape hatch only — the gate exists because V6 shipped a stale-signoff cut.")
@@ -799,6 +906,10 @@ def main() -> None:
     srt = _resolve_path(args.captions, vlt, f"Footage_and_Edits/{vid}_v2.srt")
     desc_pack = _resolve_path(args.desc, vlt, f"Video_Descriptions/{vid}_Description.md")
     receipt = vlt / "Production_Kits" / f"{vid}_youtube_upload.json"
+
+    guard_msg = reupload_guard_message(receipt, args.allow_reupload)
+    if guard_msg:
+        die(guard_msg)
 
     if not video_file.is_file():
         die(f"video file not found: {video_file}")
@@ -971,7 +1082,7 @@ def main() -> None:
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "source_file": str(video_file),
     }
-    write_receipt(receipt, receipt_data)
+    write_receipt_preserving_dead_id(receipt, receipt_data)
 
     if have_srt and not args.no_captions:
         # set_captions gates on processing: a fresh upload is essentially never
@@ -987,7 +1098,7 @@ def main() -> None:
     if thumb and not args.no_thumbnail:
         receipt_data["thumbnail_set"] = set_thumbnail(youtube, video_id, thumb)
 
-    write_receipt(receipt, receipt_data)
+    write_receipt_preserving_dead_id(receipt, receipt_data)
     print(f"\n✅ receipt → {receipt}")
     if meta.get("pinned_comment"):
         print("  ℹ pinned-comment text saved to the receipt — pin it manually in "

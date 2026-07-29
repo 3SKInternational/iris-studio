@@ -129,6 +129,23 @@ def load_flags(path: str | None) -> dict[str, str]:
     return {k: str(v) for k, v in data.items()}
 
 
+def _render_count_label(n: int) -> str:
+    """Human label for a render count that is NOT a completeness check.
+
+    THE DEFECT (2026-07-28 two-pass audit): shot_order() already filters to
+    shots present on disk (globs renders_dir for *.png), so 'present' and
+    'len(order)' are equal BY CONSTRUCTION — the old 'N/M rendered' header was
+    tautologically N/N. A batch where 8 of 40 shots failed to render still read
+    as a clean '32/32 rendered'. Deriving a true expected total isn't reliably
+    possible either: the manifest is the only candidate denominator and it's
+    stale by design (shot_order()'s own docstring — V6's hd manifest still
+    lists 42 pre-consolidation shots while only 30 render dirs exist), so
+    reading the total FROM the manifest would silently reintroduce phantom
+    "missing" counts for shots long since cut. Report only what was actually
+    verified: how many renders are shown, with no implied fraction."""
+    return f"{n} render{'s' if n != 1 else ''} shown (present-on-disk only)"
+
+
 def _text_w(draw, s: str, font) -> float:
     """Rendered width of `s`, across Pillow versions."""
     try:
@@ -177,7 +194,7 @@ def build(video: int, out: Path, flags: dict[str, str] | None = None) -> int:
         fh = f
 
     present = sum(1 for n in order if (rdir / f"{n}.png").exists())
-    hdr = f"Video {nn(video)} — {present}/{len(order)} rendered"
+    hdr = f"Video {nn(video)} — {_render_count_label(len(order))}"
     if flags:
         hdr += f"   ·   {sum(1 for n in order if n in flags)} flagged for re-render (amber)"
     d.text((PAD, 10), hdr, fill=(235, 235, 235), font=fh)
@@ -230,7 +247,7 @@ def build(video: int, out: Path, flags: dict[str, str] | None = None) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out)
     print(f"contact_sheet: wrote {out} ({sheet.size[0]}x{sheet.size[1]}, "
-          f"{present}/{len(order)} present)")
+          f"{_render_count_label(present)})")
     return 0
 
 

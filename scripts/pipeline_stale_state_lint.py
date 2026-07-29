@@ -31,14 +31,13 @@ THE TWO STALE CLASSES IT DETECTS
     _looks_orphaned. Age is only a fallback when the pid signals are unreadable,
     and its margin is set against the REAL max stage timeout (3600s, 5_images).
 
-Exit 0 = clean, exit 1 = stale state found (Telegram-pinged by the caller).
-
-DELIBERATELY NOT exit 75. run_job.sh reserves 75 (EX_TEMPFAIL) for "my TARGET was
-unavailable, so I did NOTHING" — a state this linter never reaches: it reads every
-state file and reports. Returning 75 on a healthy run would bypass
-rq_clear_on_success and SILENTLY SWALLOW THE RECOVERED PING (run_job.sh:204-208),
-the one channel left once the routine OK is suppressed. For silence-when-clean set
-JOB_QUIET_OK=1 in the plist, which suppresses the OK on rc=0 with correct semantics.
+Exit 0 = clean, exit 1 = stale state found (Telegram-pinged by the caller), exit 75
+(EX_TEMPFAIL) = zero-scan (the target vault path was unavailable — see the guard
+below; NOT a clean result, distinguishable from exit 0/1). This script is not
+currently invoked through run_job.sh (see the CONSUMER note on the zero-scan guard
+below) — the 75/EX_TEMPFAIL convention is inherited only as a shared exit-code
+vocabulary with the scripts that ARE, so a human reading either doesn't have to
+learn two meanings for the same number.
 Read-only; the operator decides the fix. `--selftest` runs hermetic fixtures.
 
 Usage:
@@ -230,12 +229,21 @@ def lint_doc(label: str, doc: dict, published: bool, now: datetime) -> list[dict
     return out
 
 
+def _pipeline_files(vlt: Path) -> list[Path]:
+    """The Video_*_pipeline.json files under Production_Kits/, sorted, or [] if
+    the dir doesn't exist. Single source of truth for both collect() and
+    main()'s zero-scan guard (round-2 audit finding, 2026-07-28): a guard that
+    re-derives this glob instead of calling the production symbol is correct
+    today and silently wrong the moment the pattern changes -- the recurring
+    defect class the 2026-07-28 gate doc names firing five times in one chain."""
+    kits = vlt / KITS_SUBDIR
+    return sorted(kits.glob("Video_*_pipeline.json")) if kits.is_dir() else []
+
+
 def collect(vlt: Path, now: datetime) -> list[dict]:
     kits = vlt / KITS_SUBDIR
-    if not kits.is_dir():
-        return []
     findings: list[dict] = []
-    for p in sorted(kits.glob("Video_*_pipeline.json")):
+    for p in _pipeline_files(vlt):
         label = p.name.replace("_pipeline.json", "")
         try:
             doc = json.loads(p.read_text(encoding="utf-8"))
@@ -355,6 +363,36 @@ def main(argv: list[str]) -> int:
     if args.selftest:
         return _selftest()
 
+    # ZERO-SCAN GUARD (2026-07-28 two-pass audit, lane E). collect() returns [] both when
+    # it scanned every pipeline and found nothing stale AND when it scanned NOTHING — a
+    # missing kits dir (line 235) or a glob that matches no files. Those are opposite
+    # facts that produced identical output ("CLEAN", exit 0), so one renamed vault path
+    # would have reported green forever. Exit 75 = EX_TEMPFAIL, distinguishable from a
+    # clean 0 and silent-on-stderr so a transient unmount doesn't page.
+    # CONSUMER (corrected 2026-07-28 round-2 review — this is NOT a run_job.sh job;
+    # it is never registered as its own scheduled task): routines/pre-brief.prompt
+    # §18 shells out to this script directly and reads the exit code itself. Its
+    # decision table now has an explicit SKIP/75 row (was binary CLEAN/FLAG only,
+    # which read a 75-with-empty-stdout as "note nothing" — the exact silent-green
+    # this guard exists to kill). Uses _pipeline_files() (the same symbol
+    # collect() calls below), not its own re-derived glob (round-2 audit
+    # finding, 2026-07-28) -- a re-derived guard is a check that only knows
+    # what the real scan scanned by COINCIDENCE, not by construction.
+    _kits = vault() / KITS_SUBDIR
+    _pipelines = _pipeline_files(vault())
+    if not _pipelines:
+        _why = ("kits dir missing" if not _kits.is_dir()
+                else "kits dir present but no Video_*_pipeline.json matched")
+        if args.json:
+            print(json.dumps({"status": "skip", "reason": _why,
+                              "kits_dir": str(_kits), "count": 0, "findings": []},
+                             indent=2))
+        else:
+            print(f"pipeline_stale_state_lint: SKIP — scan target unavailable "
+                  f"({_why}: {_kits}). Nothing scanned; this is NOT a clean result.",
+                  file=sys.stderr)
+        return 75
+
     findings = collect(vault(), datetime.now(timezone.utc))
 
     if args.json:
@@ -363,7 +401,10 @@ def main(argv: list[str]) -> int:
         return 1 if findings else 0
 
     if not findings:
-        print("pipeline_stale_state_lint: CLEAN — no stale pipeline state.")
+        # Scanned count in the line a human reads — a bare "CLEAN" can't be told apart
+        # from a shrinking scan set. Modelled on triad_sync_check.py's summary_line.
+        print(f"pipeline_stale_state_lint: CLEAN — no stale pipeline state "
+              f"[scanned {len(_pipelines)} pipeline file(s)].")
         return 0
 
     print(f"pipeline_stale_state_lint: 🔴 FLAG — {len(findings)} stale stage(s)")

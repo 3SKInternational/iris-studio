@@ -207,6 +207,26 @@ def model_key_for_id(cfg: dict, model_id: str) -> str | None:
     return None
 
 
+def _note_window(log, note):
+    """The entries for `note` that describe its CURRENT booking.
+
+    A `replace=True` commit supersedes everything booked for that note before it,
+    so the window starts at the note's LAST replace=True entry (inclusive). With
+    no such entry the whole note history is current (pure top-ups).
+
+    This exists because round-2 stopped purging superseded log entries — needed so
+    credits_used reconciles against its own itemization — which silently widened
+    the scope of every `any(...)` scan over the log. Retention and unscoped scans
+    cannot both be right: see the two call sites for the slot leak it caused.
+    """
+    entries = [e for e in log if e.get("note") == note]
+    last_replace = None
+    for i, e in enumerate(entries):
+        if e.get("replace"):
+            last_replace = i
+    return entries if last_replace is None else entries[last_replace:]
+
+
 def commit(state: dict, d: Decision, cfg: dict, note: str = "",
            actual_credits: int | None = None, replace: bool = True,
            est_override: int | None = None) -> dict:
@@ -231,9 +251,22 @@ def commit(state: dict, d: Decision, cfg: dict, note: str = "",
     combines with prior ones depends on `replace`:
 
       replace=True  (a FULL re-render -- generate_vo's `--force`, which re-renders
-                    EVERY scene): SUPERSEDE. The old same-note entries' credits and
-                    any v2 slot are reversed before the new full-kit booking is
-                    applied, so a re-render can't double-book.
+                    EVERY scene): SUPERSEDE the SLOT, never the CREDITS.
+                    * credits_used is ADDITIVE and never reversed. ElevenLabs
+                      meters per SUBMITTED character, so a --force re-render is a
+                      SECOND REAL CHARGE, not an edit of the first. Reversing it
+                      made the ledger read lower than actual consumption and showed
+                      headroom right up to a hard 402 mid-batch.
+                    * only v2_count is reversed -- it counts distinct videos
+                      occupying a premium slot this cycle, not spend, and a note
+                      holds at most one slot however many times it re-renders.
+                    CORRECTED 2026-07-29 (round-5 review): this said "the old
+                    same-note entries' credits AND any v2 slot are reversed", the
+                    exact opposite of the credits half and of the inline comment in
+                    commit() below. A maintainer trusting it would "restore" the
+                    reversal and re-open the 402 bug. The `max(credits_used, 0)`
+                    clamp further down is likewise vestigial for this path --
+                    nothing can drive credits_used negative any more.
 
       replace=False (a PARTIAL top-up -- a non-`--force` run that renders ONLY the
                     scenes whose mp3s are still missing): ADD. The new booking
@@ -257,19 +290,58 @@ def commit(state: dict, d: Decision, cfg: dict, note: str = "",
     log = state.setdefault("log", [])
     note_has_v2 = False
     if note and replace:
-        kept = []
-        for e in log:
-            if e.get("note") == note:
-                state["credits_used"] = state.get("credits_used", 0) - int(e.get("credits", 0))
-                if e.get("model") == "v2":
-                    state["v2_count"] = state.get("v2_count", 0) - 1
-            else:
-                kept.append(e)
-        log[:] = kept
+        # credits_used is DELIBERATELY NOT reversed here. ElevenLabs meters per
+        # SUBMITTED character, so a --force full re-render bills the original
+        # render's characters AGAIN -- it is a second real charge, not an edit
+        # of the first. Reversing the old booking made credits_used LOWER than
+        # actual cumulative ElevenLabs consumption (a 20-scene kit: real
+        # consumption 40, credits_used said 20 -- generate_vo.py's own
+        # stale-VO guard instructs "Re-render with --force", making this the
+        # COMMON path, not an edge case), so the ledger showed headroom right
+        # up to a hard 402 mid-batch (2026-07-28 two-pass audit). credits_used
+        # must be monotonically additive, matching the real meter it exists to
+        # track.
+        #
+        # v2_count IS still reversed here: unlike credits_used it counts
+        # DISTINCT videos currently occupying a v2 slot this cycle (a cap on
+        # concurrent premium bookings), not cumulative spend -- a re-render of
+        # the SAME video must not double-claim (or leak) a slot. A note holds
+        # AT MOST ONE slot regardless of how many v2 log entries it has
+        # accumulated (repeated top-ups can leave >1 same-note v2 entry), so
+        # this reverses ONCE PER NOTE, not once per matching entry.
+        # ROUND-2 REGRESSION (2026-07-28 review): this used to decrement once
+        # per matching log entry inside the purge loop below -- 2 v2 top-ups
+        # + one --force reversed v2_count twice for a single occupied slot,
+        # under-counting it and letting an extra 2x-cost v2 render past the
+        # per-cycle cap.
+        #
+        # ROUND-3 REGRESSION (2026-07-28 review): scoped to _note_window, NOT the
+        # note's whole history. Round-2 stopped PURGING superseded entries (so the
+        # ledger reconciles), which silently widened every `any(...)` over the log
+        # and reintroduced the very leak the same round fixed:
+        #     v2(replace) -> 1   flash(replace) -> 0   v2(replace) -> 0, want 1
+        # The third call re-reversed a slot the flash run had ALREADY released,
+        # because step 1's retained v2 entry still matched. `slot_open` is then
+        # v2_count < max_v2_per_cycle, so that under-count grants an extra
+        # 2x-cost v2 render past the per-cycle cap.
+        if any(e.get("model") == "v2" for e in _note_window(log, note)):
+            state["v2_count"] = state.get("v2_count", 0) - 1
+        # Prior same-note entries are RETAINED (not purged): the purge existed
+        # only to avoid double-reversing credits_used, and credits_used is no
+        # longer reversed at all above -- so purging now only deletes the
+        # itemization that explains the total, leaving credits_used unable to
+        # reconcile against its own log (ROUND-2 audit finding, 2026-07-28).
+        # note_has_v2 stays False here: this branch always books a fresh v2
+        # slot above when the NEW booking is v2 (the just-reversed slot, if
+        # any, is re-claimed by this run's own commit below).
     elif note and not replace:
         # Additive top-up: keep prior same-note entries; only flag whether this
         # note already consumed a v2 slot so we don't book a second one.
-        note_has_v2 = any(e.get("note") == note and e.get("model") == "v2" for e in log)
+        # Same window as the replace branch: a top-up must judge slot occupancy
+        # from the note's CURRENT booking, not a superseded one. Unwindowed, the
+        # sequence v2(replace) -> flash(replace) -> v2(top-up) saw step 1's
+        # retained v2 and skipped booking a slot the note genuinely now holds.
+        note_has_v2 = any(e.get("model") == "v2" for e in _note_window(log, note))
     state["credits_used"] = state.get("credits_used", 0) + booked
     if d.model_key == "v2" and not note_has_v2:
         state["v2_count"] = state.get("v2_count", 0) + 1

@@ -49,6 +49,26 @@ except OSError as e:
 RECEIPTS_GLOB = "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Production_Kits/*_youtube_upload.json"
 VIDEO_ID_SUPPLEMENT = ["FJljsipxTkA", "n8l84_UBLUc"]  # dead re-upload ids no receipt records
 
+def _ids_from_receipt_dict(d):
+    """The set of video ids one receipt dict contributes (video_id +
+    deleted_video_id). Extracted as a pure function (round-2 audit, 2026-07-28)
+    so this is unit-testable without RECEIPTS_GLOB's live/Mini-bound path --
+    `deleted_video_id` may be a single string (historical shape) OR a list
+    (upload_video.write_receipt_preserving_dead_id can now retire >1 dead id
+    for one receipt); neither shape may be silently dropped, or a redacted book
+    still leaks a real YouTube video id."""
+    out = set()
+    for key in ("video_id", "deleted_video_id"):
+        v = d.get(key)
+        if isinstance(v, str) and v.strip():
+            out.add(v.strip())
+        elif isinstance(v, list):  # deleted_video_id may hold >1 dead id
+            for x in v:
+                if isinstance(x, str) and x.strip():
+                    out.add(x.strip())
+    return out
+
+
 def _collect_video_ids():
     ids = set(VIDEO_ID_SUPPLEMENT)
     receipts = glob.glob(RECEIPTS_GLOB)
@@ -63,13 +83,68 @@ def _collect_video_ids():
         except (OSError, ValueError) as e:
             print(f"REDACTION FAIL — cannot parse upload receipt {r}: {e}")
             sys.exit(1)
-        for key in ("video_id", "deleted_video_id"):
-            v = d.get(key)
-            if isinstance(v, str) and v.strip():
-                ids.add(v.strip())
+        ids |= _ids_from_receipt_dict(d)
     return sorted(ids)
 
 VIDEO_IDS = _collect_video_ids()
+
+# 0b) CREDENTIAL redaction. These are high-precision secret shapes that don't match prose.
+#     Each (pattern, replacement) here is applied as a substitution AND re-scanned in the
+#     fail-closed residual check below — single source of truth so the two can't drift
+#     (the drift between replace-set and check-set was the original C2 leak class).
+#
+#     MUST RUN BEFORE the identity/company scrubs below. Hardened 2026-07-28 (two-pass
+#     codebase audit, lane E): this block used to run LAST, and the identity passes
+#     rewrote tokens *inside* credential values and email addresses, inserting `[`/`]`
+#     characters that fall outside every CRED pattern's character class. The credential
+#     pattern then could not match — and because the residual check deliberately re-scans
+#     this SAME list, the check was blinded by the identical mangling, so the script
+#     printed "REDACTION OK" and exited 0 over a live secret. Reproduced:
+#         api_key = iris_studio_live_9f3a2b7c1d
+#       -> identity pass: api_key = [ASSISTANT]_studio_live_9f3a2b7c1d
+#       -> generic NAME=secret pattern needs [A-Za-z0-9_\-./+] after `=`; `[` is not in it
+#       -> no match, no residual hit, REDACTION OK, rc=0, secret tail intact on disk.
+#     Same class for emails: founder@3sk.com -> founder@[COMPANY].com -> email pattern
+#     dead (`[` not in the domain class) -> local part survives.
+#     The sibling redact-buildlog.py has always ordered these correctly and documents the
+#     hazard in the same words; this file had it backwards. Regression: case 4e/4f in
+#     scripts/test_redact_book.py — revert this move and both go red.
+CRED_PATTERNS = [
+    (r"sk-ant-[A-Za-z0-9_\-]{20,}", "[REDACTED]"),                 # Anthropic API key
+    (r"sk-proj-[A-Za-z0-9_\-]{20,}", "[REDACTED]"),               # OpenAI project key
+    (r"sk-[A-Za-z0-9]{20,}", "[REDACTED]"),                       # OpenAI classic key
+    (r"\b(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{36}\b", "[REDACTED]"),  # GitHub token
+    (r"\bgithub_pat_[A-Za-z0-9_]{22,}\b", "[REDACTED]"),          # GitHub fine-grained PAT
+    (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED]"),          # Slack token
+    (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED]"),                      # AWS access key id
+    (r"\b\d{8,10}:AA[A-Za-z0-9_\-]{30,}\b", "[REDACTED]"),        # Telegram bot token
+    (r"(?i)\bclient_secret[A-Za-z0-9_\-]*\.json\b", "[REDACTED]"),  # OAuth client-secret filename
+    (r"-----BEGIN[A-Z ]*PRIVATE KEY-----", "[REDACTED]"),         # PEM private key header
+    # generic NAME=secret / NAME: secret assignments (keep the name, redact the value)
+    # Prefix-tolerant: the old leading \b could NOT match after an underscore
+    # (`_` is a word char), so every .env-style name — ELEVENLABS_API_KEY,
+    # TELEGRAM_BOT_TOKEN, YOUTUBE_CLIENT_SECRET, MY_PASSWORD, i.e. THIS repo's own
+    # variable names and the dominant real shape — sailed straight through. And
+    # because the fail-closed residual check is built from this same list, it was
+    # blinded identically: all four printed "REDACTION OK", rc=0, byte-for-byte
+    # intact. Same fail-open mechanism as the pass-ordering bug fixed above, one
+    # layer over. `(?<![A-Za-z0-9])` + a lazy prefix admits FOO_API_KEY while
+    # still anchoring at a token boundary; verified over all 24 maintained books
+    # with ZERO byte differences (no over-redaction). Found 2026-07-29, round-6
+    # lane-1 review. Regression: the ELEVENLABS_API_KEY fixture in the test file.
+    (r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9_\-]*?(?:api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|token))(\s*[:=]\s*)['\"]?[A-Za-z0-9_\-./+]{8,}['\"]?",
+     r"\1\2[REDACTED]"),
+    # any email address (the studio@ pass below only catches one prefix)
+    (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED]"),
+]
+for pat, repl in CRED_PATTERNS:
+    # IGNORECASE so the substitution scope EXACTLY matches the residual check below
+    # (line scans CRED_PATTERNS with re.IGNORECASE). Without it, a case-flipped secret
+    # (SK-ANT-…, GHP_…, akia…) survived the sub yet tripped the check -> fail-closed.
+    # Same single-source-of-truth invariant as the identity tokens. The fix matters for
+    # the prefix LITERALS (sk-ant-, ghp_, AKIA) which are case-specific; patterns with an
+    # inline (?i) are unaffected, and the alpha char-classes were already both-case.
+    s = re.sub(pat, repl, s, flags=re.IGNORECASE)
 
 # 1) Ordered, case-SENSITIVE structural replacements. Paths + compound tokens appear in
 #    fixed forms in the sources; longest/most-specific first so a short token never
@@ -128,37 +203,6 @@ s = re.sub(r"\biris\b", "[ASSISTANT]", s, flags=re.IGNORECASE)
 # different casing is a different YouTube video; the residual check below mirrors this exactly.
 for _vid in VIDEO_IDS:
     s = s.replace(_vid, "[VIDEO_ID]")
-
-# 2b) CREDENTIAL redaction. These are high-precision secret shapes that don't match prose.
-#     Each (pattern, flags) here is applied as a substitution AND re-scanned in the
-#     fail-closed residual check below — single source of truth so the two can't drift
-#     (the drift between replace-set and check-set was the original C2 leak class).
-#     (pattern, replacement) — replacement keeps any capture groups it needs.
-CRED_PATTERNS = [
-    (r"sk-ant-[A-Za-z0-9_\-]{20,}", "[REDACTED]"),                 # Anthropic API key
-    (r"sk-proj-[A-Za-z0-9_\-]{20,}", "[REDACTED]"),               # OpenAI project key
-    (r"sk-[A-Za-z0-9]{20,}", "[REDACTED]"),                       # OpenAI classic key
-    (r"\b(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{36}\b", "[REDACTED]"),  # GitHub token
-    (r"\bgithub_pat_[A-Za-z0-9_]{22,}\b", "[REDACTED]"),          # GitHub fine-grained PAT
-    (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED]"),          # Slack token
-    (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED]"),                      # AWS access key id
-    (r"\b\d{8,10}:AA[A-Za-z0-9_\-]{30,}\b", "[REDACTED]"),        # Telegram bot token
-    (r"(?i)\bclient_secret[A-Za-z0-9_\-]*\.json\b", "[REDACTED]"),  # OAuth client-secret filename
-    (r"-----BEGIN[A-Z ]*PRIVATE KEY-----", "[REDACTED]"),         # PEM private key header
-    # generic NAME=secret / NAME: secret assignments (keep the name, redact the value)
-    (r"(?i)\b((?:api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|token))(\s*[:=]\s*)['\"]?[A-Za-z0-9_\-./+]{8,}['\"]?",
-     r"\1\2[REDACTED]"),
-    # any email address (the studio@ pass above only caught one prefix)
-    (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED]"),
-]
-for pat, repl in CRED_PATTERNS:
-    # IGNORECASE so the substitution scope EXACTLY matches the residual check below
-    # (line scans CRED_PATTERNS with re.IGNORECASE). Without it, a case-flipped secret
-    # (SK-ANT-…, GHP_…, akia…) survived the sub yet tripped the check -> fail-closed.
-    # Same single-source-of-truth invariant as the identity tokens. The fix matters for
-    # the prefix LITERALS (sk-ant-, ghp_, AKIA) which are case-specific; patterns with an
-    # inline (?i) are unaffected, and the alpha char-classes were already both-case.
-    s = re.sub(pat, repl, s, flags=re.IGNORECASE)
 
 try:
     with open(P, "w", encoding="utf-8") as fh:
