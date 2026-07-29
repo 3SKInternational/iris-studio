@@ -230,14 +230,40 @@ class TestPolicyCapGate(unittest.TestCase):
         ~$0.095/unit so no integer count lands on $1.0000, and mutating `>` to `>=`
         survives this fixture. Pinning that boundary would need the gate predicate
         extracted from main() into a callable. Economically irrelevant (a batch
-        costing exactly $1.0000 does not occur), so it is documented, not chased."""
-        self._seed_prior(0.50)
+        costing exactly $1.0000 does not occur), so it is documented, not chased.
+
+        SEED CHANGED 2026-07-29: was $0.50, which is no longer a first batch now
+        that a reprint is judged on whether a prior BATCH exceeded the reprint cap
+        (a $0.10 smoke test used to brand the real flagship batch a reprint). With
+        the old seed this bracketed the FIRST-BATCH limit while claiming to
+        bracket the reprint one."""
+        self._seed_prior(5.00)
         self._widen_manifest(10)
         p = self._run("--max-images", "150", "--max-cost", "99")
         self.assertIn("spend guard: OK", p.stdout + p.stderr)
         self._widen_manifest(11)
         p2 = self._run("--max-images", "150", "--max-cost", "99")
         self.assertIn("reprint limit", p2.stdout + p2.stderr)
+
+    def test_smoke_test_does_not_brick_the_real_first_batch(self):
+        """THE regression, through the GATE not the helper (2026-07-29).
+
+        A `--limit 1` smoke test (~$0.10 — documented in generate_images.py's own
+        usage) used to flip the video into REPRINT mode, so the real flagship
+        batch was then refused: prior $0.10 + add $8.80 = $8.90, blocked as
+        "reprint adds $8.80 > $1.00" — $1.10 UNDER the $10 ceiling it was meant to
+        enforce. Six videos were already stuck that way, and the only escape was
+        --over-cap-ok, which pings "over cap, proceeding" for a run that is not.
+
+        This drives the real CLI, so it fails if the gate stops calling
+        first_batch_done() — unit-testing the helper alone does not catch that."""
+        self._seed_prior(0.10)          # the smoke test, NOT a first batch
+        self._widen_manifest(20)        # ~$2.00: way over the $1 reprint limit
+        p = self._run("--max-images", "150", "--max-cost", "99")
+        out = p.stdout + p.stderr
+        self.assertNotIn("reprint limit", out,
+                         "a $0.10 smoke test must not brand the real batch a reprint")
+        self.assertIn("spend guard: OK", out)
 
     def test_reprint_within_limit_passes(self):
         """A video already at the cap may still take a small reprint.
@@ -265,8 +291,17 @@ class TestPolicyCapGate(unittest.TestCase):
         Without this the reprint limit is decorative: a video with $0.50 of prior spend
         could bill another $8 and still sit below the $10 ceiling. 20 images ~= $2.00
         against $0.50 prior = $2.50 total — comfortably under the ceiling, and it must
-        STILL block because the reprint half is what was exceeded."""
-        self._seed_prior(0.50)
+        STILL block because the reprint half is what was exceeded.
+
+        SEED CHANGED 2026-07-29: was $0.50. A reprint is now judged on whether a
+        prior BATCH exceeded the reprint cap, not on `prior > 0` — a $0.10 smoke
+        test used to brand the real flagship batch a reprint and refuse it at
+        $8.90, under the $10 ceiling. $0.50 is therefore no longer a first batch,
+        so this fixture would have been testing the first-batch path while
+        claiming to test the reprint path. Seeding a REAL first batch ($5.00)
+        keeps this pinning exactly what it says: a >$1 reprint blocks even when
+        the total stays under the ceiling."""
+        self._seed_prior(5.00)
         self._widen_manifest(20)
         p = self._run("--max-images", "150", "--max-cost", "99")
         self.assertNotEqual(p.returncode, 0, "a >$1 reprint must block")
@@ -342,6 +377,72 @@ class TestPolicyCapGate(unittest.TestCase):
         self.assertEqual(gi.policy_gate_key("Video_98_Thumbnail_pop", "Video_99"),
                          "Video_98")
         self.assertEqual(gi.policy_gate_key("CTA_outro", "Video_99"), "Video_99")
+
+
+class TestFirstBatchVsReprint(unittest.TestCase):
+    """A smoke test must not brand the real first batch a REPRINT.
+
+    THE DEFECT (2026-07-29). The gate classified a run as a reprint on
+    `prior_spend > 0.0`. The `--limit 1` smoke test documented in
+    generate_images.py's own usage costs ~$0.10 — and that alone flipped the
+    video into reprint mode, so the real flagship batch was refused:
+
+        prior $0.10 + add $8.80 = $8.90, blocked as "reprint adds $8.80 > $1.00"
+
+    $1.10 UNDER the $10 ceiling it was supposedly enforcing. Six videos were
+    already stuck in that state. The only escape was --over-cap-ok, which pings
+    "over cap, proceeding" for a run that is not over cap.
+
+    A reprint is now judged on whether a prior BATCH exceeded the reprint cap,
+    which is what the decision doc always meant by "first batch"."""
+
+    def _ledger(self, rows):
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
+        for r in rows:
+            tmp.write(json.dumps(r) + "\n")
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        return Path(tmp.name)
+
+    def test_smoke_test_alone_is_not_a_first_batch(self):
+        led = self._ledger([{"video": "Video_15", "manifest": "thumb_pop_batch.json",
+                             "shot": "Video_15_Thumbnail_A", "cost_usd": 0.10}])
+        self.assertFalse(gi.first_batch_done(led, "Video_15"),
+                         "a $0.10 smoke test must NOT count as the first batch — "
+                         "that is what refused the real $8.80 flagship at $8.90")
+
+    def test_a_real_batch_is_a_first_batch(self):
+        led = self._ledger([{"video": "Video_15", "manifest": "video_15_hd.json",
+                             "shot": f"Video_15_Shot_{i}", "cost_usd": 0.22}
+                            for i in range(40)])
+        self.assertTrue(gi.first_batch_done(led, "Video_15"),
+                        "an $8.80 batch IS the first batch; later runs are reprints")
+
+    def test_several_sub_cap_runs_still_are_not_a_first_batch(self):
+        """Judged per BATCH, not on the total — three $0.40 fixups sum past the
+        reprint cap but no single one is the bulk batch."""
+        led = self._ledger([
+            {"video": "Video_15", "manifest": f"fix_{i}.json",
+             "shot": f"Video_15_Shot_{i}", "cost_usd": 0.40} for i in range(3)])
+        self.assertGreater(gi.load_video_spend(led, "Video_15"), gi.REPRINT_CAP_USD)
+        self.assertFalse(gi.first_batch_done(led, "Video_15"))
+
+    def test_batches_are_grouped_by_manifest(self):
+        led = self._ledger([
+            {"video": "Video_15", "manifest": "a.json", "shot": "s1", "cost_usd": 0.30},
+            {"video": "Video_15", "manifest": "a.json", "shot": "s2", "cost_usd": 0.30},
+            {"video": "Video_15", "manifest": "b.json", "shot": "s3", "cost_usd": 5.00},
+            {"video": "Video_99", "manifest": "a.json", "shot": "s4", "cost_usd": 9.00},
+        ])
+        got = gi.load_video_batches(led, "Video_15")
+        self.assertAlmostEqual(got["a.json"], 0.60)
+        self.assertAlmostEqual(got["b.json"], 5.00)
+        self.assertNotIn("Video_99", str(got), "must not bleed across videos")
+
+    def test_absolute_ceiling_is_unchanged(self):
+        """The fix must not raise the per-video ceiling — that is a locked value."""
+        self.assertAlmostEqual(gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD, 10.0)
 
 
 if __name__ == "__main__":

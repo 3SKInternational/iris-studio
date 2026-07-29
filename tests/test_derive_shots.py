@@ -178,6 +178,38 @@ def main():
           dies(["Video_14_Shot_01a_1", "Video_14_Shot_02a_1",
                 "Video_14_Shot_03a_1", "Video_14_Shot_01b_1"]))
 
+    # --- PORTED from the stale root-level test_derive_shots.py (2026-07-29) -----
+    # That 88-line Jul-9 copy sat beside this 548-line one, both git-tracked and
+    # both running in the gate under the same display name once suite discovery
+    # was fixed. It is being deleted, but two of its assertions had ZERO coverage
+    # here, so they move rather than vanish: the `no_char` flag and prompt
+    # whitespace collapsing. Both are real production behaviour
+    # (build_video.py:137 and :417 derive no_char from /\bno character\b/i).
+    def _derive_with_prompts(entries, vid):
+        _n[0] += 1
+        q = TMP / f"ds_port_{_n[0]:03d}_hd.json"
+        q.write_text(json.dumps({"images": entries}))
+        return bv.derive_shots_from_hd_manifest(q, vid)
+
+    _ported = _derive_with_prompts([
+        {"name": "Video_99_Shot_01a", "prompt": "Three,  charcoal  suit."},
+        {"name": "Video_99_Shot_01b", "prompt": "No character. A card."},
+        {"name": "Video_99_Shot_02a", "prompt": "Three walking."},
+        {"name": "Video_99_Thumbnail_A", "prompt": "thumb art"},   # must be excluded
+        {"name": "Video_99_Thumbnail_B", "prompt": "thumb art"},
+    ], "Video_99")
+    check("ported: thumbnails excluded, shot ids in order",
+          [x["id"] for x in _ported] == ["01a", "01b", "02a"],
+          f"got={[x['id'] for x in _ported]}")
+    check("ported: scene/sub parsed off the name",
+          _ported[0]["scene"] == 1 and _ported[0]["sub"] == "a", str(_ported[0]))
+    check("ported: prompt whitespace is collapsed",
+          _ported[0]["prompt"] == "Three, charcoal suit.",
+          f"got={_ported[0]['prompt']!r}")
+    check("ported: no_char set from 'No character', and only there",
+          _ported[1]["no_char"] is True and _ported[0]["no_char"] is False,
+          f"01a={_ported[0]['no_char']} 01b={_ported[1]['no_char']}")
+
     # The final sort is the ONLY thing ordering shots within a scene — no guard
     # checks index order, so an appended re-render (Shot_01a_3 written before
     # Shot_01a_1) relies entirely on it. Deleting the sort survived mutation

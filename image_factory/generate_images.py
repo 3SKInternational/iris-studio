@@ -375,6 +375,60 @@ def load_video_spend(ledger_path: Path, video: str) -> float:
     return total
 
 
+def load_video_batches(ledger_path: Path, video: str) -> dict:
+    """{manifest: billed USD} for THIS video — per-BATCH totals, not one sum.
+
+    The cap gate needs to know whether the video's real first batch has already
+    happened, and a bare total cannot answer that: $0.10 of smoke test and $8.80
+    of flagship look identical once summed.
+    """
+    batches: dict = {}
+    if not ledger_path.exists():
+        return batches
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        # mutequiv: if-test->False here is unobservable — an unskipped blank line
+        # reaches json.loads(""), which raises JSONDecodeError, which the except
+        # below already catches and continues on, landing on the identical result.
+        # PROVEN by running both paths over ['', '  ', <real row>]: both yield
+        # {'m': 1.0}. This is a fast path, not dead code, and it is the same idiom
+        # four sibling loaders in this file use (:346, :367, :460) — so it stays.
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # tolerate a torn last line, same as load_video_spend
+        if canonical_video(rec) == video and isinstance(rec.get("cost_usd"), (int, float)):
+            key = rec.get("manifest") or "(unknown)"
+            batches[key] = batches.get(key, 0.0) + rec["cost_usd"]
+    return batches
+
+
+def first_batch_done(ledger_path: Path, video: str) -> bool:
+    """Has this video already had its REAL first batch?
+
+    True iff some prior manifest billed MORE than the reprint cap. Anything at or
+    under it (a --limit 1 smoke test, a single card re-render) is by definition
+    not the bulk batch.
+
+    Why not `prior_spend > 0` — the old test (2026-07-29). The `--limit 1` smoke
+    test documented in this file's own usage costs ~$0.10, and that alone flipped
+    the video into REPRINT mode, so the real flagship batch was then refused:
+        prior $0.10 + add $8.80 = $8.90, blocked as "reprint adds $8.80 > $1.00"
+    — $1.10 UNDER the $10 ceiling it was supposedly protecting. Six videos were
+    already stuck that way. The only escape was --over-cap-ok, which pings
+    "⚠️ over cap, proceeding" for a run that is not over cap, training the
+    operator to treat the one flag that disables the real ceiling as routine.
+
+    This restores the semantics the decision doc always stated ("First batch:
+    video has $0 prior ledger spend ... bounded by POLICY_CAP_USD alone") without
+    the smoke test counting as spend. The absolute ceiling is untouched:
+    POLICY_CAP_USD + REPRINT_CAP_USD.
+    """
+    return any(v > REPRINT_CAP_USD for v in load_video_batches(ledger_path, video).values())
+
+
 def notify(msg: str) -> None:
     """Best-effort Telegram ping via scripts/notify.sh. Never blocks or raises.
     IRIS_NOTIFY_DISABLE=1 silences it (tests)."""
@@ -698,11 +752,14 @@ def main() -> None:
     # reprint through a fresh video's headroom.
     breaches = []
     for k, p, a in gate_state:
-        if p > 0.0 and a > REPRINT_CAP_USD:
+        # REPRINT is judged on whether the real first batch already happened, not
+        # on `p > 0.0` — see first_batch_done(). A smoke test is not a first batch.
+        _is_reprint = first_batch_done(ledger_path, k)
+        if _is_reprint and a > REPRINT_CAP_USD:
             breaches.append((k, p, a, f"reprint run adds ~${a:.2f}, over the "
                                       f"${REPRINT_CAP_USD:.2f} reprint limit"))
-        elif p + a > POLICY_CAP_USD + (REPRINT_CAP_USD if p > 0.0 else 0.0):
-            _ceil = POLICY_CAP_USD + (REPRINT_CAP_USD if p > 0.0 else 0.0)
+        elif p + a > POLICY_CAP_USD + (REPRINT_CAP_USD if _is_reprint else 0.0):
+            _ceil = POLICY_CAP_USD + (REPRINT_CAP_USD if _is_reprint else 0.0)
             breaches.append((k, p, a, f"would reach ${p + a:.2f}, over the "
                                       f"${_ceil:.2f} ceiling"))
     if not args.dry_run:

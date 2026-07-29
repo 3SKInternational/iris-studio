@@ -120,17 +120,56 @@ def get_status(youtube, video_id: str) -> dict:
     return items[0]["status"]
 
 
+def wants_synthetic(argv) -> bool:
+    """Declare altered/synthetic media? DEFAULT TRUE; --no-synthetic opts out.
+
+    Pure so it can be pinned — this file had NO test suite at all, and the two
+    mutants on the old inline expression (negating it, and slicing argv from [2:])
+    both survived the gate. A compliance default with no coverage is exactly the
+    shape that rots.
+
+    Why default-on: videos.update DELETES any status property the request omits
+    ("If you are submitting an update request, and your request does not specify
+    a value for a property that already has a value, the property's existing
+    value will be deleted." — videos.update reference). schedule-mode and
+    unschedule-mode both build their status from `live`, which can never carry
+    containsSyntheticMedia because videos.list does not return it to the owner.
+    So with the old opt-in --synthetic, either mode silently stripped the
+    disclosure. Only preserve-mode was safe, and only because it REQUIRED the
+    flag. Every 3SK Finance video is AI-generated end to end; over-disclosing is
+    harmless, under-disclosing is the compliance risk. 2026-07-29.
+    """
+    return "--no-synthetic" not in argv
+
+
 def main() -> int:
-    flags = {"--commit", "--synthetic"}
+    flags = {"--commit", "--synthetic", "--no-synthetic"}
     args = [a for a in sys.argv[1:] if a not in flags]
     commit = "--commit" in sys.argv[1:]
-    synthetic = "--synthetic" in sys.argv[1:]  # declare "altered or synthetic media"
+    # DEFAULT ON. This was opt-in via --synthetic, which made schedule-mode and
+    # unschedule-mode silently DELETE the altered/synthetic-media disclosure:
+    # both send a status update built from `live`, and per this file's own note
+    # below, `live` can never carry containsSyntheticMedia because videos.list
+    # does not return it to the owner. videos.update deletes any status property
+    # the request omits ("If you are submitting an update request, and your
+    # request does not specify a value for a property that already has a value,
+    # the property's existing value will be deleted." — videos.update reference).
+    # Only preserve-mode was protected, and only because it REQUIRED --synthetic.
+    # Receipts for Video_08/09/10/12 carry this script's own publish_at format,
+    # so the unprotected path has run against 4 live videos.
+    # Every 3SK Finance video is AI-generated end to end; over-disclosing is
+    # harmless, under-disclosing is the compliance risk. 2026-07-29.
+    # Whole argv, unsliced. `wants_synthetic` is a membership test and argv[0]
+    # is the script path, so the slice bought nothing — but it was a mutable
+    # site the tests could not reach ([1:] -> [2:] survived, and would drop a
+    # --no-synthetic passed in first position, silently declaring against an
+    # explicit opt-out). No slice, nothing to get wrong.
+    synthetic = wants_synthetic(sys.argv)
     if not args:
-        die("no videos given. Usage: schedule_publish.py Video_05=2026-06-26T18:00:00Z [...] [--commit] [--synthetic]")
+        die("no videos given. Usage: schedule_publish.py Video_05=2026-06-26T18:00:00Z "
+            "[...] [--commit] [--no-synthetic]")
 
     plan = [parse_arg(a) for a in args]
-    if any(pa is None for _, pa in plan) and not synthetic:
-        die("a bare 'Video_NN' (preserve-mode) needs --synthetic — otherwise there's nothing to change.")
     receipts = {label: load_receipt(label) for label, _ in plan}
 
     try:
