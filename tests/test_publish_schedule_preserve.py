@@ -159,7 +159,13 @@ def test_main_reaches_update_when_privacy_private_no_conflict():
 
     class _AllowingVideos(_FakeVideos):
         def update(self, **kw):
-            return _FakeRequest({"status": {"privacyStatus": "private"}})
+            # Echo containsSyntheticMedia, as the real API does when it ACCEPTS the
+            # declaration. main() now verifies persistence from this response — the
+            # update response is the only place the flag is observable, since
+            # videos.list never returns it to the owner. A mock that stays silent
+            # here is indistinguishable from an API that rejected the disclosure.
+            return _FakeRequest({"status": {"privacyStatus": "private",
+                                            "containsSyntheticMedia": True}})
 
     class _AllowingYouTube(_FakeYouTube):
         def __init__(self, list_result):
@@ -274,6 +280,125 @@ def test_unlisted_schedule_conflict_message_ignores_private_target():
     the schedule (see test_refresh_preserves_existing_schedule above)."""
     assert pv.unlisted_schedule_conflict_message(
         "private", False, SCHEDULED, "Video_09") is None
+
+
+def test_synthetic_disclosure_is_reasserted_by_default():
+    """THE compliance regression. videos.update REPLACES the status part, and the
+    API reference is explicit: a property omitted from the request is DELETED.
+    publish_video.py never set containsSyntheticMedia at all, so every metadata
+    refresh silently stripped the AI-disclosure flag — undetectably, because
+    videos.list does not return the property to the owner (None for all 12 live
+    videos). Six receipts record published_via: publish_video.py."""
+    st = pv.build_status("private", SCHEDULED, publish_at=None, clear_schedule=False)
+    assert st.get("containsSyntheticMedia") is True, \
+        f"the disclosure must be re-asserted on EVERY update, else it is deleted: {st}"
+
+
+def test_synthetic_disclosure_survives_every_schedule_path():
+    """It must not depend on which schedule branch runs."""
+    for kwargs in (dict(publish_at=None, clear_schedule=False),
+                   dict(publish_at="2030-05-05T09:00:00Z", clear_schedule=False),
+                   dict(publish_at=None, clear_schedule=True)):
+        st = pv.build_status("private", SCHEDULED, **kwargs)
+        assert st.get("containsSyntheticMedia") is True, (kwargs, st)
+    st = pv.build_status("public", SCHEDULED, publish_at=None, clear_schedule=False)
+    assert st.get("containsSyntheticMedia") is True, \
+        "going public is exactly when the disclosure matters most"
+
+
+def test_no_synthetic_opt_out_is_respected():
+    """A deliberate non-AI upload can still opt out — but only explicitly."""
+    st = pv.build_status("private", SCHEDULED, publish_at=None, clear_schedule=False,
+                         synthetic=False)
+    assert "containsSyntheticMedia" not in st, st
+
+
+def test_main_dies_if_the_disclosure_is_not_echoed_back():
+    """A response that does NOT confirm the disclosure must abort, not carry on.
+
+    videos.update DELETES any status property the request omits, and videos.list
+    never returns containsSyntheticMedia to the owner — so the update RESPONSE is
+    the only evidence the flag actually landed. If it comes back None, the video
+    may be public with no AI-disclosure label and nothing downstream could tell.
+    Silence here would be a fail-open on a compliance control."""
+    vlt = _make_vault()
+    old_env = os.environ.get("SK_VAULT")
+    os.environ["SK_VAULT"] = str(vlt)
+    live = {"items": [{"snippet": {"categoryId": "27"}, "status": dict(SCHEDULED)}]}
+
+    class _SilentVideos(_FakeVideos):
+        def update(self, **kw):
+            # accepted the update but did NOT confirm the disclosure
+            return _FakeRequest({"status": {"privacyStatus": "private"}})
+
+    class _SilentYouTube(_FakeYouTube):
+        def __init__(self, list_result):
+            self._videos = _SilentVideos(list_result)
+
+    try:
+        _stub_googleapiclient()
+        old_argv = sys.argv
+        old_load_creds, old_build_svc = pv.load_credentials, pv.build_data_service
+        sys.argv = ["publish_video.py", "Video_09", "--privacy", "private", "--no-captions"]
+        pv.load_credentials = lambda token: object()
+        pv.build_data_service = lambda creds: _SilentYouTube(live)
+        try:
+            raised = False
+            try:
+                pv.main()
+            except SystemExit:
+                raised = True
+            assert raised, ("an unconfirmed synthetic-media disclosure must die(), "
+                            "not pass silently — the video could be public with no "
+                            "AI-disclosure label")
+        finally:
+            sys.argv = old_argv
+            pv.load_credentials, pv.build_data_service = old_load_creds, old_build_svc
+    finally:
+        if old_env is None:
+            os.environ.pop("SK_VAULT", None)
+        else:
+            os.environ["SK_VAULT"] = old_env
+
+
+def test_no_synthetic_does_not_demand_an_echo():
+    """With --no-synthetic the flag is never SENT, so the response has nothing to
+    echo — demanding confirmation there would die() on a legitimate run.
+
+    Guards the other side of the verification conditional: forcing it to always
+    verify passes every other case (they all send the flag AND get it echoed),
+    and only this one distinguishes them."""
+    vlt = _make_vault()
+    old_env = os.environ.get("SK_VAULT")
+    os.environ["SK_VAULT"] = str(vlt)
+    live = {"items": [{"snippet": {"categoryId": "27"}, "status": dict(SCHEDULED)}]}
+
+    class _SilentVideos(_FakeVideos):
+        def update(self, **kw):
+            return _FakeRequest({"status": {"privacyStatus": "private"}})
+
+    class _SilentYouTube(_FakeYouTube):
+        def __init__(self, list_result):
+            self._videos = _SilentVideos(list_result)
+
+    try:
+        _stub_googleapiclient()
+        old_argv = sys.argv
+        old_load_creds, old_build_svc = pv.load_credentials, pv.build_data_service
+        sys.argv = ["publish_video.py", "Video_09", "--privacy", "private",
+                    "--no-captions", "--no-synthetic"]
+        pv.load_credentials = lambda token: object()
+        pv.build_data_service = lambda creds: _SilentYouTube(live)
+        try:
+            pv.main()  # must NOT raise — nothing was declared, nothing to confirm
+        finally:
+            sys.argv = old_argv
+            pv.load_credentials, pv.build_data_service = old_load_creds, old_build_svc
+    finally:
+        if old_env is None:
+            os.environ.pop("SK_VAULT", None)
+        else:
+            os.environ["SK_VAULT"] = old_env
 
 
 if __name__ == "__main__":

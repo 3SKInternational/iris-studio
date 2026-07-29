@@ -89,6 +89,10 @@ def parse_args() -> argparse.Namespace:
                    default="public", help="Target privacy (default: public).")
     p.add_argument("--publish-at", help="ISO8601 UTC scheduled publish time "
                    "(e.g. 2026-10-01T13:00:00Z). Keeps status private + publishAt.")
+    p.add_argument("--no-synthetic", action="store_true",
+                   help="Do NOT declare altered/synthetic media on this update. Default is "
+                        "to declare it: every 3SK Finance video is AI-generated, and "
+                        "videos.update DELETES any status property the request omits.")
     p.add_argument("--clear-schedule", action="store_true",
                    help="Explicitly DROP an existing scheduled publishAt (unschedule). "
                         "Without this flag an existing schedule is PRESERVED across a "
@@ -111,7 +115,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_status(target_privacy: str, live_status: dict, publish_at: str | None,
-                 clear_schedule: bool) -> dict:
+                 clear_schedule: bool, synthetic: bool = True) -> dict:
     """Build the writable `status` part for videos.update.
 
     videos.update REPLACES the status part wholesale, so every field we want kept
@@ -170,6 +174,26 @@ def build_status(target_privacy: str, live_status: dict, publish_at: str | None,
         # now die()s that combination explicitly before it reaches the API (see
         # the unlisted+schedule guard ahead of build_status's call site).
         status["publishAt"] = live_status["publishAt"]
+
+    # RE-ASSERT the altered/synthetic-media disclosure on every update.
+    # videos.update REPLACES the status part, and the API reference is explicit:
+    # "If you are submitting an update request, and your request does not specify
+    # a value for a property that already has a value, the property's existing
+    # value will be deleted." This file never set containsSyntheticMedia at all,
+    # so EVERY metadata refresh silently cleared the AI-disclosure flag on a
+    # public finance channel — and nothing could detect it, because videos.list
+    # does not return the property to the owner (verified: it reads None for all
+    # 12 live videos). Six receipts record published_via: publish_video.py while
+    # still claiming contains_synthetic_media: true, a local record asserting a
+    # disclosure that is no longer on the video.
+    #
+    # Defaults TRUE because every 3SK Finance video is AI-generated end to end
+    # (AI-generated imagery + ElevenLabs TTS narration), and over-disclosing is
+    # harmless while under-disclosing is the compliance risk. --no-synthetic is
+    # the deliberate escape hatch for a future non-AI upload.
+    # 2026-07-29, resolved from the API docs rather than by testing on a live video.
+    if synthetic:
+        status["containsSyntheticMedia"] = True
     return status
 
 
@@ -375,7 +399,8 @@ def main() -> None:
     if conflict_msg:
         die(conflict_msg)
 
-    status = build_status(target_privacy, live_status, publish_at, args.clear_schedule)
+    status = build_status(target_privacy, live_status, publish_at,
+                         args.clear_schedule, synthetic=not args.no_synthetic)
 
     for _line in schedule_notice(status, live_status, publish_at, args.clear_schedule):
         print(_line)
@@ -391,6 +416,20 @@ def main() -> None:
     new_privacy = (resp.get("status") or {}).get("privacyStatus", target_privacy)
     url = f"https://youtu.be/{video_id}"
     print(f"  ✅ updated: privacy now '{new_privacy}'  →  {url}")
+
+    # Confirm the disclosure PERSISTED. The update response is the only place it
+    # is observable — videos.list does not return containsSyntheticMedia to the
+    # owner (verified: None for all 12 live videos), so a list-based check
+    # false-negatives every time. schedule_publish.py:199 has always done this;
+    # this file never did, which is how the flag could be dropped silently.
+    if status.get("containsSyntheticMedia"):
+        echoed = (resp.get("status") or {}).get("containsSyntheticMedia")
+        if echoed is not True:
+            die(f"synthetic-media disclosure NOT accepted — update response says "
+                f"containsSyntheticMedia={echoed!r}. The video may now be public "
+                f"WITHOUT its AI-disclosure label. Re-run, or set it in YouTube "
+                f"Studio before treating this video as compliant.")
+        print("  ✅ altered/synthetic-media disclosure confirmed on the video")
 
     if thumb:
         set_thumbnail(youtube, video_id, thumb)
