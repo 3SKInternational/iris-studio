@@ -3,8 +3,8 @@
 
 The competitor analogue of ``analytics_pull.py``. Where that script reads OUR
 channel's metrics from the Analytics API, this one reads the OUTSIDE animated-
-finance peer set from the public Data API: for a rolling window it runs
-``search.list`` (ordered by view count) within each peer channel — the
+finance peer set from the public Data API: for a rolling window it lists each
+peer channel's recent uploads via ``playlistItems.list`` (1 unit) — the
 Willie-anchored animated-finance allowlist (Willie Finance + 100k+ look-alikes
 in his animated-documentary format) — then ``videos.list`` to attach the REAL
 ``viewCount`` (+ channel, publish date, duration) to each hit, and writes a
@@ -21,9 +21,11 @@ This script does NO analysis — it is the data feed. The ``youtube-research``
 routine runs it first, then hands the file to the agent (see
 routines/youtube-research.prompt), exactly mirroring the analytics-feedback loop.
 
-Quota: ``search.list`` costs 100 units/call, ``videos.list`` 1 unit per ≤50 ids.
-Default run (allowlist only, 4 channels) ≈ 400 units; ``--keyword-search`` adds
-~800 — both well under the 10k/day default quota.
+Quota: the channel path costs 2 units/channel (``channels.list`` resolve +
+``playlistItems.list`` uploads, 1 each), ``videos.list`` 1 unit per ≤50 ids — a
+default run over ~9 channels is ~20 units. ``--keyword-search`` (opt-in, OFF by
+default) still uses ``search.list`` at 100 units/query. Was ~100 units/channel;
+this is the ~100x cut that stops one run from starving the shared project quota.
 
 Output: Channel_Intelligence/Niche_Views/<YYYY-MM-DD>_niche-views.md (under $SK_VAULT).
 Frontmatter ``status:`` follows the agent status contract so a no-results / quota
@@ -152,6 +154,16 @@ TABLE_TOP_N = 40         # cap the ranked table after merging + dedup.
 SHORTS_MAX_SECONDS = 60  # <= this duration is a Short (dropped unless --include-shorts).
 
 
+def _quota_estimate(n_handles: int, n_queries: int, keyword_search: bool) -> int:
+    """Rough Data-API units a run will spend (for the pre-flight readout).
+
+    Channel path = 2 units/handle (channels.list resolve + playlistItems.list, 1
+    each) — down from 101 (the old 100-unit search.list). Keyword search adds
+    100/query (search.list) only when opted in.
+    """
+    return n_handles * 2 + (n_queries * 100 if keyword_search else 0)
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(code)
@@ -204,14 +216,19 @@ def _is_quota_error(exc) -> bool:
     return "quotaexceeded" in txt or "dailylimitexceeded" in txt
 
 
-def resolve_handle(data_service, handle: str) -> str | None:
-    """@handle -> channelId via channels.list(forHandle). None on miss/soft error."""
+def resolve_uploads_playlist(data_service, handle: str) -> str | None:
+    """@handle -> the channel's uploads-playlist id via channels.list(forHandle).
+
+    One channels.list call (1 unit) returns contentDetails.relatedPlaylists.uploads,
+    the 1-unit path to a channel's recent videos via playlistItems.list — replacing
+    the old 100-unit search.list(channelId=...). None on miss/soft error.
+    """
     from googleapiclient.errors import HttpError
 
     try:
         resp = (
             data_service.channels()
-            .list(part="id", forHandle=handle.lstrip("@"))
+            .list(part="contentDetails", forHandle=handle.lstrip("@"))
             .execute()
         )
     except HttpError as exc:
@@ -220,7 +237,11 @@ def resolve_handle(data_service, handle: str) -> str | None:
         print(f"  ⚠ resolve @{handle} failed: {exc}", file=sys.stderr)
         return None
     items = resp.get("items", [])
-    return items[0]["id"] if items else None
+    if not items:
+        return None
+    return (items[0].get("contentDetails", {})
+            .get("relatedPlaylists", {})
+            .get("uploads"))
 
 
 def search_video_ids(data_service, after: str, per_query: int, *,
@@ -254,6 +275,46 @@ def search_video_ids(data_service, after: str, per_query: int, *,
         if vid:
             ids.append(vid)
     return ids
+
+
+def _uploads_in_window(items: list[dict], after: str, per_query: int) -> list[str]:
+    """Video ids from playlistItems `contentDetails` published on/after `after`.
+
+    `after` and `videoPublishedAt` are both RFC3339 UTC 'Z' timestamps, so a plain
+    string compare is a correct chronological compare. Uploads arrive newest-first;
+    keep window hits in that order, cap at per_query (matches the old search depth).
+    Pure/no-network so --selftest can exercise the one non-trivial branch.
+    """
+    ids = []
+    for it in items:
+        cd = it.get("contentDetails", {})
+        vid, pub = cd.get("videoId"), cd.get("videoPublishedAt", "")
+        if vid and pub and pub >= after:
+            ids.append(vid)
+    return ids[:per_query]
+
+
+def recent_upload_ids(data_service, playlist_id: str, after: str,
+                      per_query: int) -> list[str]:
+    """Recent in-window upload ids for a channel — playlistItems.list = 1 unit.
+
+    Replaces the old 100-unit search.list(channelId=...). Raises QuotaExceeded so
+    the caller can salvage partial data; [] on soft failure.
+    """
+    from googleapiclient.errors import HttpError
+
+    try:
+        resp = (
+            data_service.playlistItems()
+            .list(part="contentDetails", playlistId=playlist_id, maxResults=50)
+            .execute()
+        )
+    except HttpError as exc:
+        if _is_quota_error(exc):
+            raise QuotaExceeded(str(exc)) from exc
+        print(f"  ⚠ uploads for {playlist_id} failed: {exc}", file=sys.stderr)
+        return []
+    return _uploads_in_window(resp.get("items", []), after, per_query)
 
 
 def fetch_video_stats(data_service, video_ids: list[str]) -> dict[str, dict]:
@@ -377,9 +438,9 @@ def build_body(rows: list[dict], queries: list[str], window_days: int,
         "",
         f"# 3SK Finance — Niche most-viewed feed (last {window_days} days)",
         "",
-        "Real view counts from the YouTube **Data API** (`search.list` ordered by "
-        "views → `videos.list` statistics) over the **Willie-anchored animated-finance "
-        "peer set** (Willie Finance + 100k+ look-alikes that share his animated-"
+        "Real view counts from the YouTube **Data API** (channel uploads via "
+        "`playlistItems.list` → `videos.list` statistics) over the **Willie-anchored "
+        "animated-finance peer set** (Willie Finance + 100k+ look-alikes that share his animated-"
         "documentary format). This is the deterministic data feed for "
         "**youtube-researcher** — use these numbers to rank `viral_teardowns.md` and "
         "gauge `title_performance.md` instead of 'no public data'. Raw data only; no "
@@ -450,8 +511,7 @@ def main() -> None:
     out = (Path(os.path.expanduser(args.out)) if args.out
            else vlt / NICHE_SUBDIR / f"{date.today().isoformat()}_niche-views.md")
 
-    # Rough quota: 1 unit/handle (resolve) + 100/handle-search + 100/query + videos.list.
-    est = len(handles) * 101 + (len(queries) * 100 if args.keyword_search else 0)
+    est = _quota_estimate(len(handles), len(queries), args.keyword_search)
     print(f"window     : last {args.days} days (publishedAfter {after})")
     print(f"creators   : {len(handles)} ({', '.join('@' + h for h in handles)})")
     print(f"queries    : {len(queries) if args.keyword_search else 0}"
@@ -461,10 +521,11 @@ def main() -> None:
     print(f"output     : {out}")
 
     if args.dry_run:
-        kw = "per channel + per query" if args.keyword_search else "per channel (keyword search off)"
-        print(f"\n--- DRY RUN (no network). Would resolve creator handles, run "
-              f"search.list(order=viewCount) {kw}, then videos.list for statistics, "
-              "and write the ranked feed. Drop --dry-run to run. ---")
+        kw = ("uploads playlist per channel + search.list per query"
+              if args.keyword_search else "uploads playlist per channel (keyword search off)")
+        print(f"\n--- DRY RUN (no network). Would resolve creator handles to their "
+              f"uploads playlists, list recent uploads ({kw}), then videos.list for "
+              "statistics, and write the ranked feed. Drop --dry-run to run. ---")
         return
 
     try:
@@ -479,11 +540,11 @@ def main() -> None:
     quota_note = ""
     try:
         for h in handles:
-            cid = resolve_handle(data, h)
-            if not cid:
+            uploads = resolve_uploads_playlist(data, h)
+            if not uploads:
                 print(f"  creator @{h}: unresolved (skipped)")
                 continue
-            ids = search_video_ids(data, after, args.per_query, channel_id=cid)
+            ids = recent_upload_ids(data, uploads, after, args.per_query)
             for vid in ids:
                 source.setdefault(vid, f"creator:@{h}")
             print(f"  creator @{h}: {len(ids)} hit(s)")
