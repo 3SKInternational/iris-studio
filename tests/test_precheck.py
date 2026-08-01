@@ -197,6 +197,27 @@ def main():
         check("no-match dirs: rc 0, exactly the one tests/ suite counted",
               rc == 0 and "ALL SUITES GREEN — 1 passed." in out,
               f"rc={rc} out={out[-300:]}")
+
+        # --- L: precheck runs suites on .venv/bin/python when it exists, not the
+        # bare `python3` (2026-08-01). On this box `python3` is 3.9 while the code
+        # is deployed under .venv=3.12, so a healthy module using `str | None`
+        # read as a hard failure and the gate printed a false BLOCKED. Proof is
+        # before/after with a shim: a fixture that FAILS under real python3 goes
+        # GREEN only if precheck picked the (always-exit-0) .venv shim; remove the
+        # shim and the same fixture BLOCKS on the python3 fallback.
+        venv_bin = tmp / ".venv" / "bin"
+        venv_bin.mkdir(parents=True, exist_ok=True)
+        shim = venv_bin / "python"
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+        would_fail = "import sys\nsys.exit(1)\n"
+        rc, out = _scenario(tmp, {"test_venv.py": would_fail})
+        check("venv-preference: shim (exit 0) makes a python3-failing suite GREEN",
+              rc == 0 and "ALL SUITES GREEN" in out, f"rc={rc} out={out[-300:]}")
+        shim.unlink()
+        rc, out = _scenario(tmp, {"test_venv.py": would_fail})
+        check("venv-preference: without the shim the same suite BLOCKS on python3",
+              rc == 1 and "BLOCKED" in out, f"rc={rc} out={out[-300:]}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

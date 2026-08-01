@@ -47,6 +47,19 @@ export PYTHONDONTWRITEBYTECODE=1
 # site-packages caches are not ours and are expensive to rebuild.
 find . -name '__pycache__' -type d -not -path './.venv/*' -prune -exec rm -rf {} + 2>/dev/null || true
 
+# Run suites on the interpreter the code is actually DEPLOYED on, not whatever
+# bare `python3` resolves to. On this box `python3` is /usr/bin/python3 = 3.9.6
+# (macOS CLT), while the daemon + scripts run under .venv = 3.12. A module with
+# a PEP-604 `str | None` annotation (evaluated at import) is a hard TypeError on
+# 3.9, so 6 perfectly healthy suites read as real FAILURES and the gate printed
+# BLOCKED on correct code — the recurring false-BLOCK that trains reviewers to
+# ignore it (diagnosed 2026-08-01, misfiled earlier as a "missing pytest" gap;
+# same 3.9-vs-3.10+ class as the watch_video.py A-48 crash). mutate.py already
+# runs suites via sys.executable, so invoking it through $PY fixes the mutation
+# phase too. Fall back to python3 only if .venv is absent (no worse than before).
+PY=python3
+[ -x .venv/bin/python ] && PY=.venv/bin/python
+
 VERBOSE=""
 declare -a MUTATE=()
 while [ $# -gt 0 ]; do
@@ -83,7 +96,7 @@ declare -a FAILED=() SKIPPED=() LOCKSKIPPED=() PASSED=()
 for t in ./test_*.py tests/test_*.py scripts/test_*.py image_factory/test_*.py; do
     [ -e "$t" ] || continue          # glob with no match expands to itself
     name=$(basename "$t" .py)
-    out=$(python3 "$t" 2>&1); rc=$?
+    out=$("$PY" "$t" 2>&1); rc=$?
     if [ $rc -eq 0 ]; then
         printf '  \033[32m✓\033[0m %-38s\n' "$name"; pass=$((pass + 1)); PASSED+=("$t")
     elif [ $rc -eq 75 ] && grep -q "LOCK_SKIP" <<<"$out"; then
@@ -182,7 +195,7 @@ if [ ${#MUTATE[@]} -gt 0 ]; then
         echo "     and restored, so a concurrent save is silently reverted)"
         # Capture the REAL rc — `|| mrc=1` would collapse rc=2 (could not run) into
         # rc=1 (survivors) and print the wrong remedy.
-        python3 scripts/mutate.py --diff-only "$f" "${RAN[@]}"; rc2=$?
+        "$PY" scripts/mutate.py --diff-only "$f" "${RAN[@]}"; rc2=$?
         [ $rc2 -ne 0 ] && mrc=$rc2
     done
 fi
