@@ -189,6 +189,35 @@ def test_sweep_repairs_untrusted_skips_trusted():
         assert _caption_trusted(r) is True
 
 
+def test_sweep_trusted_skips_with_zero_api_calls():
+    """The quota fix (2026-08-02): a trusted receipt is skipped WITHOUT any live API
+    call. Re-verifying servable-and-proven captions hourly at 50 units/video was
+    exhausting the 10k/day Data API quota. --force and --dry-run still take the full
+    path (they must LIST), so only the unattended live sweep short-circuits."""
+    class _Boom(FakeYouTube):
+        def videos(self):
+            raise AssertionError("trusted skip must not call videos().list (1 unit)")
+        def captions(self):
+            raise AssertionError("trusted skip must not call captions().list (50 units)")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vlt = _vault(tmp, {
+            "Video_01": {"video": "Video_01", "video_id": "v1",
+                         "captions_set": True, "captions_post_processing": True},
+        })
+        s = sweep_captions(_Boom(), vlt)          # would raise if any API call fired
+        assert s["skipped"] == 1 and s["checked"] == 1, s
+        assert s["added"] == 0 and s["repaired"] == 0 and s["updated"] == 0, s
+        # --force must still reach the API (it re-verifies/repairs even trusted).
+        fy = FakeYouTube(tracks=[_track("old")])
+        sweep_captions(fy, vlt, force=True)
+        assert fy.captions().ops, "force must re-verify a trusted video, not skip it"
+        # --dry-run must still LIST a trusted video (true live-state report), not skip.
+        dz = FakeYouTube(tracks=[_track("old")])
+        sd = sweep_captions(dz, vlt, dry_run=True)
+        assert sd["skipped"] == 1 and dz.captions().ops == [], sd  # listed, no writes
+
+
 def test_sweep_defers_while_processing():
     with tempfile.TemporaryDirectory() as tmp:
         vlt = _vault(tmp, {
@@ -221,6 +250,7 @@ if __name__ == "__main__":
     test_upsert_replace_deletes_then_inserts()
     test_upsert_no_replace_updates_in_place()
     test_sweep_repairs_untrusted_skips_trusted()
+    test_sweep_trusted_skips_with_zero_api_calls()
     test_sweep_defers_while_processing()
     test_sweep_buckets_gone_video()
     print("OK")

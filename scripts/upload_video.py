@@ -750,6 +750,21 @@ def sweep_captions(youtube, vlt: Path, *, force: bool = False,
         summary["checked"] += 1
         srt = vlt / "Footage_and_Edits" / f"{label}_v2.srt"
 
+        # Fast path: a receipt that PROVES the caption was inserted post-processing
+        # (servable) never changes, so re-verifying it against the live API every run
+        # is pure quota burn. captions.list is 50 units/video (+1 for the processing
+        # check); the hourly sweep over the whole library was ~600 units/run × 24 ≈
+        # 14.7k/day and exhausted the 10k/day Data API quota on its own (the
+        # 2026-08-02 exhaustion, which 403'd niche_pull + comment-ingest). Skip a
+        # trusted video with ZERO API calls, exactly as sweep_comments trusts its
+        # stamped comment_id. --force re-verifies/repairs (its whole purpose) and
+        # --dry-run keeps LISTING tracks for a true live-state report, so both take
+        # the full path below; only the unattended live sweep short-circuits.
+        if _caption_trusted(data) and not force and not dry_run:
+            print(f"  ✓ {label} ({video_id}): captions confirmed servable (receipt) — skip (no API call)")
+            summary["skipped"] += 1
+            continue
+
         # Gate on processing FIRST: inserting/repairing a caption track before the
         # video finishes processing is exactly what creates a permanently
         # non-servable track (the V9 bug). Still cooking → defer to a later sweep.
