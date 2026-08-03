@@ -62,6 +62,23 @@ def _notify(msg: str) -> None:
             pass
 
 
+def _resolve_input(p: str) -> Path:
+    """Resolve a CLI path argument to where the file actually lives.
+
+    Absolute paths, and relative paths that exist from the current directory,
+    are returned unchanged (back-compat). A bare relative path NOT found from
+    cwd is resolved against the vault — where the daily expense routine's
+    documented `--rows rows.json` / `--review ...` relative-path commands expect
+    it. The daily job runs from the iris_studio repo, so a relative arg used to
+    raise Errno 2, and main()'s except-handler then fired a spurious failure
+    Telegram ping before the absolute-path retry succeeded (FAILURES ONLY —
+    a self-recovered run must not alert)."""
+    path = Path(p)
+    if path.is_absolute() or path.exists():
+        return path
+    return VAULT / p
+
+
 def _amount_key(val) -> str:
     """Normalize an amount to a stable dedup key ('40' and '40.00' collide)."""
     try:
@@ -789,8 +806,53 @@ def _selftest():
             commit([{"date": "2026-07-01", "vendor": "Adobe", "amount": "50",
                     "category": "SaaS"}], xlsx_path=e_xlsx, force=True, dry_run=True)
             assert _pinged == [], f"a dry-run all-dupe batch must NOT notify: {_pinged}"
+
+            # G — main()'s top-level failure-notify gate (2026-08-03): a failure must
+            # ping ONLY for the live book, mirroring commit()'s is_live policy above.
+            # Driven in-process (SystemExit-caught, DEFAULT_XLSX == e_xlsx = "live",
+            # _notify still the recorder) so BOTH directions are covered without any
+            # real Telegram call — the wrapper's subprocess can't exercise the ping
+            # branch without hitting the real notifier.
+            _orig_argv = sys.argv
+            bad = Path(d) / "bad.json"
+            bad.write_text("not valid json")           # forces json.loads to raise
+            other = Path(d) / "OtherBook.xlsx"          # != DEFAULT_XLSX → not live
+            try:
+                _pinged.clear()
+                sys.argv = ["commit_expense.py", "--rows", str(bad),
+                            "--xlsx", str(other), "--force"]
+                try:
+                    main()
+                except SystemExit:
+                    pass
+                assert _pinged == [], (
+                    f"a failure on a NON-LIVE book must not ping Telegram: {_pinged}")
+                sys.argv = ["commit_expense.py", "--rows", str(bad),
+                            "--xlsx", str(e_xlsx), "--force"]
+                try:
+                    main()
+                except SystemExit:
+                    pass
+                assert len(_pinged) == 1, (
+                    f"a failure on the LIVE book must ping exactly once: {_pinged}")
+            finally:
+                sys.argv = _orig_argv
         finally:
             _notify, DEFAULT_XLSX = _orig_notify, _orig_default_xlsx
+
+    # _resolve_input: bare relative args land in the vault (the daily-routine bug);
+    # absolute paths and cwd-existing relatives are returned unchanged.
+    import os as _os
+    assert _resolve_input("/tmp/absent.json") == Path("/tmp/absent.json"), "absolute path must be unchanged"
+    assert _resolve_input("no/such/rel.json") == VAULT / "no/such/rel.json", "bare relative must resolve to vault"
+    with _tf.TemporaryDirectory() as _d:
+        _cwd = _os.getcwd()
+        _os.chdir(_d)
+        try:
+            Path("here.json").write_text("[]")
+            assert _resolve_input("here.json") == Path("here.json"), "cwd-existing relative must be unchanged"
+        finally:
+            _os.chdir(_cwd)
 
     print("commit_expense self-check: PASS")
 
@@ -813,15 +875,23 @@ def main():
 
     if not args.rows:
         ap.error("--rows is required (JSON file or '-' for stdin)")
+    xlsx_path = _resolve_input(args.xlsx)
+    # Only ping the real Telegram channel for a failure against the LIVE book —
+    # same is_live policy commit()'s inner notify() uses. A failure on a test /
+    # dry-run / throwaway xlsx (or a mis-resolved relative arg) must NOT alert
+    # Steve (FAILURES ONLY, and only ones that matter).
+    is_live = xlsx_path.resolve() == DEFAULT_XLSX.resolve()
     try:
-        raw = sys.stdin.read() if args.rows == "-" else Path(args.rows).read_text(encoding="utf-8")
+        raw = sys.stdin.read() if args.rows == "-" else _resolve_input(args.rows).read_text(encoding="utf-8")
         rows = json.loads(raw)
         if isinstance(rows, dict):
             rows = [rows]
-        commit(rows, xlsx_path=args.xlsx, review_path=args.review,
+        review_path = _resolve_input(args.review) if args.review else None
+        commit(rows, xlsx_path=xlsx_path, review_path=review_path,
                force=args.force, dry_run=args.dry_run)
     except Exception as e:
-        _notify(f"commit_expense FAILED: {e}")
+        if is_live:
+            _notify(f"commit_expense FAILED: {e}")
         sys.exit(f"ERROR: {e}")
 
 
