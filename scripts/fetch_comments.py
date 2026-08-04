@@ -71,6 +71,30 @@ def _video_state(youtube, video_id: str) -> str:
     return _classify_state(resp.get("items", []))
 
 
+def _http_reason(e: Exception) -> str:
+    """Best-effort human reason from a googleapiclient HttpError (quotaExceeded,
+    authError, ...) or any other exception. Never raises — a status line must be
+    printable on every failure path."""
+    try:
+        details = getattr(e, "error_details", None) or []
+        if details and isinstance(details[0], dict) and details[0].get("reason"):
+            return str(details[0]["reason"])
+    except Exception:  # noqa: BLE001 — reason extraction must never mask the real fault
+        pass
+    return str(e) or e.__class__.__name__
+
+
+def _die_blocked(status_reason: str, err_msg: str) -> None:
+    """Fail the run as BLOCKED, not ok. Prints an explicit machine-readable
+    `status: blocked (<reason>)` line to stdout FIRST so any consumer grepping the
+    final `status:` token reads "could not look" — never a genuine `ok (0)` — then
+    dies non-zero for the wrapper's Telegram alert. This is the guard against the
+    2026-07-29 masked-failure class (quota 403 on every status check surfaced as
+    `status: ok (0 comments)`). See [[Pattern_liveness_is_not_success]]."""
+    print(f"status: blocked ({status_reason})")
+    die(err_msg, code=2)
+
+
 def _author_channel_id(snippet: dict) -> str:
     return snippet.get("authorChannelId", {}).get("value", "")
 
@@ -136,14 +160,10 @@ def fetch_threads(youtube, video_id: str, *, max_pages: int,
             if not page:
                 break
     except HttpError as e:
-        reason = ""
-        try:
-            reason = e.error_details[0].get("reason", "")  # type: ignore[attr-defined]
-        except Exception:
-            reason = ""
+        reason = _http_reason(e)
         if "commentsDisabled" in str(e) or reason == "commentsDisabled":
             return [], "comments disabled on this video"
-        return [], f"YouTube API error: {reason or e}"
+        return [], f"YouTube API error: {reason}"
     return threads, ""
 
 
@@ -201,14 +221,15 @@ def main() -> None:
         youtube = build_data_service(creds)
         owner_channel_id = resolve_channel(youtube).get("id", "")
     except Exception as e:  # noqa: BLE001 — surface auth failure to the wrapper
-        die(f"could not load YouTube credentials: {e}", code=2)
+        _die_blocked(f"auth: {_http_reason(e)}", f"could not load YouTube credentials: {e}")
 
     if not owner_channel_id:
         # Fail CLOSED: without the owner id the owner-comment filter is disabled,
         # and our own pinned/outgoing comment would leak in as "incoming" audience
         # signal — a fabrication-adjacent leak. Refuse rather than degrade.
-        die("resolved YouTube channel has no id — refusing to run so our own "
-            "comments cannot leak in as incoming audience signal", code=2)
+        _die_blocked("auth: resolved channel has no id",
+                     "resolved YouTube channel has no id — refusing to run so our own "
+                     "comments cannot leak in as incoming audience signal")
 
     receipts = list(iter_upload_receipts(vlt))
     if args.video:
@@ -231,8 +252,15 @@ def main() -> None:
     for label, video_id, _rp, _data in receipts:
         try:
             state = _video_state(youtube, video_id)
-        except Exception as e:  # noqa: BLE001
-            per_video.append(f"  {label}: status check failed ({e}) — skipped")
+        except Exception as e:  # noqa: BLE001 — ANY status-check fault = "could not look"
+            # A failed status check (quota 403 / auth / transport) means we could
+            # NOT determine this video's state — NOT that it has no comments. Collect
+            # it as a hard error so the run fails BLOCKED instead of masquerading as
+            # `ok (0 comments)` (the 2026-07-29 masked-failure). Keep the last good
+            # export; do not clobber it with an empty one.
+            reason = _http_reason(e)
+            hard_errors.append(f"{label}: status check failed — {reason}")
+            per_video.append(f"  {label}: STATUS CHECK FAILED — {reason} (kept last export)")
             continue
         if state == "missing":
             # The receipt's video_id is not on the channel (deleted / re-uploaded
@@ -277,8 +305,9 @@ def main() -> None:
         print("HARD API ERRORS (not comments-disabled):")
         for he in hard_errors:
             print(f"  {he}")
-        die(f"{len(hard_errors)} video(s) failed to fetch — likely token scope/quota",
-            code=2)
+        _die_blocked(
+            f"{len(hard_errors)} of {len(receipts)} video(s) failed — likely token scope/quota",
+            f"{len(hard_errors)} video(s) failed to fetch — likely token scope/quota")
     if drift:
         # Not a hard error (live videos still ingested → keep exit 0 + the
         # `status: ok` contract the comment-ingest routine matches), but a real
