@@ -1294,6 +1294,89 @@ class TestAssembleImageGate(unittest.TestCase):
             (po.run_image_review, po.subprocess.run, po.notify,
              po._image_review_verdict_rel) = saved
 
+    def test_unpark_assemble_for_force_resets_only_parked_assemble(self):
+        """--force un-parks a REVISE-parked 6_assemble → ready (so select_next can
+        pick it), clears the fail/infra counters, and touches NOTHING else. A
+        sibling parked stage is left alone; a non-parked assemble is untouched."""
+        stages = {
+            "6_assemble": {"status": "needs-steve", "park_reason": "failed",
+                           "fail_count": 3, "infra_count": 0},
+            "8_thumbnail": {"status": "needs-steve", "park_reason": "gate"},
+        }
+        changed = po._unpark_assemble_for_force(stages)
+        self.assertTrue(changed)
+        self.assertEqual(stages["6_assemble"]["status"], "ready")
+        self.assertEqual(stages["6_assemble"]["fail_count"], 0)
+        self.assertEqual(stages["6_assemble"]["infra_count"], 0)
+        self.assertIsNone(stages["6_assemble"]["park_reason"])
+        # A sibling parked stage must NOT be touched.
+        self.assertEqual(stages["8_thumbnail"]["status"], "needs-steve")
+        # A ready (non-parked) assemble is a no-op.
+        self.assertFalse(po._unpark_assemble_for_force({"6_assemble": {"status": "ready"}}))
+
+    def test_reconcile_change_on_idle_tick_is_saved(self):
+        """advance_once's save guard: when reconcile/promote mutated state but no
+        stage is selectable (idle), the change MUST still be persisted this tick —
+        else a reconcile fix is silently dropped. Pins the OR-guard fires on any
+        one truthy operand (kills the `or`->`and` and guard->False mutants)."""
+        saved = (po.reconcile_orphans, po.promote_gate_exits, po.select_next,
+                 po.first_ready_gate, po.notify)
+        try:
+            po.reconcile_orphans = lambda stages, video: ["1_script"]  # truthy → changed
+            po.promote_gate_exits = lambda stages, video: ([], False)
+            po.select_next = lambda stages: None
+            po.first_ready_gate = lambda stages: None
+            po.notify = lambda *a, **k: None
+            sf = _FakeSF({"1_script": {"status": "ready"}})
+            po.advance_once(sf, force=False)
+            self.assertGreaterEqual(sf.saved, 1, "a reconcile change on an idle tick must be saved")
+        finally:
+            (po.reconcile_orphans, po.promote_gate_exits, po.select_next,
+             po.first_ready_gate, po.notify) = saved
+
+    def test_no_change_idle_tick_does_not_save(self):
+        """The flip side: a truly-idle tick with NOTHING changed must NOT save
+        (kills the guard->True mutant that would write on every no-op sweep tick)."""
+        saved = (po.reconcile_orphans, po.promote_gate_exits, po.select_next,
+                 po.first_ready_gate, po.notify)
+        try:
+            po.reconcile_orphans = lambda stages, video: []
+            po.promote_gate_exits = lambda stages, video: ([], False)
+            po.select_next = lambda stages: None
+            po.first_ready_gate = lambda stages: None
+            po.notify = lambda *a, **k: None
+            sf = _FakeSF({"1_script": {"status": "blocked"}})
+            po.advance_once(sf, force=False)
+            self.assertEqual(sf.saved, 0, "an idle no-change tick must not write state")
+        finally:
+            (po.reconcile_orphans, po.promote_gate_exits, po.select_next,
+             po.first_ready_gate, po.notify) = saved
+
+    def test_force_unpark_is_persisted_when_assemble_stays_unselectable(self):
+        """Pins the `unparked` operand of advance_once's save guard as the SOLE
+        truthy one — the drop-a-conjunct mutation the automated pass can't generate
+        (reviewer 🟡, 2026-08-05). Force-unpark a parked assemble whose upstream is
+        NOT done: reconcile/promote change nothing and select_next returns None
+        (assemble blocked by its dep), so the un-park persists ONLY via the guard
+        term. Drop `unparked` from the guard and this goes RED (saved stays 0)."""
+        saved = (po.reconcile_orphans, po.promote_gate_exits, po.select_next,
+                 po.first_ready_gate, po.notify)
+        try:
+            po.reconcile_orphans = lambda stages, video: []
+            po.promote_gate_exits = lambda stages, video: ([], False)
+            po.select_next = lambda stages: None      # assemble blocked by unfinished dep
+            po.first_ready_gate = lambda stages: None
+            po.notify = lambda *a, **k: None
+            sf = _FakeSF({"6_assemble": {"status": "needs-steve",
+                                         "park_reason": "failed", "fail_count": 3,
+                                         "infra_count": 0, "deps": ["5_images"]}})
+            po.advance_once(sf, force=True)
+            self.assertGreaterEqual(sf.saved, 1, "force un-park must be persisted this tick")
+            self.assertEqual(sf.data["stages"]["6_assemble"]["status"], "ready")
+        finally:
+            (po.reconcile_orphans, po.promote_gate_exits, po.select_next,
+             po.first_ready_gate, po.notify) = saved
+
     def test_advance_all_never_forces_the_assemble_gate(self):
         """The hourly fleet sweep MUST stay fail-closed: autonomy can never cross a
         REVISE-parked assemble stage. Two structural invariants pin that: (1)

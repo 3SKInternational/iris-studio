@@ -2593,16 +2593,38 @@ def _on_failure(s: dict, err: str) -> None:
 AdvanceResult = namedtuple("AdvanceResult", "code outcome stage line")
 
 
+def _unpark_assemble_for_force(stages: dict) -> bool:
+    """CLI `--advance --force` ONLY: a REVISE-parked 6_assemble sits at
+    needs-steve, which select_next skips — so `--advance --force` would idle and
+    never reach the assemble gate. Reset it to ready so the force path can
+    re-select it and skip the RENDERS review. Narrow BY DESIGN: only 6_assemble
+    (the sole stage --force overrides), only when parked needs-steve. Returns True
+    if it changed anything (so the caller saves). The hourly --advance-all sweep
+    passes force=False and never calls this, so autonomy can't un-park anything."""
+    s = stages.get("6_assemble")
+    if s and s.get("status") == "needs-steve":
+        s["status"] = "ready"
+        s["fail_count"] = 0
+        s["infra_count"] = 0
+        s["park_reason"] = None
+        return True
+    return False
+
+
 def advance_once(sf: StateFile, force: bool = False) -> AdvanceResult:
     """Run the SINGLE next ready non-gate stage for one video (reconcile orphans
     + promote gate-exits first). The shared core of --advance and --advance-all;
     the gate-respecting structural invariant lives entirely in select_next, so
-    every caller of advance_once inherits no-auto-spend/publish/VO unchanged."""
+    every caller of advance_once inherits no-auto-spend/publish/VO unchanged.
+
+    force (single-video --advance only): un-park a REVISE-parked 6_assemble and
+    skip its RENDERS review gate. Never set by the --advance-all sweep."""
     stages = sf.data["stages"]
     video = sf.data["video"]
+    unparked = _unpark_assemble_for_force(stages) if force else False
     reset = reconcile_orphans(stages, video)   # may die() on a genuinely-live run
     promoted, vo_changed = promote_gate_exits(stages, video)
-    if reset or promoted or vo_changed:
+    if unparked or reset or promoted or vo_changed:
         sf.save()
 
     nxt = select_next(stages)
