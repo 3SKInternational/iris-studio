@@ -1064,7 +1064,7 @@ def _stage_prompt(key: str, video: int) -> str:
     return prompts[key]
 
 
-def run_script_stage(key: str, video: int) -> tuple[bool, str]:
+def run_script_stage(key: str, video: int, force: bool = False) -> tuple[bool, str]:
     """Local $0 factory stages. Stage 6 assemble: a SINGLE build_video.py
     --assemble call. Stage 8 thumbnail: a SINGLE card_overlay.py title-text burn.
     MUST pass --assemble; MUST NEVER pass --images/--vo."""
@@ -1102,43 +1102,62 @@ def run_script_stage(key: str, video: int) -> tuple[bool, str]:
     # _maybe_promote_vo_expand parks with a note. This site was the odd one out.
     # Now it matches: the stage is left ready and retried, bounded by MAX_INFRA,
     # and parks for Steve if the reviewer is genuinely down.
-    verdict, vrel, detail = run_image_review("renders", video,
-                                             canonical_manifest_rel(video))
-    if verdict == "UNAVAILABLE":
-        # The cause must survive TWO truncations that cut from OPPOSITE ENDS:
-        #   notify/Telegram  -> out[:160]   (advance_once, head)
-        #   state-file note  -> err[-300:]  (_on_failure, tail)
-        # So: BOUND {detail} and keep it EARLY, total <= 300. Detail-last satisfies
-        # the note and leaves the Telegram line cause-free; detail-late-and-long
-        # satisfies neither. Two earlier versions of this message got exactly one
-        # of the two ends right, which left Steve unable to tell a reviewer timeout
-        # from a quota hit from a missing agent definition — three different fixes.
-        # (_is_infra_failure scans the untruncated RETURN VALUE — strictly, its
-        # pre-STDOUT_DELIM head — never either display window. So keep the marker
-        # at index 0: moving it after {detail} could push it behind that delimiter
-        # and silently reclassify a reviewer outage as a task failure.)
-        # The stage-2 and stage-review gates were early but UNBOUNDED until
-        # 2026-07-26; their cause starts falling out of the note once the DETAIL
-        # passes ~250 chars (a real quota detail made the stage-2 message ~650).
-        # They now carry
-        # this same detail[:120] bound, so "match the siblings" is sound advice
-        # rather than a way to reinherit this bug.
-        # "assemble by hand, THEN stamp" — not just stamp. Nothing downstream
-        # verifies the master exists (GATE_ARTIFACTS covers only 4_vo_record; the
-        # packaging/thumbnail/description stages never check for the video). The only
-        # check is _producer_artifact_ok against stage_artifact_path's
-        # Footage_and_Edits/{v}_v2.mp4, and it runs on the PRODUCER path only —
-        # a hand-stamp bypasses it, advancing the pipeline with no file ever
-        # built, and the first thing to notice is the human at 10_publish.
-        # Matches _gate_note's house style: do the work, then stamp.
-        return False, (f"reviewer-unavailable: {detail[:120]} — refusing to assemble "
-                       f"unreviewed renders (parks at {MAX_INFRA} attempts; manual "
-                       f"exit = assemble by hand, then set 6_assemble status:done "
-                       f"+ completed_at)")
-    if verdict != "SHIP":
-        return False, (f"image-reviewer {verdict} on the rendered images — refusing to "
-                       f"assemble. Fix prompts per {vrel}, then re-run /pipeline "
-                       f"{video} spend-ok to regenerate (BILLED — human-gated) ({detail}).")
+    # Explicit human override — reachable ONLY via single-video `--advance
+    # --force`. The hourly `--advance-all` sweep NEVER sets force (cmd_advance_all
+    # calls advance_once(sf) with the default), so autonomy still fails CLOSED on a
+    # REVISE; only Steve, at the CLI, can override. Use when Steve has reviewed
+    # these exact (unchanged) renders and accepted them as-is — e.g. V14's
+    # `closed-by-steve-decision-2026-07-27`. We skip the re-review dispatch
+    # (re-running image-reviewer would re-bill an agent to reprint the SAME REVISE
+    # on unchanged renders) and proceed to the $0 assemble. This is the WORKING
+    # form of the exit the RENDERS verdict file documents: before this, `--force`
+    # was consumed only by cmd_spend_ok, so the file's "--force to advance to
+    # assembly" instruction was a silent no-op on this path.
+    if force:
+        vrel = _image_review_verdict_rel(video)
+        print(f"⏭️  Video {video}: --force — overriding the pre-assemble RENDERS "
+              f"image-review gate on explicit human authorization (renders accepted "
+              f"as-is; see {vrel}). Assembling.")
+    else:
+        verdict, vrel, detail = run_image_review("renders", video,
+                                                 canonical_manifest_rel(video))
+        if verdict == "UNAVAILABLE":
+            # The cause must survive TWO truncations that cut from OPPOSITE ENDS:
+            #   notify/Telegram  -> out[:160]   (advance_once, head)
+            #   state-file note  -> err[-300:]  (_on_failure, tail)
+            # So: BOUND {detail} and keep it EARLY, total <= 300. Detail-last satisfies
+            # the note and leaves the Telegram line cause-free; detail-late-and-long
+            # satisfies neither. Two earlier versions of this message got exactly one
+            # of the two ends right, which left Steve unable to tell a reviewer timeout
+            # from a quota hit from a missing agent definition — three different fixes.
+            # (_is_infra_failure scans the untruncated RETURN VALUE — strictly, its
+            # pre-STDOUT_DELIM head — never either display window. So keep the marker
+            # at index 0: moving it after {detail} could push it behind that delimiter
+            # and silently reclassify a reviewer outage as a task failure.)
+            # The stage-2 and stage-review gates were early but UNBOUNDED until
+            # 2026-07-26; their cause starts falling out of the note once the DETAIL
+            # passes ~250 chars (a real quota detail made the stage-2 message ~650).
+            # They now carry
+            # this same detail[:120] bound, so "match the siblings" is sound advice
+            # rather than a way to reinherit this bug.
+            # "assemble by hand, THEN stamp" — not just stamp. Nothing downstream
+            # verifies the master exists (GATE_ARTIFACTS covers only 4_vo_record; the
+            # packaging/thumbnail/description stages never check for the video). The only
+            # check is _producer_artifact_ok against stage_artifact_path's
+            # Footage_and_Edits/{v}_v2.mp4, and it runs on the PRODUCER path only —
+            # a hand-stamp bypasses it, advancing the pipeline with no file ever
+            # built, and the first thing to notice is the human at 10_publish.
+            # Matches _gate_note's house style: do the work, then stamp.
+            return False, (f"reviewer-unavailable: {detail[:120]} — refusing to assemble "
+                           f"unreviewed renders (parks at {MAX_INFRA} attempts; manual "
+                           f"exit = assemble by hand, then set 6_assemble status:done "
+                           f"+ completed_at)")
+        if verdict != "SHIP":
+            return False, (f"image-reviewer {verdict} on the rendered images — refusing to "
+                           f"assemble. Fix prompts per {vrel}, then re-run /pipeline "
+                           f"{video} spend-ok to regenerate (BILLED — human-gated). To ship "
+                           f"these renders AS-IS on a recorded human accept, run: "
+                           f"pipeline_orchestrator.py --video {video} --advance --force ({detail}).")
     cfg = RUN_TABLE[key]
     vid = f"Video_{nn(video)}"
     cmd = [
@@ -2574,7 +2593,7 @@ def _on_failure(s: dict, err: str) -> None:
 AdvanceResult = namedtuple("AdvanceResult", "code outcome stage line")
 
 
-def advance_once(sf: StateFile) -> AdvanceResult:
+def advance_once(sf: StateFile, force: bool = False) -> AdvanceResult:
     """Run the SINGLE next ready non-gate stage for one video (reconcile orphans
     + promote gate-exits first). The shared core of --advance and --advance-all;
     the gate-respecting structural invariant lives entirely in select_next, so
@@ -2617,7 +2636,7 @@ def advance_once(sf: StateFile) -> AdvanceResult:
     if cfg["kind"] == "agent":
         ok, out = run_agent_stage(nxt, video, stages)
     elif cfg["kind"] == "script":
-        ok, out = run_script_stage(nxt, video)
+        ok, out = run_script_stage(nxt, video, force=force)
     else:
         ok, out = False, f"stage {nxt} is billed and not advancable via --advance"
 
@@ -2673,11 +2692,15 @@ def advance_once(sf: StateFile) -> AdvanceResult:
     return AdvanceResult(2, outcome, nxt, line)
 
 
-def cmd_advance(sf: StateFile) -> int:
+def cmd_advance(sf: StateFile, force: bool = False) -> int:
     """Single-video --advance: one stage, exit. Thin wrapper over advance_once.
-    A genuinely-live run surfaces as die() (exit 1), preserving prior CLI UX."""
+    A genuinely-live run surfaces as die() (exit 1), preserving prior CLI UX.
+
+    force: Steve's explicit CLI override — only the 6_assemble RENDERS gate honors
+    it (skip the image-review gate, assemble renders accepted as-is). The hourly
+    --advance-all sweep never sets it, so autonomy can't cross the gate."""
     try:
-        return advance_once(sf).code
+        return advance_once(sf, force=force).code
     except LiveRunError as e:
         die(str(e))
 
@@ -3588,8 +3611,11 @@ def main() -> int:
     p.add_argument("--title", help="Title for --init.")
     p.add_argument("--force-init", action="store_true", help="Overwrite an existing state file on --init.")
     p.add_argument("--force", action="store_true",
-                   help="With --spend-ok: skip the pre-spend image-review gate (Steve override). "
-                        "CLI-only; the Telegram /pipeline spend-ok path never sets it.")
+                   help="Steve's explicit CLI override. With --spend-ok: skip the pre-spend "
+                        "image-review gate. With --advance: skip the pre-assemble RENDERS gate "
+                        "to ship renders accepted as-is. CLI-only; the Telegram /pipeline path "
+                        "and the hourly --advance-all sweep never set it, so autonomy stays "
+                        "fail-closed on a REVISE.")
     p.add_argument("--quiet-idle", action="store_true",
                    help="With --advance-all: suppress the Telegram digest when no stage executed "
                         "this run (for a frequent cron cadence). No effect on other commands.")
@@ -3617,7 +3643,7 @@ def main() -> int:
         if args.status:
             return cmd_status(sf)
         if args.advance:
-            return cmd_advance(sf)
+            return cmd_advance(sf, force=args.force)
         if args.spend_ok:
             return cmd_spend_ok(sf, force=args.force)
         if args.force_reset:

@@ -238,7 +238,7 @@ class TestReconcileOrphans(unittest.TestCase):
         # exactly as before the fleet refactor. advance_once is stubbed to raise.
         old = po.advance_once
         try:
-            def _raise(_sf):
+            def _raise(_sf, force=False):
                 raise po.LiveRunError("stage 1_script already running")
             po.advance_once = _raise
             with self.assertRaises(SystemExit) as cm:
@@ -1265,6 +1265,56 @@ class TestAssembleImageGate(unittest.TestCase):
         finally:
             (po.run_image_review, po.subprocess.run, po.notify) = saved
 
+    def test_force_overrides_revise_and_builds_without_reviewing(self):
+        """Steve's explicit CLI override (`--advance --force`): the assemble gate
+        skips the RENDERS review entirely and assembles renders accepted as-is
+        (e.g. V14's closed-by-steve-decision). run_image_review must NOT be called
+        (a re-dispatch would re-bill an agent to reprint the same REVISE on
+        unchanged renders), and build_video.py MUST run. A _Boom that raises on any
+        review call proves the skip is real, not a happened-to-pass SHIP."""
+        saved = (po.run_image_review, po.subprocess.run, po.notify,
+                 po._image_review_verdict_rel)
+        try:
+            called = {"build": False}
+
+            def _spy_run(*a, **k):
+                called["build"] = True
+                return _Proc(0, stdout="assembled")
+
+            def _boom(*a, **k):
+                raise AssertionError("run_image_review must NOT be called under --force")
+            po.subprocess.run = _spy_run
+            po.notify = lambda *a, **k: None
+            po.run_image_review = _boom
+            po._image_review_verdict_rel = lambda video: "rel"
+            ok, msg = po.run_script_stage("6_assemble", 3, force=True)
+            self.assertTrue(ok, f"--force must assemble accepted-as-is renders: {msg!r}")
+            self.assertTrue(called["build"], "--force must reach build_video.py")
+        finally:
+            (po.run_image_review, po.subprocess.run, po.notify,
+             po._image_review_verdict_rel) = saved
+
+    def test_advance_all_never_forces_the_assemble_gate(self):
+        """The hourly fleet sweep MUST stay fail-closed: autonomy can never cross a
+        REVISE-parked assemble stage. Two structural invariants pin that: (1)
+        advance_once defaults force=False, and (2) cmd_advance_all (the sweep core)
+        calls advance_once WITHOUT ever passing force. If either regresses — the
+        default flips or someone threads force into the sweep — the override becomes
+        auto-reachable and unreviewed renders could ship. Driving the full sweep
+        here is heavy (real StateFile/discover_videos); assert the invariants
+        directly so the guard can't be defeated by a behavioural test that happens
+        to pass."""
+        import inspect
+        self.assertIs(inspect.signature(po.advance_once).parameters["force"].default,
+                      False, "advance_once must default force=False")
+        src = inspect.getsource(po.cmd_advance_all)
+        self.assertIn("advance_once(sf)", src,
+                      "the sweep must call advance_once WITHOUT force")
+        # Precise: the advance_once CALL must not carry a force arg. (notify(...,
+        # force=True) elsewhere in the fn is an unrelated callee — don't match it.)
+        self.assertNotIn("advance_once(sf, force", src,
+                          "cmd_advance_all must never thread force into advance_once")
+
     def test_unavailable_fails_closed_and_does_not_build(self):
         """SUPERSEDED 2026-07-26 (was test_unavailable_fails_open_and_builds).
 
@@ -1287,13 +1337,21 @@ class TestAssembleImageGate(unittest.TestCase):
                 return _Proc(0, stdout="assembled")
             po.subprocess.run = _spy_run
             po.notify = lambda *a, **k: None
+            # A long detail exercises the detail[:120] truncation bound (the
+            # documented ≤300 two-opposite-end-truncation invariant): the head must
+            # cut at exactly 120 chars so the cause survives both display windows.
+            long_detail = "Q" * 200
             po.run_image_review = lambda mode, video, manifest_rel=None: (
-                "UNAVAILABLE", "rel", "reviewer down")
+                "UNAVAILABLE", "rel", long_detail)
             ok, msg = po.run_script_stage("6_assemble", 3)
             self.assertFalse(ok, "must NOT assemble unreviewed renders")
             self.assertFalse(called["build"], "build_video.py must never be reached")
             self.assertTrue(po._is_infra_failure(msg),
                             f"a reviewer outage must retry, not burn a strike: {msg!r}")
+            # Exactly 120 detail chars then the literal " — refusing" — 121 chars
+            # (an off-by-one on the bound) would push a Q between them and this fails.
+            self.assertIn("Q" * 120 + " — refusing", msg)
+            self.assertNotIn("Q" * 121, msg)
         finally:
             (po.run_image_review, po.subprocess.run, po.notify) = saved
 
