@@ -45,16 +45,8 @@ STATE_FILE = STATE_DIR / "stale_on_you_seen.tsv"
 # cycles of grace before an item's first-seen day-count is forgotten.
 SEEN_RETENTION_DAYS = 14
 
-# Decisions_Log lookup defaults (Night 4 fix — DQ-10 false-alarm root cause).
+# Decisions_Log lookup window (Night 4 fix — DQ-10 false-alarm root cause).
 DECISIONS_LOG_LOOKBACK_DAYS = 30
-DECISIONS_LOG_MIN_TOKEN_LEN = 4
-DECISIONS_LOG_MIN_HITS = 2
-DECISIONS_LOG_STOPWORDS = {
-    "that", "this", "with", "from", "have", "will", "into", "your",
-    "their", "these", "those", "should", "must", "would", "could",
-    "make", "give", "need", "want", "when", "what", "where", "while",
-    "been", "than", "then", "they", "them", "also", "such",
-}
 
 
 def _today_iso() -> str:
@@ -154,46 +146,74 @@ def load_recent_decisions(
     return out
 
 
-def _significant_tokens(text: str) -> list[str]:
-    raw = re.findall(r"[a-z0-9]+", text.lower())
-    return [
-        t for t in raw
-        if len(t) >= DECISIONS_LOG_MIN_TOKEN_LEN
-        and t not in DECISIONS_LOG_STOPWORDS
-    ]
+def exclusion_reason(
+    item: dict[str, str],
+    decisions: list[tuple[str, str, str]],
+) -> str:
+    """Return the stem of the recent decision that resolves this item, else "".
+
+    An open row is excluded ONLY when a recent decision names its DQ-id in its
+    TITLE. A resolution names the row it closes in its heading; nothing else is
+    a reliable "this was decided" signal.
+
+    Fuzzy topic-word overlap was retired on 2026-08-25: it silently dropped
+    still-open rows because an incident/analysis doc about topic X always
+    shares words with an open decision about "what to do about X" — DQ-49
+    ("OAuth token expired, fleet dark") matched the incident report that merely
+    DESCRIBED the outage the row still awaits a decision on, and DQ-44 matched
+    an unrelated ledger on the generic {auto, build, nightly}. A body mention
+    is likewise not used — an incident referencing DQ-41/DQ-49 in prose is not
+    a decision. For the "awaiting Steve" list a false drop (a hidden
+    obligation) is far worse than a false keep (a decided row shows until the
+    gardener stamps it ✅, at which point the glyph check drops it).
+    """
+    if False:  # mutequiv: fast-path only — the loop below returns "" on an empty list identically
+        return ""
+    item_id = (item.get("id") or "").lower().strip()
+    if not item_id:
+        # Load-bearing: `"" in title` is always True, so without this guard an
+        # id-less row (an INBOX item) is excluded the moment any decision exists.
+        return ""
+    id_re = re.compile(r"(?<![\w-])" + re.escape(item_id) + r"(?![\w-])")
+    for stem, title, _body in decisions:
+        # Word-boundary match, not substring: `"dq-4" in "dq-44 shipped"` is
+        # True, so a plain `in` test would suppress an open DQ-4 by an unrelated
+        # DQ-44 decision — re-opening the silent-drop this fix exists to close.
+        if id_re.search(title):
+            return stem
+    return ""
 
 
 def resolved_by_recent_decision(
     item: dict[str, str],
     decisions: list[tuple[str, str, str]],
 ) -> bool:
-    """True iff the item's text or DQ id strongly overlaps a recent decision.
+    """True iff a recent decision resolves this item. See exclusion_reason."""
+    return bool(exclusion_reason(item, decisions))
 
-    Heuristic:
-      (a) If the item carries a DQ-N id and that exact id appears anywhere in
-          any recent decision body → resolved.
-      (b) Otherwise, extract significant tokens (len >= 4, non-stopword) from
-          the item text. If at least MIN_HITS distinct tokens appear in any
-          decision title → resolved.
 
-    Body matches are intentionally NOT used for token overlap — decision
-    bodies tend to mention many topics by reference, which would
-    over-match. Title overlap is the precise signal.
+def _split_row_cells(line: str) -> list[str]:
+    """Split a Decision_Queue table row into cells on UNESCAPED pipes only.
+
+    A `\\|` inside a wikilink alias is table *content*, not a column separator.
+    Splitting on it (the old `.split("|")`) shifted every later cell on the
+    rows carrying escaped pipes (DQ-14/42/43/45/47) and mis-read the status
+    column — the H1 bug from the 2026-08-19 pickup, which surfaced closed/HOLD
+    rows as if awaiting Steve. Cell content is normalised back to a plain `|`.
     """
-    if not decisions:
-        return False
-    item_id = (item.get("id") or "").lower().strip()
-    item_text = (item.get("text") or "").lower()
-    tokens = _significant_tokens(item_text)
-    for _stem, title, body in decisions:
-        if item_id and item_id in body:
-            return True
-        if len(tokens) < DECISIONS_LOG_MIN_HITS:
-            continue
-        hits = {t for t in tokens if t in title}
-        if len(hits) >= DECISIONS_LOG_MIN_HITS:
-            return True
-    return False
+    body = line.strip().strip("|")
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", body)]
+
+
+def _is_open_dq_status(status: str) -> bool:
+    """A row is awaiting Steve iff its status cell leads with the ⏳ open glyph.
+
+    Keying on the leading glyph — not a substring search over the whole prose
+    cell — is what stops an OPEN row whose status *prose* happens to mention
+    'app-CLOSED' (DQ-19) or 'Deferred half' (DQ-29) from being dropped, and
+    naturally excludes ✅ closed / 💤 armed / ⏸ HOLD without listing each.
+    """
+    return status.lstrip("* ").startswith("⏳")
 
 
 def parse_decision_queue() -> list[dict[str, str]]:
@@ -204,16 +224,12 @@ def parse_decision_queue() -> list[dict[str, str]]:
     for line in DECISION_QUEUE.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.startswith("| DQ-"):
             continue
-        # split on `|`, strip surrounding whitespace
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        cells = _split_row_cells(line)
         if len(cells) < 7:
             continue
         dq_id, decision, klass, default, deadline, days, status = cells[:7]
-        # Skip closed/deferred — only surface what's actively pending.
-        status_low = status.lower()
-        if "closed" in status_low or "✅" in status:
-            continue
-        if "deferred" in status_low or "💤" in status:
+        # Surface only rows the author has marked ⏳ open.
+        if not _is_open_dq_status(status):
             continue
         # Trim decision text for the table — keep first sentence-ish.
         short_decision = re.split(r"[—–]| - ", decision, maxsplit=1)[0].strip()
@@ -230,6 +246,31 @@ def parse_decision_queue() -> list[dict[str, str]]:
             }
         )
     return rows
+
+
+def open_rows_skipped_by_parse() -> list[str]:
+    """DQ ids that look open in the source but parse_decision_queue could not
+    read (fewer than 7 cells even after an escape-aware split).
+
+    This is the silent-drop tripwire the C2 defect asked for: an open row that
+    is neither rendered nor excluded-with-a-reason is a bug, so make it loud.
+    """
+    if not DECISION_QUEUE.exists():
+        return []
+    parsed = {r["id"] for r in parse_decision_queue()}
+    skipped = []
+    for line in DECISION_QUEUE.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("| DQ-"):  # mutequiv: redundant with the `if not m` regex reject two lines down
+            continue
+        m = re.match(r"\| (DQ-\d+)", line)
+        if not m:
+            continue
+        dq_id = m.group(1)
+        cells = _split_row_cells(line)
+        looks_open = any("⏳" in c for c in cells)
+        if looks_open and len(cells) < 7 and dq_id not in parsed:
+            skipped.append(dq_id)
+    return skipped
 
 
 def parse_inbox_steve_items() -> list[dict[str, str]]:
@@ -480,6 +521,14 @@ def _selftest() -> int:
     finally:
         os.unlink(INBOX)
         INBOX = orig
+
+    # The Decision_Queue parse (escaped pipes, glyph open-detection),
+    # exclusion_reason, and the open-row tripwire are covered by the gate-run
+    # suite tests/test_stale_on_you.py — precheck globs tests/test_*.py and never
+    # runs --selftest, so duplicating that coverage here would be gate-invisible
+    # (every assert survived mutation, 2026-08-26). Kept the INBOX-parse checks
+    # above because no test file covers them yet.
+
     print("stale_on_you selftest: PASS")
     return 0
 
@@ -504,20 +553,48 @@ def main() -> int:
     _save_seen(seen, today)
 
     # Night 4 fix — exclude items that already have a recent decision logged
-    # (the DQ-10 false-alarm class). Title-token overlap + DQ-id body grep,
+    # (the DQ-10 false-alarm class). Title-token overlap + DQ-id title match,
     # window = last 30 days.
     decisions = load_recent_decisions()
-    pre_count = len(dq_rows) + len(inbox_rows)
-    dq_rows = [r for r in dq_rows if not resolved_by_recent_decision(r, decisions)]
+
+    # Reconciliation — the C2 list must never silently drop an open row (the
+    # 2026-08-19 defect). Account for every open DQ row: it is either rendered
+    # or excluded WITH a named reason. Anything else is a bug, printed loudly.
+    n_open_dq = len(dq_rows)
+    excluded_dq: list[str] = []
+    kept_dq = []
+    for r in dq_rows:
+        reason = exclusion_reason(r, decisions)
+        if reason:
+            excluded_dq.append(f"{r['id']}→{reason}")
+        else:
+            kept_dq.append(r)
+    dq_rows = kept_dq
     inbox_rows = [r for r in inbox_rows if not resolved_by_recent_decision(r, decisions)]
-    dropped = pre_count - len(dq_rows) - len(inbox_rows)
-    if dropped:
-        sys.stderr.write(
-            f"stale_on_you: excluded {dropped} item(s) with recent decisions "
-            f"in {DECISIONS_LOG.name}/ ({DECISIONS_LOG_LOOKBACK_DAYS}-day window)\n"
+
+    sys.stderr.write(
+        f"stale_on_you reconcile: {n_open_dq} open DQ rows · {len(dq_rows)} rendered · "
+        f"{len(excluded_dq)} excluded (recent decision)"
+        + (f" [{'; '.join(excluded_dq)}]" if excluded_dq else "")
+        + "\n"
+    )
+
+    # Silent-drop tripwire: an open row parse could not read at all.
+    skipped = open_rows_skipped_by_parse()
+    warning = ""
+    if skipped:
+        msg = (
+            "stale_on_you BUG: open Decision_Queue row(s) neither rendered nor "
+            f"excluded — malformed table row: {', '.join(skipped)}\n"
+        )
+        sys.stderr.write(msg)
+        warning = (
+            "> ⚠️ **stale_on_you could not read open row(s): "
+            + ", ".join(skipped)
+            + "** — the list below may be incomplete; check `Decision_Queue.md` formatting.\n\n"
         )
 
-    section = render_section(dq_rows + inbox_rows, today)
+    section = warning + render_section(dq_rows + inbox_rows, today)
 
     if write_mode:
         status = write_inbox(section)
