@@ -17,6 +17,13 @@ Then LOOP the books below. **Each book is independent: a failure or HOLD on one 
 FOR EACH maintained book (BOOK = its absolute path, with SOURCE_MODEL and REDACT_GATED):
 ────────────────────────────────────────────────────────
 
+PASS 0a — READ GUARD (bounded EDEADLK retry, before reading THIS book's changelog or content):
+  - This book lives under ~/Documents, a path the Cowork sandbox VM shares into a guest. While that VM holds the file open, host-side reads intermittently fail with EDEADLK ("Resource deadlock avoided") at byte 0 — a TRANSIENT flap that clears in minutes (A-77, 2026-08-25). Run the deterministic read guard FIRST so a flap doesn't instantly break the book:
+      python3 /Volumes/AI_Workspace/iris_studio/scripts/book_read_guard.py "$BOOK"
+    • Exit 0 → the book reads clean; proceed to Pass 0.
+    • Exit 2 → the deadlock PERSISTED after the guard's retries. Do NOT read/back up/write this book (a torn read of a sellable artifact is worse than a one-night skip the nightly cadence recovers). Tally it `broke` with reason "EDEADLK persisted (VM-share lock)", surface it in the bridge + aggregate daily-note line, and move to the next book.
+    • Exit 3 (missing) or 4 (other read error) → tally `broke` with the guard's message and move on.
+
 PASS 0 — CHEAP NO-OP GUARD (before spending any writing effort on this book):
   - Determine FIRST_TOUCH and LAST_BOOK_DATE for THIS book:
       • If the book HAS a "## Changelog" section, this is NOT a first touch. LAST_BOOK_DATE = the date (YYYY-MM-DD) of the TOP changelog entry. The canonical entry format is `- **vX.Y (YYYY-MM-DD — summary):**`, so the date is the YYYY-MM-DD inside the first entry's parentheses. (Use the Changelog, NOT the title-block "Draft vX.Y — date" line — the two can diverge mid-bump; the Changelog is the canonical anchor.)
