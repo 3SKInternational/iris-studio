@@ -3649,7 +3649,9 @@ DAILY_BRIEFING_REGEN_TIMEOUT_SECONDS = 180.0
 # Telegram brief), split on this sentinel — halving cost/latency vs. the old
 # two-call design (regen file, then a second call to reword it). Composed from
 # the two canonical prompts so neither format drifts.
-BRIEFING_SENTINEL = "===TELEGRAM_BRIEF==="
+# Sourced from the head-guard so the prompt's sentinel and the parser's boundary
+# can never drift apart (they are the same string by construction).
+BRIEFING_SENTINEL = _briefing_headguard.BRIEFING_SENTINEL
 MORNING_BRIEFING_COMBINED_PROMPT = (
     "Produce TWO outputs in a SINGLE response. Do the Gmail + Calendar checks "
     "described below ONCE, up front, and let the findings inform both parts.\n\n"
@@ -3829,8 +3831,9 @@ async def _generate_daily_briefing_combined() -> tuple[str, str]:
         history=[],
         timeout=DAILY_BRIEFING_REGEN_TIMEOUT_SECONDS,
     )
-    if BRIEFING_SENTINEL in out:
-        file_md, brief = (s.strip() for s in out.split(BRIEFING_SENTINEL, 1))
+    split = _briefing_headguard.split_combined(out)
+    if split is not None:
+        file_md, brief = split
         if not brief:
             # Trailing/empty PART 2 (model treated the sentinel as a terminator).
             # Degrade to a head of the file so Steve still gets something; if the
@@ -3839,12 +3842,21 @@ async def _generate_daily_briefing_combined() -> tuple[str, str]:
             logger.warning("Combined briefing PART 2 empty; using file head as brief.")
             brief = file_md[:1800] or "Morning briefing produced no usable text — check daemon logs."
         return file_md, brief
-    logger.warning(
-        "Combined briefing missing sentinel; treating whole output as the file "
-        "and deriving the brief from its head."
+    # No boundary of ANY shape. The brief is unrecoverable — we cannot tell where
+    # it starts, and the old `out[:1800]` fallback silently shipped the FILE half
+    # instead (the 6-week "never populated" bug). Say so loudly rather than send
+    # a convincing-looking wrong artifact; `out` still goes to the file path,
+    # where the head-guard decides whether it is safe to persist.
+    logger.error(
+        "Combined briefing has no PART 2 boundary (neither the sentinel nor a "
+        "'# PART 2' heading); no brief could be extracted from %d chars.",
+        len(out),
     )
-    out = out.strip()
-    return out, out[:1800]
+    return out.strip(), (
+        "⚠️ Morning briefing could not be extracted — the generation emitted no "
+        "PART 2 boundary. Check the daemon logs; yesterday's DAILY_BRIEFING.md "
+        "is preserved."
+    )
 
 
 # ============================================================

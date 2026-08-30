@@ -23,6 +23,49 @@ import sys
 
 BRIEFING_HEADER = "# Daily Briefing"
 
+# The combined morning call asks for PART 1 + a bare sentinel line + PART 2.
+# Haiku routinely mirrors the prompt's own "PART 1 / PART 2" scaffolding as
+# markdown headers and emits NO bare sentinel — measured on 7/20, 7/21, 7/22,
+# 7/29, 8/09, 8/10 and reproduced on demand 8/10. The old split then fell back to
+# `out[:1800]`, which is the HEAD of the response — i.e. the FILE half, cut
+# mid-sentence — so the Telegram brief (PART 2, living at the tail) was never
+# sent at all. That is the "briefing never populated" report. Accept either
+# boundary shape so the brief survives whichever label the model picks.
+BRIEFING_SENTINEL = "===TELEGRAM_BRIEF==="
+# The exact sentinel, alone on its own line — the canonical, unambiguous boundary.
+_SENTINEL_RE = re.compile(
+    r"^[ \t]*" + re.escape(BRIEFING_SENTINEL) + r"[ \t]*$",
+    re.MULTILINE,
+)
+# The loose fallback: a '# PART 2 ...' heading the model substitutes for the
+# sentinel. Matched ONLY when no real sentinel is present, because a legitimate
+# '## Part 2: ...' heading inside the PART 1 file body would otherwise win over
+# the true boundary and put the sentinel into the brief text (review 2026-08-30).
+_PART2_HEADING_RE = re.compile(
+    r"^[ \t]*#{1,6}[ \t]*PART[ \t]*2\b.*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def split_combined(out: str) -> tuple[str, str] | None:
+    """Split the combined morning output into (file_md, brief).
+
+    Splits on the canonical sentinel line when present; otherwise falls back to
+    the first '# PART 2 ...' heading the model substitutes for it. Preferring the
+    sentinel keeps a '## Part 2' heading in the file body from stealing the split.
+    Returns None when neither boundary exists, so the caller can degrade
+    deliberately instead of silently shipping the wrong half.
+
+    Either half may come back empty (a model that emits the boundary and then
+    stops); the caller decides what an empty half means.
+    """
+    if not out:
+        return None
+    m = _SENTINEL_RE.search(out) or _PART2_HEADING_RE.search(out)
+    if not m:
+        return None
+    return out[: m.start()].strip(), out[m.end() :].strip()
+
 
 def strip_briefing_preamble(content: str) -> str | None:
     """Return `content` sliced to start at the first '# Daily Briefing' header,
