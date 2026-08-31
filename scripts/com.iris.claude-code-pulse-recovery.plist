@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>JOB_QUIET_OK</key>
+		<string>1</string>
+	</dict>
+	<key>Label</key>
+	<string>com.iris.claude-code-pulse-recovery</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_job.sh</string>
+		<string>pulse-recovery</string>
+		<string>/Volumes/AI_Workspace/iris_studio/.venv/bin/python3</string>
+		<string>/Volumes/AI_Workspace/iris_studio/scripts/pulse_recovery.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-pulse-recovery.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/steve/iris_studio/logs/claude-code-pulse-recovery.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>5</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Volumes/AI_Workspace/iris_studio</string>
+</dict>
+</plist>
