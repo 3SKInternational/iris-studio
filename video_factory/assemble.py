@@ -929,6 +929,19 @@ def main() -> None:
         die(f"manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text())
 
+    # Optional alternate output geometry (e.g. 9:16 Shorts). Absent -> the locked
+    # 1920x1080 template is untouched, so every existing longform manifest renders
+    # byte-identical. The canvas stays 4x the output (the Ken Burns sweet spot).
+    _size = manifest.get("output_size")
+    if _size is not None:
+        if not (isinstance(_size, (list, tuple)) and len(_size) == 2):
+            die(f"output_size must be [width, height]; got {_size!r}")
+        global OUT_W, OUT_H, CANVAS_W, CANVAS_H
+        OUT_W, OUT_H = int(_size[0]), int(_size[1])
+        if OUT_W <= 0 or OUT_H <= 0:
+            die(f"output_size dims must be positive; got {_size!r}")
+        CANVAS_W, CANVAS_H = OUT_W * 4, OUT_H * 4
+
     asset_dir = Path(os.path.expanduser(manifest.get("asset_dir", "."))).resolve()
     if not asset_dir.is_dir():
         die(f"asset_dir is not a directory: {asset_dir}")
