@@ -17,7 +17,12 @@
 #   2. VAULT (internal-disk proxy) — can a scheduled job READ the vault at all? This
 #            reads a vault file (on the internal Data volume) from this launchd
 #            job's own context. It catches Full Disk Access being broadly revoked
-#            for scheduled jobs as it affects INTERNAL-disk reads. (Scope: macOS TCC
+#            for scheduled jobs as it affects INTERNAL-disk reads, AND the iCloud /
+#            File-Provider dataless-eviction deadlock (the vault sits under
+#            ~/Documents, which iCloud offloads to dataless stubs under disk
+#            pressure; on-read materialization then deadlocks for headless jobs,
+#            EDEADLK — the whole vault was unreadable this way on 2026-09-05).
+#            (Scope: macOS TCC
 #            is per-responsible-process; a revocation hitting ONLY claude's exact
 #            binary while this bash context still reads the internal vault would not
 #            be caught here. Best-effort proxy.)
@@ -87,7 +92,7 @@ CLAUDE="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 VAULT="/Users/steve/Documents/3SK/outputs"
 VAULT_PROBE="${VAULT_PROBE:-$VAULT/CLAUDE.md}"          # internal-disk read proves vault access
 MOUNT_PROBE="${MOUNT_PROBE:-/Volumes/AI_Workspace/iris_studio/requirements.txt}"  # external-mount read proves AI_Workspace access
-LOG="/Users/steve/iris_studio/logs/claude-code-auth-canary.log"
+LOG="${LOG_FILE:-/Users/steve/iris_studio/logs/claude-code-auth-canary.log}"
 STATE_FILE="${STATE_FILE:-/Users/steve/iris_studio/state/auth_canary.state}"
 LOCK_DIR="$(dirname "$STATE_FILE")/auth_canary.lock"
 
@@ -207,12 +212,19 @@ elif printf '%s' "$AUTH_OUT" | grep -q 'CANARY_OK'; then
 fi
 
 # --- Probe 2: VAULT readability (internal Data volume) ----------------------
-# Read one byte of a known vault file. A denial ("Operation not permitted"/EPERM/
-# "Permission denied") → "bad". A merely-absent probe file → "inconclusive".
+# CONFIRM A SUCCESSFUL READ of one byte of a known vault file, rather than
+# enumerating known-bad error strings. A healthy read of a present file emits
+# NOTHING on stderr; every failure mode emits something — EPERM ("Operation not
+# permitted"/"Permission denied") from an FDA revocation, AND the iCloud /
+# File-Provider dataless-eviction deadlock, which surfaces as "head: Error reading
+# <file>" or "Resource deadlock avoided" (EDEADLK). The old EPERM-only grep was
+# blind to that second class, so on 2026-09-05 the whole vault was dataless +
+# unreadable while this probe still reported vault=ok (a false green for hours).
+# Any non-empty stderr → "bad". A merely-absent probe file → "inconclusive".
 vault_state="ok"
 if [ -e "$VAULT_PROBE" ]; then
     VAULT_OUT="$(head -c1 "$VAULT_PROBE" 2>&1 >/dev/null)"
-    if printf '%s' "$VAULT_OUT" | grep -qiE 'Operation not permitted|EPERM|Permission denied'; then
+    if [ -n "$VAULT_OUT" ]; then
         vault_state="bad"
     fi
 else
@@ -221,13 +233,15 @@ fi
 
 # --- Probe 3: AI_WORKSPACE MOUNT readability (external volume) ---------------
 # READ a byte of a real file on the mount (not just stat the dir) — the 2026-06-23
-# FDA-revocation signature is `ls`/`stat` OK but file OPEN → EPERM. Denial → "bad".
-# A truly-absent probe file (genuine unmount, distinct condition) → "inconclusive",
-# not a manufactured failure.
+# FDA-revocation signature is `ls`/`stat` OK but file OPEN → EPERM. Same rule as the
+# vault probe: confirm a successful read (a healthy read emits nothing on stderr);
+# any non-empty stderr → "bad", so this catches EPERM AND any other open failure,
+# not just the specific EPERM strings. A truly-absent probe file (genuine unmount,
+# distinct condition) → "inconclusive", not a manufactured failure.
 mount_state="ok"
 if [ -e "$MOUNT_PROBE" ]; then
     MOUNT_OUT="$(head -c1 "$MOUNT_PROBE" 2>&1 >/dev/null)"
-    if printf '%s' "$MOUNT_OUT" | grep -qiE 'Operation not permitted|EPERM|Permission denied'; then
+    if [ -n "$MOUNT_OUT" ]; then
         mount_state="bad"
     fi
 else
@@ -267,7 +281,7 @@ if [ -n "$effective_bad" ]; then
     # token), so following the alert looked like it silently did nothing.
     # Verified against `claude auth --help` on 2.1.176.
     _has "$effective_bad" "auth"  && body="${body}• AUTH: run \`claude auth login\` in a Terminal on the Mini. NOT \`claude login\` — that is not a command, it gets parsed as a prompt and appears to do nothing. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
-    _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't read the vault (EPERM). Re-grant Full Disk Access to the background job's binary (System Settings ▸ Privacy & Security)."$'\n'
+    _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't READ the vault. Two known causes: (a) Full Disk Access revoked for the background job's binary → re-grant in System Settings ▸ Privacy & Security; (b) iCloud evicted the vault to dataless stubs and on-read materialization deadlocks (\"Error reading\" / EDEADLK) → System Settings ▸ [Apple ID] ▸ iCloud, turn OFF \"Optimize Mac Storage\" (or move the vault off iCloud Desktop & Documents), then re-materialize with \`brctl download\`. See DQ-51."$'\n'
     _has "$effective_bad" "mount" && body="${body}• AI_WORKSPACE MOUNT: scheduled jobs can't READ /Volumes/AI_Workspace (EPERM) — the iris_studio repo + every job script live there, so the WHOLE fleet is down. Fix (~2 min): System Settings ▸ Privacy & Security ▸ Full Disk Access ▸ remove + re-add /opt/homebrew/bin/claude. A \`brew upgrade claude-code\` revokes it. Durable fix: relocate iris_studio to the internal disk (DQ-17)."$'\n'
 
     # Escalation = a dimension is broken now that was NOT in the prior outage.
