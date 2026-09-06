@@ -15,3 +15,9 @@ arrow
 .Trashes/**
 node_modules/**
 graphify-out/**
+# Local sync-incident recovery duplicates (07_Archive/sync_dupes_*) — dupes of
+# vault content already backed up; not worth mirroring to Drive. They are cold and
+# get iCloud-evicted to dataless stubs (DQ-52), which deadlocks rclone's hash pass
+# and aborts the WHOLE backup. Excluding them keeps the nightly backup running
+# through the eviction. Steve can delete these local folders anytime (they are dupes).
+07_Archive/sync_dupes_*/**
