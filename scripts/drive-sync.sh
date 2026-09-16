@@ -84,6 +84,21 @@ If intentional: re-run with DRIVE_SYNC_ALLOW_DELETES=1. Else investigate the loc
     fi
 fi
 
+# Pre-materialize the changed delta (DQ-52). iCloud "Optimize Mac Storage"
+# evicts vault file contents to dataless stubs; the dry-run above only compares
+# size+modtime so it passes, but the real sync READS each changed file and
+# deadlocks (EDEADLK) on an evicted one, wedging the whole backup. This rehydrates
+# just the would-copy files that are currently unreadable, bounded by free disk.
+# Best-effort: it never blocks the sync (always exit 0); anything it can't fix the
+# real sync hits and alerts on, exactly as before. Skipped in the ALLOW_DELETES
+# bypass path (no dry-run log produced there). Real fix is Steve's toggle (DQ-52).
+if [ "${DRYRUN_OUT:-}" != "" ] && [ -f "${DRYRUN_OUT:-}" ]; then
+    PYBIN="/Volumes/AI_Workspace/iris_studio/.venv/bin/python3"
+    [ -x "$PYBIN" ] || PYBIN="python3"
+    "$PYBIN" /Volumes/AI_Workspace/iris_studio/scripts/materialize_delta.py \
+        "$DRYRUN_OUT" "$VAULT" || true
+fi
+
 # Real sync. --max-delete is a hard backstop in case the live delta is larger
 # than the dry-run predicted (e.g. churn between the two passes). Wrap it so a
 # backstop trip (or any rclone failure) ALWAYS alerts Telegram rather than dying
