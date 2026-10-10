@@ -5059,7 +5059,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if any(s in exc_str for s in oauth_signals):
             err_msg = (
                 f"Iris auth/OAuth failure: {exc}\n\n"
-                "On the Mac Mini Terminal, run: claude login\n"
+                "On the Mac Mini Terminal, run: claude auth login\n"
                 "Then text me again to verify."
             )
         elif any(s in exc_str for s in sqlite_signals):
@@ -5214,7 +5214,7 @@ def main() -> None:
         f"photos + documents → {INBOX_MEDIA_DIR.relative_to(WORKSPACE_DIR)}/ + Quick Capture."
     )
     logger.info(
-        "OAuth-aware error reply: ENABLED. Auth failures surface a 'run claude login' hint to Steve via Telegram."
+        "OAuth-aware error reply: ENABLED. Auth failures surface a 'run claude auth login' hint to Steve via Telegram."
     )
     logger.info(
         f"Daily Tier 4 spend cap: ${DAILY_TIER4_CAP_USD:.2f}/day. "

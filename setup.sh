@@ -84,7 +84,7 @@ agents=$(find ~/.claude/agents -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr
 skills=$(find ~/.claude/skills -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ' || true)
 if [[ "$agents" -gt 0 ]]; then ok "$agents agents linked"; else warn "no agents in ~/.claude/agents — the fleet is empty"; fi
 if [[ "$skills" -gt 0 ]]; then ok "$skills skills linked"; else warn "no skills in ~/.claude/skills"; fi
-command -v claude >/dev/null 2>&1 && ok "claude CLI on PATH" || warn "claude CLI not found — install it + run 'claude login'"
+command -v claude >/dev/null 2>&1 && ok "claude CLI on PATH" || warn "claude CLI not found — install it + run 'claude auth login'"
 
 # ── 6. vault mount ──────────────────────────────────────────────────────────────
 step "vault"
