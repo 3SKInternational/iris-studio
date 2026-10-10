@@ -133,5 +133,14 @@ class TestCanaryInlineCopy(unittest.TestCase):
         self.assertIn(logic, open(CANARY).read())
 
 
+class TestStoreScriptExtraction(unittest.TestCase):
+    """store_claude_token.sh must rejoin a wrapped token and refuse partial ones
+    (the 10/09 paste stored one wrapped line). Runs its --selftest under the gate."""
+    def test_selftest(self):
+        out = subprocess.run(["/bin/bash", os.path.join(REPO, "scripts", "store_claude_token.sh"),
+                              "--selftest"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
