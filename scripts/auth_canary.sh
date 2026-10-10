@@ -89,6 +89,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Primary channel when healthy; the Keychain fallback covers it being unreachable.
 NOTIFY="${NOTIFY_BIN:-/Volumes/AI_Workspace/iris_studio/scripts/notify.sh}"
 CLAUDE="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
+# Probe the SAME credential the jobs use: the long-lived setup-token from
+# Keychain when installed (DQ-49). VERBATIM copy of scripts/claude_token.sh's
+# logic, inlined because this canary must not depend on the AI_Workspace
+# mount. tests/test_claude_token.py asserts the two stay identical.
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    IRIS_CLAUDE_AUTH_SOURCE="env"
+else
+    IRIS_CLAUDE_AUTH_SOURCE="login"
+    _iris_tok="$(security find-generic-password -a iris-claude -s iris_claude_oauth_token -w 2>/dev/null)" || _iris_tok=""
+    if [ -n "$_iris_tok" ]; then
+        export CLAUDE_CODE_OAUTH_TOKEN="$_iris_tok"
+        IRIS_CLAUDE_AUTH_SOURCE="keychain"
+    fi
+    unset _iris_tok
+fi
+if [ "$IRIS_CLAUDE_AUTH_SOURCE" = "login" ]; then
+    IRIS_CLAUDE_REAUTH="run \`claude auth login\` in a Terminal on the Mini (NOT \`claude login\`, which the CLI reads as a prompt)"
+else
+    IRIS_CLAUDE_REAUTH="the long-lived setup-token (Keychain iris_claude_oauth_token) was rejected; \`claude auth login\` will NOT fix it. On the Mini run \`claude setup-token\`, then \`security add-generic-password -U -a iris-claude -s iris_claude_oauth_token -w\` (paste the token), then \`launchctl kickstart -k gui/\$(id -u)/com.iris.studio\`"
+fi
+export IRIS_CLAUDE_AUTH_SOURCE IRIS_CLAUDE_REAUTH
 VAULT="/Users/steve/Documents/3SK/outputs"
 VAULT_PROBE="${VAULT_PROBE:-$VAULT/CLAUDE.md}"          # internal-disk read proves vault access
 MOUNT_PROBE="${MOUNT_PROBE:-/Volumes/AI_Workspace/iris_studio/requirements.txt}"  # external-mount read proves AI_Workspace access
@@ -280,7 +301,7 @@ if [ -n "$effective_bad" ]; then
     # PROMPT (it answers the word "login" as a question, then 401s on the dead
     # token), so following the alert looked like it silently did nothing.
     # Verified against `claude auth --help` on 2.1.176.
-    _has "$effective_bad" "auth"  && body="${body}• AUTH: run \`claude auth login\` in a Terminal on the Mini. NOT \`claude login\` — that is not a command, it gets parsed as a prompt and appears to do nothing. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
+    _has "$effective_bad" "auth"  && body="${body}• AUTH (credential: ${IRIS_CLAUDE_AUTH_SOURCE}): ${IRIS_CLAUDE_REAUTH}. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
     _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't READ the vault. Two known causes: (a) Full Disk Access revoked for the background job's binary → re-grant in System Settings ▸ Privacy & Security; (b) iCloud evicted the vault to dataless stubs and on-read materialization deadlocks (\"Error reading\" / EDEADLK) → System Settings ▸ [Apple ID] ▸ iCloud, turn OFF \"Optimize Mac Storage\" (or move the vault off iCloud Desktop & Documents), then re-materialize with \`brctl download\`. See DQ-52."$'\n'
     _has "$effective_bad" "mount" && body="${body}• AI_WORKSPACE MOUNT: scheduled jobs can't READ /Volumes/AI_Workspace (EPERM) — the iris_studio repo + every job script live there, so the WHOLE fleet is down. Fix (~2 min): System Settings ▸ Privacy & Security ▸ Full Disk Access ▸ remove + re-add /opt/homebrew/bin/claude. A \`brew upgrade claude-code\` revokes it. Durable fix: relocate iris_studio to the internal disk (DQ-17)."$'\n'
 

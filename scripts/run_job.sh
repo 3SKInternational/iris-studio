@@ -59,6 +59,9 @@ LOG="/Users/steve/iris_studio/logs/job-${JOB}.log"
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/retry_queue.sh"
 
+# Long-lived setup-token from Keychain when installed (DQ-49); no-op otherwise.
+. "$SCRIPT_DIR/claude_token.sh"
+
 alert() {
     # Best-effort — never let a notify failure mask the job's own exit code.
     "$NOTIFY" "$1" || true

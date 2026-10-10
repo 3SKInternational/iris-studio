@@ -33,6 +33,9 @@ ORIG_ARGV=("$0" "$@")
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/retry_queue.sh"
 
+# Long-lived setup-token from Keychain when installed (DQ-49); no-op otherwise.
+. "$SCRIPT_DIR/claude_token.sh"
+
 alert() {
     # Best-effort — never let a notify failure mask the job's own exit code.
     "$NOTIFY" "$1" || true
@@ -321,13 +324,13 @@ Reason: ${REASON:-(none given)}"
             # the original fire; retries stay throttled.
             if [ "${IRIS_RETRY:-0}" != "1" ]; then
                 alert "🔴 launchd job '${JOB}' FAILED — Claude CLI auth/credits rejected.
-FIX: run \`claude auth login\` in a Terminal on the Mini (NOT \`claude login\`, which the CLI reads as a prompt). (A 401 = stale OAuth token; re-auth clears it. If re-auth doesn't help, you may be genuinely out of Max credits — wait for the window reset.) Cleared within 24h: the auto-retry runs this job within 30 min. Later than that: retries are paused and the job resumes on its normal schedule.
+FIX (credential: ${IRIS_CLAUDE_AUTH_SOURCE:-login}): ${IRIS_CLAUDE_REAUTH:-run \`claude auth login\` in a Terminal on the Mini}. (A 401 = stale OAuth token; re-auth clears it. If re-auth doesn't help, you may be genuinely out of Max credits — wait for the window reset.) Cleared within 24h: the auto-retry runs this job within 30 min. Later than that: retries are paused and the job resumes on its normal schedule.
 This blocks EVERY overnight claude job until cleared.
 Time: ${TS}
 Detail: ${DETAIL}"
             fi
             rq_record_failure "$JOB" "claude" "Claude CLI auth/credits rejected" -- "${ORIG_ARGV[@]}"
-            echo "run_claude_job: '${JOB}' AUTH/CREDIT FAILURE at ${TS} — needs \`claude auth login\` on the Mini" >> "$LOG"
+            echo "run_claude_job: '${JOB}' AUTH/CREDIT FAILURE at ${TS} — needs re-auth (credential: ${IRIS_CLAUDE_AUTH_SOURCE:-login})" >> "$LOG"
             exit 1
         fi
         # Next: an OS access/permission denial (TCC/FDA or session-env EPERM) can
