@@ -15,7 +15,7 @@ Three checks:
    in the overview, easy to flag).
 
 3. VO density (A-32) — for script deliverables that state a "Runtime target:",
-   estimate spoken runtime from VO word-count (150 wpm) and flag when it falls
+   estimate spoken runtime from VO word-count (180 wpm) and flag when it falls
    below 70% of target. Skip-silent on anything without a runtime target line.
 
 Read-only: writes `<deliverable>_lint.md` next to the deliverable. Never edits
@@ -255,7 +255,10 @@ def monetary_overview(text: str) -> dict:
 # can't fill. V1-V4 legacy scripts carried 600-730 words against 12-16 min
 # targets (~30-40% of the words needed); V5 (calibrated) carried 1,785 words /
 # 12 min ≈ 149 wpm — correct. Calibrated baseline rounded to 150 wpm.
-VO_WPM = 150
+# Raised to 180 on 2026-10-09. The VO now renders at speed 1.1 on the new voice,
+# measured 179.8 wpm off V06 (2026-07-01), and the script-reviewer def has used
+# 180 since then. Keep this equal to PLANNING_WPM in vo_factory/generate_vo.py.
+VO_WPM = 180
 VO_RATIO_FLAG_THRESHOLD = 0.70  # flag below 70% of stated runtime
 
 # Stated runtime target, anchored at line start so prose mentions don't trip it.

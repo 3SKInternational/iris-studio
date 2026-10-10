@@ -1043,7 +1043,7 @@ def _stage_prompt(key: str, video: int) -> str:
                     f"locked Brand Bible voice + scene-prompt structure. Write to "
                     f"BRANDS/3SK_Finance/Scripts/{v}_Script.md.",
         "2_review": f"Review the drafted script for {v} (BRANDS/3SK_Finance/Scripts/{v}_Script.md). "
-                    f"7-dimension read-only critique → BRANDS/3SK_Finance/Scripts/_REVIEW_PREP/.",
+                    f"Read-only critique on every review dimension → BRANDS/3SK_Finance/Scripts/_REVIEW_PREP/.",
         "7_packaging": f"Build the packaging for {v}: 8-10 titles, 2 cold-open hooks, 3 thumbnail "
                        f"text overlays + CTR rationale, from the script's Thumbnail Concept. "
                        f"Write to BRANDS/3SK_Finance/Packaging/.",
@@ -1576,7 +1576,7 @@ def run_script_review(video: int) -> tuple[str, str, str]:
     timeout = RUN_TABLE["2_review"]["timeout"]
     prompt = (
         f"Review the drafted script for {v} (BRANDS/3SK_Finance/Scripts/{v}_Script.md). "
-        f"7-dimension read-only critique → {verdict_rel}. Include a one-line 'VERDICT:' "
+        f"Read-only critique on every review dimension → {verdict_rel}. Include a one-line 'VERDICT:' "
         f"line. The verdict is BINARY: SHIP (every dimension passes, zero fixes) or "
         f"REVISE (anything less — list every fix under REVISE). There is no 'ship with "
         f"fixes': if it is not all good to go, none of it goes."

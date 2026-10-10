@@ -5,6 +5,7 @@ Run: python scripts/test_agent_output_lint.py  (exit 0 = all pass)
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
@@ -15,12 +16,12 @@ _spec.loader.exec_module(m)
 
 
 def test_vo_density():
-    # 1: V05-shape — target 12 min, ~1,786 words → ratio ~0.99 → clean
+    # 1: V05-shape — target 12 min, ~1,786 words → ratio ~0.83 → clean
     f1 = "Runtime target: 12 min\n\n**VO:**\n" + ("hello world " * 893) + "\n\n**B-roll:** x\n"
     r1 = m.check_vo_density(f1)
     assert r1["applicable"] and not r1["should_alert"], r1
 
-    # 2: V01-shape — target 15 min, 700 words → ratio ~0.31 → flag
+    # 2: V01-shape — target 15 min, 700 words → ratio ~0.26 → flag
     f2 = "Runtime target: 15:00\n\n**VO:**\n" + ("word " * 700) + "\n"
     r2 = m.check_vo_density(f2)
     assert r2["applicable"] and r2["should_alert"], r2
@@ -36,11 +37,11 @@ def test_vo_density():
     assert r4["word_count"] == 0, r4
 
     # 5: multiple VO blocks summed; MM:SS target parsed
-    f5 = ("Runtime target: 2:00\n\n**VO:**\n" + ("a " * 120) + "\n\n"
-          "**Image:** x\n\n**VO:**\n" + ("b " * 120) + "\n")
+    f5 = ("Runtime target: 2:00\n\n**VO:**\n" + ("a " * 144) + "\n\n"
+          "**Image:** x\n\n**VO:**\n" + ("b " * 144) + "\n")
     r5 = m.check_vo_density(f5)
-    assert r5["applicable"] and r5["vo_block_count"] == 2 and r5["word_count"] == 240, r5
-    assert not r5["should_alert"], r5  # 240/150=1.6min vs 2min target = 0.8 > 0.7
+    assert r5["applicable"] and r5["vo_block_count"] == 2 and r5["word_count"] == 288, r5
+    assert not r5["should_alert"], r5  # 288/180=1.6min vs 2min target = 0.8 > 0.7
 
     # 6: INLINE VO — live scriptwriter shape "**VO:** narration on same line",
     # interleaved with **B-roll:**/**Image:** markers (which must terminate the
@@ -55,7 +56,7 @@ def test_vo_density():
     )
     r6 = m.check_vo_density(f6)
     assert r6["vo_block_count"] == 3 and r6["word_count"] == 300, r6
-    # 300/150=2min vs 3min target = 0.667 < 0.70 → flag
+    # 300/180=1.67min vs 3min target = 0.556 < 0.70 → flag
     assert r6["should_alert"], r6
 
     # 7: live markdown target form "- **Runtime target:** 19:49" must be detected,
@@ -65,7 +66,22 @@ def test_vo_density():
     assert m.check_vo_density('runtime_estimate: "19:49"\n')["applicable"] is False
     assert m.check_vo_density("Formula: X | Runtime: ~19:49 here\n")["applicable"] is False
 
-    print("VO density: 7/7 pass")
+    # 8: the rate itself. At the locked 180 wpm a 10-min target crosses 70% at
+    # 1,260 words, so 1,263 stays clean and 1,256 flags. The pair fails if VO_WPM
+    # moves off 180 either way (it sat at a stale 150 until 2026-10-09).
+    r8a = m.check_vo_density("Runtime target: 10 min\n\n**VO:**\n" + ("w " * 1263))
+    r8b = m.check_vo_density("Runtime target: 10 min\n\n**VO:**\n" + ("w " * 1256))
+    assert r8a["applicable"] and not r8a["should_alert"], r8a
+    assert r8b["applicable"] and r8b["should_alert"], r8b
+
+    # 9: the lint must use the pipeline's planning rate; a recalibration that
+    # moves PLANNING_WPM must turn this suite red, not leave the lint behind.
+    src = (Path(__file__).resolve().parent.parent / "vo_factory" / "generate_vo.py").read_text(encoding="utf-8")
+    pw = re.search(r"^\s*PLANNING_WPM\s*=\s*(\d+)\b", src, re.M)
+    assert pw is not None, "PLANNING_WPM not found in vo_factory/generate_vo.py"
+    assert int(pw.group(1)) == m.VO_WPM, (int(pw.group(1)), m.VO_WPM)
+
+    print("VO density: 9/9 pass")
 
 
 def test_full_lint_and_render(tmp: Path):

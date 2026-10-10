@@ -782,7 +782,8 @@ Available subagents (agent_name -> what it does):
   from Cowork with the export, not a bare Telegram message. ~12 min.
 - `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~20 min.
 - `script-reviewer` — skeptical second pass on a drafted script before Steve reads
-  it (voice, banned vocab, number-spine, hook, VO density, structure/CTA, moat).
+  it (voice, banned vocab, number-spine, hook, VO density, structure/CTA, moat,
+  scene-field baked text, sibling duplication).
   Read-only — writes a review, never edits the script. Dispatch right after
   scriptwriter. ~8 min.
 - `scene-image-prompt-generator` — turns a script's scene blocks into paste-ready
