@@ -488,6 +488,11 @@ def test_script_stage_timeout_exceeds_measured_drafts():
     assert po.RUN_TABLE["1_script"]["timeout"] >= 840 * 2
 
 
+def test_packaging_stage_timeout_exceeds_the_value_that_failed():
+    """packaging-strategist timed out 3x at 480s on both V13 and V14."""
+    assert po.RUN_TABLE["7_packaging"]["timeout"] > 480
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and isinstance(v, types.FunctionType)]

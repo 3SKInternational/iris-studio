@@ -23,7 +23,9 @@ import asyncio
 import importlib
 import importlib.util
 import os
+import signal
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -92,6 +94,7 @@ class TestTimeoutKillsAndReports(unittest.TestCase):
     def setUp(self):
         self._orig_send = iris._send_telegram
         self._orig_timeout = iris.PIPELINE_SUBPROCESS_TIMEOUT
+        self._orig_redrain = iris.PIPELINE_REDRAIN_TIMEOUT
         self.tg = _CapturingTelegram()
         iris._send_telegram = self.tg
         # Shrink the real 3600s bound to something a test can actually wait out.
@@ -100,6 +103,7 @@ class TestTimeoutKillsAndReports(unittest.TestCase):
     def tearDown(self):
         iris._send_telegram = self._orig_send
         iris.PIPELINE_SUBPROCESS_TIMEOUT = self._orig_timeout
+        iris.PIPELINE_REDRAIN_TIMEOUT = self._orig_redrain
 
     def test_hung_subprocess_is_killed_and_reported_not_left_hanging(self):
         """A subprocess that outlives the timeout must be killed and the call
@@ -136,6 +140,48 @@ class TestTimeoutKillsAndReports(unittest.TestCase):
         self.assertEqual(chat_id, 999)
         self.assertIn("hello-from-subprocess", text)
         self.assertNotIn("timed out", text)
+
+    def test_timeout_sends_sigterm_so_orchestrator_reaper_runs(self):
+        """The orchestrator's install_agent_reaper() traps SIGTERM; SIGKILL skips it
+        and leaves its detached agent running unowned while the next sweep re-runs
+        the stage. Reachable once 7_packaging went to 1800s (review, 2026-10-09)."""
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "got_sigterm"
+            child = ("import signal, sys, time\n"
+                     f"def h(*a):\n    open({str(marker)!r}, 'w').write('x'); sys.exit(0)\n"
+                     "signal.signal(signal.SIGTERM, h)\ntime.sleep(30)\n")
+            iris.PIPELINE_SUBPROCESS_TIMEOUT = 1.5  # room for the child to install h
+            asyncio.run(iris._run_pipeline_subprocess([sys.executable, "-c", child], 1, "t"))
+            self.assertTrue(marker.exists(),
+                            "timeout must SIGTERM first; SIGKILL bypasses install_agent_reaper")
+
+    def test_sigterm_ignored_falls_back_to_sigkill(self):
+        """If SIGTERM has not landed within the re-drain window, kill() must follow,
+        or a wedged orchestrator outlives the call."""
+        procs = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capture(*a, **k):
+            p = await real_exec(*a, **k)
+            procs.append(p)
+            return p
+
+        child = "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(30)\n"
+        iris.PIPELINE_SUBPROCESS_TIMEOUT = 1.5  # room for the child to ignore SIGTERM
+        iris.PIPELINE_REDRAIN_TIMEOUT = 0.5
+        asyncio.create_subprocess_exec = capture
+        try:
+            asyncio.run(iris._run_pipeline_subprocess([sys.executable, "-c", child], 1, "t"))
+        finally:
+            asyncio.create_subprocess_exec = real_exec
+            for p in procs:
+                if p.returncode is None:
+                    try:
+                        os.kill(p.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        self.assertEqual(len(procs), 1)
+        self.assertEqual(procs[0].returncode, -signal.SIGKILL)
 
 
 class TestPinnedLiterals(unittest.TestCase):

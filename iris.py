@@ -458,7 +458,10 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # notification + status-hook read of the wrong file). A dedicated non-nested
     # dir removes the collision with zero change to the shared detection logic.
     "packaging-strategist": {
-        "timeout_seconds": 480,  # 8 min — read canon + draft 8-10 titles/hooks/text
+        # 30 min, raised from 8 (2026-10-09): this agent timed out 3x at 480s as
+        # pipeline stage 7_packaging on V13 and V14. The orchestrator has its own copy.
+        # mutequiv: 1800 vs 1801s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 1800,
         "deliverable_dir": "BRANDS/3SK_Finance/Packaging",
     },
     "sponsor-outreach-drafter": {
@@ -467,7 +470,8 @@ DISPATCH_AGENTS: dict[str, dict] = {
     },
     # --- Added 2026-05-30: 4 vault-native agents (the "easy adds" pass) ---
     "scene-image-prompt-generator": {
-        "timeout_seconds": 600,  # 10 min — Haiku, mechanical 5-field transformation
+        # mutequiv: 600 vs 601s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 600,  # 10 min — Sonnet, mechanical 5-field transformation
         "deliverable_dir": "BRANDS/3SK_Finance/Scene_Image_Prompts",
     },
     "video-description-writer": {
@@ -484,13 +488,14 @@ DISPATCH_AGENTS: dict[str, dict] = {
     },
     # --- Added 2026-05-31 (Session 17): YouTube channel intelligence ---
     # youtube-researcher: continuously monitors the finance-creator YouTube
-    # landscape and writes 5 structured intelligence files to
+    # landscape and writes 7 structured intelligence files to
     # BRANDS/3SK_Finance/Channel_Intelligence/ that the channel content agents
     # (scriptwriter, thumbnail-coordinator, video-description-writer,
     # scene-image-prompt-generator) read at every dispatch. Distinct from
     # market-researcher (business/sponsor scope) and researcher (general tech).
     "youtube-researcher": {
-        "timeout_seconds": 1800,  # 30 min — multi-source web research + 5 file writes
+        # mutequiv: 1800 vs 1801s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 1800,  # 30 min — multi-source web research + 7 file writes
         "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence",
     },
     # --- Added 2026-06-18: the inward-facing analytics counterpart ---
@@ -796,7 +801,7 @@ Available subagents (agent_name -> what it does):
   2 cold-open hooks, 3 thumbnail TEXT overlays + a per-title CTR rationale, all
   against the Discoverability_Playbook and the "first-gen wealth" moat. Owns the
   title/hook/thumb-text WORDS (thumbnail-coordinator owns the image). Dispatch
-  when a script/topic is set, before or alongside thumbnail-coordinator. ~8 min.
+  when a script/topic is set, before or alongside thumbnail-coordinator. Up to ~30 min.
 - `sponsor-outreach-drafter` — drafts a personalized cold sponsor email. ~15 min.
 - `chief-of-staff` — ground-truth verification of the whole operation: probes
   live state (launchctl/git/disk) for drift, dead jobs, what actually shipped,
@@ -3362,12 +3367,13 @@ _PIPELINE_FLAGS = {"advance": "--advance", "status": "--status", "spend-ok": "--
 # Shared bound for every orchestrator subprocess /pipeline spawns. 3600s matches
 # the orchestrator's own documented worst-case single-stage timeout (5_images —
 # see pipeline_stale_state_lint.py's STALE_RUNNING_HOURS margin, built against
-# this same number) — long enough that a legitimate advance/advance-all running
-# under the hourly pipeline-sweep is never mistaken for a hang, short enough
-# that a genuinely wedged subprocess is eventually reaped instead of leaking a
+# this same number) — it covers any single dispatch but NOT a review-looped stage
+# (2_review and 7_packaging can run ~3h in one --advance); the timeout path SIGTERMs
+# so the orchestrator reaps its agents, and the hourly sweep re-runs the stage. Short
+# enough that a genuinely wedged subprocess is eventually reaped instead of leaking a
 # process + asyncio task on every impatient retry (2026-07-28 two-pass audit).
 PIPELINE_SUBPROCESS_TIMEOUT = 3600
-# Bounded re-drain/reap window after kill() — mirrors _run_dispatch's M3 fix
+# Bounded re-drain/reap window after terminate()/kill() — mirrors _run_dispatch's M3 fix
 # (same literal, same rationale: a killed process's pipes close almost
 # immediately in every real case; this only bounds the pathological one).
 # Named (not inline) so a test can pin the exact value via the symbol instead
@@ -3403,18 +3409,26 @@ async def _run_pipeline_subprocess(cmd: list, chat_id, label: str) -> None:
             )
         except asyncio.TimeoutError:
             timed_out = True
+            # SIGTERM, not SIGKILL: the orchestrator's install_agent_reaper() traps
+            # SIGTERM and kills its agent process groups (start_new_session puts them
+            # outside ours). SIGKILL skips the reaper and leaves the in-flight agent
+            # running unowned while the next sweep re-runs the stage.
             try:
-                proc.kill()
+                proc.terminate()
             except ProcessLookupError:
                 pass
-            # Bounded re-drain + reap after kill() — mirrors _run_dispatch's M3
-            # fix: re-draining half-consumed pipes can itself hang.
+            # Bounded re-drain + reap — mirrors _run_dispatch's M3 fix: re-draining
+            # half-consumed pipes can itself hang.
             try:
                 out_b, err_b = await asyncio.wait_for(
                     proc.communicate(), timeout=PIPELINE_REDRAIN_TIMEOUT
                 )
             except Exception:
                 out_b, err_b = b"", b""
+                try:
+                    proc.kill()  # SIGTERM did not land in time
+                except ProcessLookupError:
+                    pass
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=PIPELINE_REDRAIN_TIMEOUT)
                 except Exception:
@@ -3425,8 +3439,9 @@ async def _run_pipeline_subprocess(cmd: list, chat_id, label: str) -> None:
             await _send_telegram(
                 chat_id,
                 f"⏱️ {label} timed out after {PIPELINE_SUBPROCESS_TIMEOUT}s and was "
-                f"killed — likely blocked on the orchestrator's flock during a sweep. "
-                f"Retry later, or check `/pipeline all status` for what's holding it."
+                f"stopped — either blocked on the orchestrator's flock during a sweep, or "
+                f"running a stage longer than that (2_review, 7_packaging), which the "
+                f"hourly sweep re-runs. Check `/pipeline all status`."
             )
             return
         if proc.returncode == 0 and out:

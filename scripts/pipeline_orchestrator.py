@@ -213,7 +213,22 @@ RUN_TABLE: dict[str, dict] = {
     "2_review":      {"kind": "agent",  "agent": "script-reviewer",          "timeout": 1800},
     "5_images":      {"kind": "billed", "agent": None,                       "timeout": 3600},
     "6_assemble":    {"kind": "script", "agent": None,                       "timeout": 1800},
-    "7_packaging":   {"kind": "agent",  "agent": "packaging-strategist",     "timeout": 480},
+    # 1800, raised from 480 (2026-10-09). packaging-strategist timed out 3x at 480 on
+    # both V13 and V14 (V14's agent logs are 0 bytes, the same signature as 2_review
+    # above), and Iris wrote both packages by hand. No run has finished in-pipeline,
+    # so there is no measured duration; this copies 2_review's budget for the same
+    # class of work (whole script + canon reads). iris.py's packaging-strategist
+    # dispatch entry has its own copy.
+    # COUPLING: run_stage_review and run_stage_fixer read this same value, so the
+    # packaging-reviewer and each fix round get 1800 too. The stage's worst case is
+    # now ~180 min (1800 + 1800 + 2×(1800+1800)), up from ~48; while it runs,
+    # --status blocks on the same per-video flock the 1_script note describes.
+    # A Telegram /pipeline run is capped by iris.py PIPELINE_SUBPROCESS_TIMEOUT
+    # (3600s); producer + one review can reach that, so a Telegram-started stage 7
+    # that needs a fix round is stopped (SIGTERM, agents reaped) and left for the
+    # hourly sweep, which has no cap. 2_review has the same exposure.
+    # mutequiv: 1800 vs 1801s stage timeout is a tunable knob, no exact-value contract
+    "7_packaging":   {"kind": "agent",  "agent": "packaging-strategist",     "timeout": 1800},
     "12_leadmagnet": {"kind": "agent",  "agent": "lead-magnet-writer",       "timeout": 900},
     "8_thumbnail":   {"kind": "script", "agent": None,                       "timeout": 600},
     "9_description": {"kind": "agent",  "agent": "video-description-writer",  "timeout": 600},
