@@ -69,4 +69,15 @@ with tempfile.TemporaryDirectory() as td:
             assert abs(lab - real) < 0.2, \
                 f"label {lab} vs true content-time {real} (interval {interval}) — off-by-half bug"
 
+    # A second pull into the same frames/ dir must replace the first, not mix with it:
+    # a full 10-frame pull, then a 4-frame hook pull (different timestamps, fewer frames).
+    reused = tmp / "reused"
+    extract_frames(clip, reused, 0.0, 120.0, 10, 128)
+    (reused / "raw_0099.jpg").write_bytes(b"stale")   # leftover from an interrupted run
+    second = extract_frames(clip, reused, 0.0, 60.0, 4, 128)
+    assert len(second) == 4, f"expected 4 frames, got {[p.name for _, p in second]}"
+    on_disk = sorted(p.name for p in reused.glob("*.jpg"))
+    assert on_disk == sorted(p.name for _, p in second), \
+        f"stale frames left beside the new pull: {on_disk}"
+
 print("ok: watch_video frame labels match true content time (interval-center, no off-by-half)")

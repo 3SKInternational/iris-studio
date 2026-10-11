@@ -6,15 +6,20 @@
   CLOSED LOOP, not just a data pull: this runs the `youtube-research` Claude
   routine, which (1) runs niche_pull.py to fetch the OUTSIDE finance niche's real
   most-viewed videos from the YouTube Data API, then (2) dispatches the
-  youtube-researcher agent to refresh the 5 Channel_Intelligence freshness files
+  youtube-researcher agent to refresh the 7 Channel_Intelligence freshness files
   the content agents (scriptwriter / thumbnail-coordinator / video-description-
-  writer / scene-image-prompt-generator) read at every dispatch. The agent's web
+  writer / scene-image-prompt-generator / vo-reviewer) read at every dispatch. The agent's web
   sweep runs every cycle; the niche feed gives it REAL ranked view counts so
   viral_teardowns.md stops saying "no public data retrieved".
 
   Runs via run_claude_job.sh (NOT run_job.sh): it's a `claude --print` routine, so
   the SAME wrapper every other claude-code job uses handles logging, the
   ROUTINE_COMPLETE/INCOMPLETE sentinel → Telegram alert, and the retry queue.
+
+  SLOW_JOB_THRESHOLD_SEC=2700 (2026-10-10): good 5-file runs already took up to
+  ~28 min, past run_claude_job.sh's 1200s "ran LONG" default, and the agent now
+  writes 7 files plus watch packs. Retries replayed by retry_runner.sh do not
+  carry this variable and fall back to 1200.
 
   Schedule: Mon + Thu 2:00 AM ET — fresh niche intel before each half-week's
   production push. Replaces the old weekly (Wed) youtube-researcher-weekly
@@ -38,6 +43,11 @@
 		<string>-lc</string>
 		<string>/Volumes/AI_Workspace/iris_studio/scripts/run_claude_job.sh youtube-research /Volumes/AI_Workspace/iris_studio/routines/youtube-research.prompt</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SLOW_JOB_THRESHOLD_SEC</key>
+		<string>2700</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<false/>
 	<key>StandardErrorPath</key>

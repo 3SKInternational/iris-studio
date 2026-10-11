@@ -260,6 +260,11 @@ def extract_frames(video: Path, out: Path, start: float, end: float,
                    max_frames: int, width: int) -> list[tuple[float, Path]]:
     """Uniform sampling across [start,end], renamed with real timestamps."""
     out.mkdir(parents=True, exist_ok=True)
+    # A second pull of the same video (e.g. the hook re-run with --start 0 --end 60)
+    # reuses this dir; without this, its frames sit beside the first pull's and the
+    # reader can't tell the two sets apart. Only our own file patterns are removed.
+    for old in [*out.glob("frame_*.jpg"), *out.glob("raw_*.jpg")]:
+        old.unlink(missing_ok=True)
     span = max(end - start, 1.0)
     interval = max(span / max_frames, 0.5)  # ponytail: uniform only; scene-detect if it ever misses cuts
     tmp_pat = str(out / "raw_%04d.jpg")
