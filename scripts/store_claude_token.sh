@@ -5,8 +5,10 @@
 # Copy-paste failed twice on 2026-10-09: the CLI prints the token wrapped over
 # two indented lines, and only one line reached the Keychain. This runs
 # `claude setup-token` under `script` (it needs a real terminal for the browser
-# sign-in), pulls the token out of the captured output, joins the wrapped
-# lines, stores it, and proves it works with one headless call.
+# sign-in), pulls candidate tokens out of the captured output (the token
+# rejoined across 1-4 wrapped lines), and stores the first candidate that
+# actually authenticates. A candidate that fails the sign-in test is never
+# stored, so a parsing mistake costs a retry, never a broken fleet.
 #
 # Usage (in a Terminal on the Mini):  bash scripts/store_claude_token.sh
 # Self-check of the extraction only:  bash scripts/store_claude_token.sh --selftest
@@ -14,61 +16,82 @@
 set -uo pipefail
 CLAUDE="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 
-# Print the token found in a captured setup-token transcript: strip ANSI
-# escapes (cursor-forward first becomes the spaces it stands for, because Ink
-# draws some spaces that way), take everything from sk-ant-oat01- up to
-# "Store this token", and
-# drop all whitespace (the wrap). Prints nothing when there is no token.
-extract() {
-    perl -0777 -ne 's/\e\[(\d*)C/" " x ($1 || 1)/ge;
-        s/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e[()][A-Za-z0-9]//g;
-        if (/(sk-ant-oat01-.*?)Store\s+this\s+token/s) { ($t=$1) =~ s/\s//g;
-        print $t if $t =~ /\Ask-ant-oat01-[A-Za-z0-9_-]{60,}\z/ }' "$1"
+# Print candidate tokens from a captured setup-token transcript, shortest
+# first. Ink's output is drawing commands, not text: cursor-forward codes stand
+# for spaces, and lines are separated by CR plus cursor moves rather than LF.
+# So: strip every escape, then join the
+# whitespace-separated pieces after sk-ant-oat01- one at a time. No end marker:
+# the caller's auth test decides which candidate is the token.
+candidates() {
+    perl -0777 -ne 's/\e\][^\a\e]*(?:\a|\e\\)//g; s/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e[()][A-Za-z0-9]//g;
+        /(sk-ant-oat01-.*)/s or exit;
+        my @p = split /\s+/, $1; my $t = "";
+        for my $i (0 .. 3) {
+            last if $i > $#p || $p[$i] !~ /\A[A-Za-z0-9_-]+\z/;
+            $t .= $p[$i];
+            print "$t\n" if $t =~ /\Ask-ant-oat01-[A-Za-z0-9_-]{60,}\z/;
+        }' "$1"
+}
+
+# Print the first candidate that authenticates. Exit status is the auth
+# proof. The list comes in on fd 3 and claude gets </dev/null: `claude -p`
+# reads stdin when it isn't a terminal, and would otherwise swallow the rest
+# of the list after the first try (and could send it to the API as prompt).
+pick_token() {
+    local c
+    while IFS= read -r c <&3; do
+        if (cd /tmp && CLAUDE_CODE_OAUTH_TOKEN="$c" "$CLAUDE" -p 'Reply with exactly: ok' </dev/null >/dev/null 2>&1); then
+            printf '%s\n' "$c"; return 0
+        fi
+    done 3< <(candidates "$1")
+    return 1
 }
 
 if [ "${1:-}" = "--selftest" ]; then
     f="$(mktemp)"; trap 'rm -f "$f"' EXIT
     good="sk-ant-oat01-$(printf 'A%.0s' {1..60})_b-$(printf 'C%.0s' {1..30})"
-    # Ink re-applies color on every wrapped line, so put codes INSIDE the token.
-    printf ' \e[1mYour OAuth token (valid for 1 year):\e[0m\r\n\r\n \e[38;2;255;193;7m%s\e[39m\r\n \e[38;2;255;193;7m%s\e[39m\r\n\r\n \e[2mStore this\e[1Ctoken securely.\r\n' \
+    # Real Ink shape: color codes INSIDE the wrapped token, lines joined by CR +
+    # cursor-down (no LF), and a space drawn as cursor-forward in the next line.
+    printf ' \e[1mYour OAuth token (valid for 1 year):\e[0m\r\e[1B\r\e[1B \e[38;2;255;193;7m%s\e[39m\r\e[1B \e[38;2;255;193;7m%s\e[39m\r\e[1B\r\e[1B \e[2mStore this\e[1Ctoken securely.\e[22m\r\n' \
         "${good:0:70}" "${good:70}" > "$f"
-    [ "$(extract "$f")" = "$good" ] || { echo "FAIL: wrapped token not rejoined"; exit 1; }
+    candidates "$f" | grep -qx "$good" || { echo "FAIL: wrapped token not among candidates"; exit 1; }
     printf ' Your OAuth token:\n sk-ant-oat01-short\n Store this token\n' > "$f"
-    [ -z "$(extract "$f")" ] || { echo "FAIL: accepted a truncated token"; exit 1; }
+    [ -z "$(candidates "$f")" ] || { echo "FAIL: offered a truncated token"; exit 1; }
     printf 'Login failed\n' > "$f"
-    [ -z "$(extract "$f")" ] || { echo "FAIL: invented a token"; exit 1; }
+    [ -z "$(candidates "$f")" ] || { echo "FAIL: invented a token"; exit 1; }
+    # The loop must reach the full token even though shorter candidates come
+    # first, with a fake claude that reads stdin the way the real one does.
+    # Split at 80 so the first half alone is a candidate and is tried first.
+    printf ' \e[38;2;255;193;7m%s\e[39m\r\e[1B \e[38;2;255;193;7m%s\e[39m\r\e[1B\r\e[1B Store this token\r\n' \
+        "${good:0:80}" "${good:80}" > "$f"
+    fake="$(mktemp)"; trap 'rm -f "$f" "$fake"' EXIT
+    printf '#!/bin/bash\ncat >/dev/null\n[ "$CLAUDE_CODE_OAUTH_TOKEN" = "%s" ]\n' "$good" > "$fake"; chmod +x "$fake"
+    [ "$(CLAUDE="$fake" pick_token "$f")" = "$good" ] || { echo "FAIL: loop never reached the full token"; exit 1; }
     echo "selftest ok"; exit 0
 fi
 
 log="$(mktemp)"; chmod 600 "$log"; trap 'rm -f "$log"' EXIT
 script -q "$log" "$CLAUDE" setup-token
 printf '\e[3J'; clear   # drop the printed token from scrollback
-tok="$(extract "$log")"   # the EXIT trap deletes $log
-if [ -z "$tok" ]; then
-    echo "No complete token found in the setup-token output. Nothing was stored."
-    # Shape of the capture for debugging: markers found, and every character
-    # between them with letters/digits counted, not shown. No token content.
-    perl -0777 -ne 'printf "capture: %d bytes, sk-ant-oat01- x%d, \"Store this token\" x%d\n",
-        length, scalar(() = /sk-ant-oat01-/g), scalar(() = /Store this token/g);
-        if (/sk-ant-oat01-(.*?)(Store this token|\z)/s) { my $m=$1; my $n=($m =~ tr/A-Za-z0-9//);
-        $m =~ s/[A-Za-z0-9]+/<alnum>/g; $m =~ s/([^\x21-\x7e])/sprintf("\\x%02x",ord $1)/ge;
-        print "alnum chars after marker: $n\nshape: ", substr($m,0,600), "\n" }
-        else { my $m=substr($_,-500); $m =~ s/[A-Za-z0-9]+/<alnum>/g;
-        $m =~ s/([^\x21-\x7e])/sprintf("\\x%02x",ord $1)/ge; print "tail shape: $m\n" }' "$log"
-    exit 1
-fi
 
-# Prove the token before touching Keychain, so a bad capture never replaces
-# whatever is stored. Exit status is the auth proof, not the reply text.
-if ! (cd /tmp && CLAUDE_CODE_OAUTH_TOKEN="$tok" "$CLAUDE" -p 'Reply with exactly: ok' >/dev/null 2>&1); then
-    echo "The new token did not authenticate. Nothing was stored."
+tok="$(pick_token "$log")"
+
+if [ -z "$tok" ]; then
+    echo "No working token found among $(candidates "$log" | wc -l | tr -d ' ') candidate(s). Nothing was stored."
+    echo "Try again with the Terminal window wide enough for the token to fit on one line."
+    # Shape of the capture for debugging: escape codes shown, letters and
+    # digits collapsed to <alnum>. No token content.
+    perl -0777 -ne 'printf "capture: %d bytes, sk-ant-oat01- x%d\n", length, scalar(() = /sk-ant-oat01-/g);
+        if (/sk-ant-oat01-(.*)/s) { my $m=substr($1,0,700);
+        $m =~ s/[A-Za-z0-9]+/<alnum>/g; $m =~ s/([^\x21-\x7e])/sprintf("\\x%02x",ord $1)/ge;
+        print "shape: $m\n" }' "$log"
     exit 1
 fi
 
 # Through security's stdin, so the token never appears in argv (ps) or history.
 printf 'add-generic-password -U -a iris-claude -s iris_claude_oauth_token -w %s\n' "$tok" | security -i \
     || { echo "Keychain write failed. Nothing changed."; exit 1; }
-unset tok
+unset tok c
 echo "Token works and is stored in Keychain. Restarting the daemon so it picks it up."
 launchctl kickstart -k "gui/$(id -u)/com.iris.studio"
 echo "Done."
