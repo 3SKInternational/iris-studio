@@ -3451,6 +3451,19 @@ async def _run_pipeline_subprocess(cmd: list, chat_id, label: str) -> None:
                     pass
         out = (out_b or b"").decode(errors="replace").strip()
         err = (err_b or b"").decode(errors="replace").strip()
+        if timed_out and "--spend-ok" in cmd:
+            # The orchestrator runs the billed batch in its own session with its pid
+            # in stage 5, so SIGTERM above stops the orchestrator, not the batch.
+            await _send_telegram(
+                chat_id,
+                f"⏱️ {label}: stopped waiting after {PIPELINE_SUBPROCESS_TIMEOUT}s. If the "
+                f"image batch had started, it may still be running and billing; stage 5 "
+                f"records its pid, and the hourly sweep marks the stage done when it "
+                f"finishes, or pings you to resume it. If the pre-spend review was still "
+                f"running, nothing was billed: re-send spend-ok. Check "
+                f"`{label.rsplit(' ', 1)[0]} status`."
+            )
+            return
         if timed_out:
             await _send_telegram(
                 chat_id,

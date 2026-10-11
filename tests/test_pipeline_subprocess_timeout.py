@@ -133,6 +133,20 @@ class TestTimeoutKillsAndReports(unittest.TestCase):
         self.assertIn("timed out", text)
         self.assertIn("test-label", text)
 
+    def test_spend_ok_timeout_says_the_batch_may_still_run(self):
+        """spend-ok's batch runs in its own session (pipeline_orchestrator
+        _run_image_batch), so the SIGTERM stops the orchestrator, not the batch.
+        Saying it "was stopped" told Steve a billing batch had ended (2026-10-10)."""
+        cmd = [sys.executable, "-c", "import time; time.sleep(30)", "--video", "14",
+               "--spend-ok"]
+        asyncio.run(asyncio.wait_for(
+            iris._run_pipeline_subprocess(cmd, 1, "/pipeline 14 spend-ok"), timeout=10))
+        self.assertEqual(len(self.tg.calls), 1, self.tg.calls)
+        text = self.tg.calls[0][1]
+        self.assertIn("may still be running", text)
+        self.assertIn("/pipeline 14 status", text)
+        self.assertNotIn("was stopped", text)
+
     def test_fast_subprocess_completes_normally_no_false_timeout(self):
         """A subprocess well under the timeout must relay its real output and
         must NOT print a timeout message — pins the other direction, so a

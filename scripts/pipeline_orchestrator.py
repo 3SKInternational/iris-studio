@@ -211,7 +211,14 @@ RUN_TABLE: dict[str, dict] = {
     # _run_agent's own docstring already records V14 script dispatches running
     # 1200-2400s. Stage 1 (scriptwriter, same class of work) is 2400.
     "2_review":      {"kind": "agent",  "agent": "script-reviewer",          "timeout": 1800},
-    "5_images":      {"kind": "billed", "agent": None,                       "timeout": 3600},
+    # 14400 (4 h), raised from 3600 (2026-10-10). Measured flagship batches ran 52-123
+    # min (image_factory/cost_ledger.jsonl), so 3600 killed most of them part way. At
+    # 54-105 s an image, 85 shots (the $11 cap) can take ~150 min; 4 h leaves room.
+    # The batch runs in its own session with its pid in 5_images (_run_image_batch),
+    # so this limit holds even after the orchestrator that started it has died:
+    # reconcile_orphans stops a batch that outlives it.
+    # mutequiv: 14400 vs 14401s stage timeout is a tunable knob, no exact-value contract
+    "5_images":      {"kind": "billed", "agent": None,                       "timeout": 14400},
     "6_assemble":    {"kind": "script", "agent": None,                       "timeout": 1800},
     # 1800, raised from 480 (2026-10-09). packaging-strategist timed out 3x at 480 on
     # both V13 and V14 (V14's agent logs are 0 bytes, the same signature as 2_review
@@ -626,10 +633,64 @@ def promote_gate_exits(stages: dict, video: int) -> tuple[list[str], bool]:
     return promoted, changed
 
 
+def _hd_dir(video: int) -> Path | None:
+    """The folder spend-ok renders into; build_video reads the same one."""
+    return vault_abs(f"{VAULT_REL}/Raw_Assets/Video_{nn(video)}_HD")
+
+
+def _batch_pngs_missing(video: int, stages: dict) -> int | None:
+    """How many of the billed manifest's shots have no PNG yet; None if the
+    manifest cannot be read. Skips the entries generate_images itself skips."""
+    try:
+        images = json.loads(vault_abs(canonical_manifest_rel(video, stages))
+                            .read_text(encoding="utf-8")).get("images") or []
+        out = _hd_dir(video)
+        missing = 0
+        for img in images:
+            if not isinstance(img, dict):
+                continue
+            name, prompt = str(img.get("name") or ""), img.get("prompt")
+            if (not name or not isinstance(prompt, str) or not prompt
+                    or "/" in name or "\\" in name or name.startswith(".")):
+                continue
+            if not (out / f"{name}.png").exists():
+                missing += 1
+        return missing
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _close_batch(s: dict, stages: dict, video: int, why: str) -> None:
+    """5_images after its batch process has gone: done when every shot has its
+    PNG, else ready, so spend-ok resumes it (generate_images skips PNGs already on
+    disk, and a resume of the same manifest counts against the first-batch cap).
+    Always pings: nobody else is left to say how the batch ended."""
+    missing = _batch_pngs_missing(video, stages)
+    if missing == 0 and _on_success(s, "5_images", video,
+                                    f"batch finished after its launcher stopped ({why})")[0]:
+        notify(f"💸 Video {video}: stage 5 (images) GENERATED. The batch finished "
+               f"after the run that started it had stopped.", force=True)
+        return
+    s["status"] = "ready"
+    s["pid"] = None
+    s["pid_start_token"] = None
+    left = "an unknown number of" if missing is None else str(missing)
+    s["note"] = f"image batch stopped ({why}) with {left} shot(s) unrendered at {now_iso()}"
+    notify(f"⚠️ Video {video}: the image batch stopped ({why}) with {left} shot(s) "
+           f"unrendered. /pipeline {video} spend-ok resumes it: shots already on disk "
+           f"are skipped.", force=True)
+
+
 def reconcile_orphans(stages: dict, video: int) -> list[str]:
     """Decision 3: a `running` stage is orphaned if the orchestrator that owned
     it is gone/recycled/timed-out. Orphan → ready (re-runnable). A genuinely-live
-    run aborts the whole invocation."""
+    run aborts the whole invocation.
+
+    5_images records the image batch's own pid (_run_image_batch), so a batch that
+    outlives its orchestrator stays `running` while it runs, and a gone batch goes
+    to done or ready by its PNGs (_close_batch). A batch past its timeout is ours
+    to stop (same pid and start token), so it is SIGTERMed here, never left
+    running behind a `ready` stage."""
     reset = []
     for key in STAGE_ORDER:
         s = stages.get(key)
@@ -648,6 +709,15 @@ def reconcile_orphans(stages: dict, video: int) -> list[str]:
         timed_out = (started is not None and (time.time() - started) > timeout)
         if dead or recycled or timed_out:
             why = "pid-dead" if dead else ("pid-recycled" if recycled else "timed-out")
+            if key == "5_images":
+                if not dead and rec_token is not None and cur_token == rec_token:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass  # exited in between
+                _close_batch(s, stages, video, why)
+                reset.append(key)
+                continue
             s["status"] = "ready"
             s["pid"] = None
             s["pid_start_token"] = None
@@ -658,10 +728,12 @@ def reconcile_orphans(stages: dict, video: int) -> list[str]:
             # Raise (not die) so the fleet loop can distinguish this benign live
             # run from a corrupt-state die()/SystemExit. The per-video caller
             # converts it back to die() to preserve the prior CLI behavior.
+            hint = (f"Wait for it to finish, or stop it with: kill {pid}"
+                    if key == "5_images" else  # --force-reset refuses a live batch
+                    f"If it is stuck, clear it with: --video {video} --force-reset")
             raise LiveRunError(
                 f"stage {key} already running (pid {pid} since {s.get('started_at')}), "
-                f"refusing to double-run. If it is stuck, clear it with: "
-                f"--video {video} --force-reset")
+                f"refusing to double-run. {hint}")
     return reset
 
 
@@ -3065,7 +3137,8 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
     # cmd_advance — so the billed path gives a clean "refusing to double-run …"
     # message instead of a raw traceback, BEFORE any spend or state mutation.
     try:
-        reconcile_orphans(stages, video)
+        if reconcile_orphans(stages, video):
+            sf.save()  # a batch closed here must stay closed on the early returns below
     except LiveRunError as e:
         die(str(e))
     key = "5_images"
@@ -3313,23 +3386,18 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
             notify(line)
             return 2
 
-    out_rel = f"Raw_Assets/Video_{nn(video)}_HD"      # build_video reads same dir
-    out_abs = vault_abs(f"{VAULT_REL}/{out_rel}")
+    out_abs = _hd_dir(video)
     _mark_running(s)
     sf.save()
     cmd = [
         PYTHON, "image_factory/generate_images.py",
         str(manifest_abs), "--output", str(out_abs),
     ]
-    cfg = RUN_TABLE[key]
-    try:
-        proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
-                              text=True, timeout=cfg["timeout"])
-        ok = proc.returncode == 0
-        out = (proc.stdout or "").strip()[-300:] if ok else \
-              f"generate_images exited {proc.returncode}: {(proc.stderr or '')[-400:]}"
-    except subprocess.TimeoutExpired:
-        ok, out = False, f"generate_images timed out after {cfg['timeout']}s"
+    rc, out = _run_image_batch(cmd, s, sf, video, RUN_TABLE[key]["timeout"])
+    ok = rc == 0
+    if not ok:
+        out = (f"generate_images timed out after {RUN_TABLE[key]['timeout']}s and was "
+               f"stopped" if rc is None else f"generate_images exited {rc}") + f": {out}"
 
     done_ok, art_reason = (False, "") if not ok else _on_success(s, key, video, out)
     if ok and done_ok:
@@ -3351,6 +3419,57 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
         print(line)
         notify(line)
         return 2
+
+
+def _run_image_batch(cmd: list[str], s: dict, sf: StateFile, video: int,
+                     timeout: int) -> tuple[int | None, str]:
+    """Run the billed generate_images batch; return (rc, output tail), rc None on
+    timeout.
+
+    The batch gets its own session and writes to a log file, not a pipe, and its
+    pid and start token go into 5_images before the wait (2026-10-10). The daemon
+    stops a /pipeline spend-ok after PIPELINE_SUBPROCESS_TIMEOUT with SIGTERM to
+    this process only; flagship batches run 52-123 min, so that used to leave
+    generate_images billing with no owner, a dead pid in the state, and a pipe
+    that killed it (BrokenPipe) on its first stderr line. Now the batch runs on,
+    the state names it, and reconcile_orphans marks the stage done or ready once
+    it exits. The reaper leaves it alone: it is not in _LIVE_AGENT_PGIDS."""
+    AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_p = AGENT_LOG_DIR / f"Video_{nn(video)}_generate_images.log"
+    with open(log_p, "ab") as log_fh:
+        start = log_fh.tell()
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                                stdout=log_fh, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    # ponytail: a SIGTERM between Popen and this save leaves the orchestrator's pid
+    # in 5_images, so reconcile closes the stage while the batch still runs (tens of
+    # ms; the ledger lock still refuses a second billed run). Blocking signals over
+    # the spawn would pass the mask to the batch; fix only if it is ever seen.
+    s["pid"] = proc.pid
+    s["pid_start_token"] = _proc_start_token(proc.pid)
+    sf.save()
+    print(f"↳ image batch pid {proc.pid}, log: {log_p} "
+          f"(it keeps running if this process stops; to stop it: kill {proc.pid})")
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            # mutequiv: 30 vs 31s grace before SIGKILL is a tunable knob; generate_images
+            # exits on SIGTERM at once, so no test can tell them apart
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        rc = None
+    try:
+        with open(log_p, "rb") as fh:
+            fh.seek(start)
+            out = fh.read().decode(errors="replace").strip()
+    except OSError:
+        out = ""
+    # mutequiv: 600 vs 601 chars of log tail is a tunable knob, no exact-length contract
+    return rc, out[-600:]
 
 
 def cmd_force_reset(sf: StateFile) -> int:
@@ -3375,8 +3494,18 @@ def cmd_force_reset(sf: StateFile) -> int:
         recycled = (not dead and cur_token is not None
                     and rec_token is not None and cur_token != rec_token)
         timed_out = (started is not None and (time.time() - started) > timeout)
+        if key == "5_images" and not (dead or recycled):
+            # A live image batch is still billing: clearing it would leave it
+            # running behind a `ready` stage (reconcile_orphans stops it at its
+            # timeout). Refuse; once it has gone, it closes by its PNGs.
+            refused.append((key, pid, s.get("started_at")))
+            continue
         if dead or recycled or timed_out:
             why = "pid-dead" if dead else ("pid-recycled" if recycled else "timed-out")
+            if key == "5_images":
+                _close_batch(s, stages, video, f"manual --force-reset, {why}")
+                cleared.append(key)
+                continue
             s["status"] = "ready"
             s["pid"] = None
             s["pid_start_token"] = None

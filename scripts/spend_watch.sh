@@ -41,8 +41,8 @@ POLL=30           # seconds between checks
 GRACE=120         # startup window to let the spend process appear
 # Worst-case wall time: Pass-A review can loop IMAGE_REVIEW_MAX_FIX_ATTEMPTS(2)
 # times, so up to 5 review passes × IMAGE_REVIEW_TIMEOUT(900) = 4500s, THEN the
-# billed generation at 5_images timeout 3600s = 8100s. Add slack → 9000s.
-MAX_WAIT=9000     # review(<=4500) + gen(3600) + slack, in seconds
+# billed generation at 5_images timeout 14400s = 18900s. Add slack → 19800s.
+MAX_WAIT=19800    # review(<=4500) + gen(14400) + slack, in seconds
 
 # Match the orchestrator spend process for THIS video, or its generate_images
 # child. The trailing " --spend-ok" anchors so "--video 3" never matches "30".
@@ -127,13 +127,18 @@ while true; do
       log "spend process exited with stage5=done — clean finish"
       make_sheet; exit 0
     fi
-    log "spend process GONE with stage5='${st}' — abnormal end"
-    alert "⚠️ Video ${VIDEO}: image spend STOPPED without completing (stage 5 = '${st}'). Killed/crashed mid-run — \$0 or a partial batch, nothing assembled. Re-authorize when ready: /pipeline ${VIDEO} spend-ok"
-    exit 1
+    # 'running' with no process: the batch outlived its orchestrator (the daemon's
+    # cap) and has now exited. The next sweep closes stage 5, done or ready with its
+    # own ping (pipeline_orchestrator _close_batch), so keep watching for that.
+    if [ "$st" != "running" ]; then
+      log "spend process GONE with stage5='${st}' — abnormal end"
+      alert "⚠️ Video ${VIDEO}: image spend STOPPED without completing (stage 5 = '${st}'). Killed/crashed mid-run — \$0 or a partial batch, nothing assembled. Re-authorize when ready: /pipeline ${VIDEO} spend-ok"
+      exit 1
+    fi
   fi
   if [ "$elapsed" -ge "$MAX_WAIT" ]; then
-    log "watchdog timeout after ${MAX_WAIT}s, spend still alive (stage5='${st}')"
-    alert "⚠️ Video ${VIDEO}: image spend watchdog hit ${MAX_WAIT}s and the process is still running (stage 5 = '${st}'). It may be stuck — check it: /pipeline ${VIDEO} status"
+    log "watchdog timeout after ${MAX_WAIT}s, spend not finished (stage5='${st}')"
+    alert "⚠️ Video ${VIDEO}: image spend watchdog hit ${MAX_WAIT}s and stage 5 is still '${st}'. It may be stuck — check it: /pipeline ${VIDEO} status"
     exit 2
   fi
   sleep "$POLL"; elapsed=$((elapsed + POLL))

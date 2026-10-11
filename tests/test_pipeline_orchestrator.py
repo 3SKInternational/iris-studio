@@ -31,6 +31,18 @@ _MODULE_PATH = _HERE.parent / "scripts" / "pipeline_orchestrator.py"
 _spec = importlib.util.spec_from_file_location("pipeline_orchestrator", _MODULE_PATH)
 po = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(po)
+# The billed batch NEVER runs for real here. cmd_spend_ok runs it through
+# _run_image_batch (Popen, own session), which no `po.subprocess.run = _spy_run`
+# below intercepts; left real, the spend-ok tests here started the real
+# generate_images with a live key (2026-10-10, stopped only by a bad output path).
+# Route it through subprocess.run so every existing spy sees it. The real
+# _run_image_batch is tested in tests/test_spend_ok_batch.py against a stub child.
+def _batch_via_run(cmd, s, sf, video, timeout):
+    p = po.subprocess.run(cmd)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+po._run_image_batch = _batch_via_run
 # NOTE: the module-level `mut` (scripts/mutate.py) import that used to live here
 # was dropped (round 16, 2026-07-27) — TestMutationCrashGuard now runs entirely
 # against a private tmp copy (see its docstring), so nothing in this file reads
