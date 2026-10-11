@@ -1456,6 +1456,48 @@ def _parse_image_verdict(text: str) -> str | None:
     return best
 
 
+_FM_BLOCKED_RE = re.compile(r"^status:\s*['\"]?blocked", re.IGNORECASE | re.MULTILINE)
+
+
+def _status_blocked(text: str) -> bool:
+    """True when the file's YAML frontmatter says `status: blocked-*`."""
+    lines = (text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return False
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return bool(_FM_BLOCKED_RE.search("\n".join(lines[1:i])))
+    return False
+
+
+def _parse_gate_verdict(text: str) -> str | None:
+    """Strict verdict parse for the image gate, which bills money on SHIP.
+
+    _parse_image_verdict is lenient on purpose (legacy "any line saying verdict"
+    scan), and that let a blocked skeleton's "no verdict, so this batch will not
+    ship" parse as SHIP (2026-10-10). Here only CANONICAL label lines count, and
+    each must lead with a verdict token, on the label line or (header form) the
+    next non-blank line. Any canonical line that leads with something else
+    ("VERDICT: BLOCKED - nothing should ship") makes the whole file unparseable
+    (None → UNAVAILABLE). Several tokens on one line still resolve to the most
+    blocking, as in _parse_image_verdict, so a rubric echo can't parse as SHIP."""
+    lines = (text or "").splitlines()
+    best, best_rank = None, 0
+    for i, line in enumerate(lines):
+        m = _VERDICT_LABEL_RE.match(line)
+        if not m:
+            continue
+        rest = line[m.end():]
+        if not rest.strip("*_`> \t"):
+            rest = next((ln for ln in lines[i + 1:] if ln.strip()), "")
+        if not _VERDICT_TOKEN_RE.match(rest.lstrip("*_`#> \t")):
+            return None
+        for tok, r in _tokens_in(rest):
+            if r > best_rank:
+                best, best_rank = tok, r
+    return best
+
+
 def run_image_review(mode: str, video: int,
                      manifest_rel: str | None = None) -> tuple[str, str, str]:
     """Dispatch image-reviewer and read back its verdict file.
@@ -1470,7 +1512,10 @@ def run_image_review(mode: str, video: int,
     blocking. "UNAVAILABLE" is the sentinel when the reviewer could not run or
     emitted no parseable VERDICT line — the caller decides fail-open vs fail-closed
     on UNAVAILABLE per its gate.
-    The verdict FILE is the source of truth; stdout is only a fallback parse."""
+    Only the verdict FILE counts, parsed strictly (_parse_gate_verdict); a file
+    whose frontmatter says `status: blocked-*` is UNAVAILABLE before any parsing.
+    stdout is never parsed: a reply like "VERDICT: BLOCKED - nothing should ship"
+    used to parse as SHIP and bill the batch (2026-10-10)."""
     verdict_rel = _image_review_verdict_rel(video)
     agent_file = AGENTS_DIR / f"{IMAGE_REVIEWER_AGENT}.md"
     if not agent_file.exists():
@@ -1505,9 +1550,11 @@ def run_image_review(mode: str, video: int,
     text = ""
     if verdict_abs and verdict_abs.exists():
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
-    verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
+    if _status_blocked(text):
+        return "UNAVAILABLE", verdict_rel, "reviewer wrote status: blocked-* (no verdict)"
+    verdict = _parse_gate_verdict(text)
     if verdict is None:
-        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in file or stdout"
+        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in the verdict file"
     return verdict, verdict_rel, f"{mode} verdict {verdict}"
 
 

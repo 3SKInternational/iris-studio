@@ -632,6 +632,83 @@ class TestImageVerdictParse(unittest.TestCase):
         self.assertIsNone(po._parse_image_verdict("VERDICT: pending review"))
 
 
+class TestImageGateStrictVerdict(unittest.TestCase):
+    """run_image_review bills money on SHIP, so only an explicit VERDICT line in the
+    file counts. Both triggers below parsed as SHIP before 2026-10-10."""
+
+    def _review(self, file_text, stdout=""):
+        saved = (po.AGENTS_DIR, po._run_agent, po.vault_abs)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / f"{po.IMAGE_REVIEWER_AGENT}.md").write_text("stub")
+            verdict_file = d / "verdict.md"
+            if file_text is not None:
+                verdict_file.write_text(file_text)
+            po.AGENTS_DIR = d
+            po._run_agent = lambda cmd, timeout, label: subprocess.CompletedProcess(
+                cmd, 0, stdout=stdout, stderr="")
+            po.vault_abs = lambda rel: verdict_file
+            try:
+                return po.run_image_review("prompts", 3)[0]
+            finally:
+                po.AGENTS_DIR, po._run_agent, po.vault_abs = saved
+
+    def test_blocked_skeleton_is_unavailable(self):
+        txt = ("---\nstatus: blocked-no-manifest\n---\n\n"
+               "Manifest missing: no verdict, so this batch will not ship.\n")
+        self.assertEqual(self._review(txt), "UNAVAILABLE")
+
+    def test_stdout_is_never_parsed(self):
+        clean_skeleton = "---\nstatus: ok\n---\n\n# Image review\n"
+        self.assertEqual(
+            self._review(clean_skeleton, "## VERDICT: BLOCKED - nothing should ship"),
+            "UNAVAILABLE")
+        self.assertEqual(self._review(clean_skeleton, "VERDICT: SHIP"), "UNAVAILABLE")
+        self.assertEqual(self._review(None, "VERDICT: SHIP"), "UNAVAILABLE")
+
+    def test_canonical_line_must_lead_with_a_token(self):
+        self.assertEqual(self._review("## VERDICT: BLOCKED - nothing should ship\n"),
+                         "UNAVAILABLE")
+        # One malformed canonical line poisons the file even beside a good one.
+        self.assertEqual(self._review("## VERDICT: SHIP\n\nVerdict: see below\n"),
+                         "UNAVAILABLE")
+
+    def test_real_verdict_shapes_still_parse(self):
+        ok = "---\nstatus: ok\n---\n\n"
+        self.assertEqual(self._review(ok + "## VERDICT: SHIP\n"), "SHIP")
+        self.assertEqual(self._review(ok + "**VERDICT: HOLD-SPEND** — 3 fixes.\n"),
+                         "HOLD-SPEND")
+        self.assertEqual(self._review(ok + "## Verdict\n\nSHIP\n"), "SHIP")
+        self.assertEqual(self._review(ok + "## Verdict\nHOLD-SPEND\n"), "HOLD-SPEND")
+        # Rubric echo still resolves to the most blocking token, never bare SHIP.
+        self.assertEqual(
+            self._review(ok + "VERDICT: SHIP / SHIP WITH FIXES / HOLD-SPEND / REVISE\n"),
+            "HOLD-SPEND")
+        # Prose and table headers that mention "verdict" are not canonical lines.
+        self.assertEqual(
+            self._review(ok + "Prior verdict in this file: SHIP WITH FIXES\n"
+                         "| Shot | Verdict | Finding |\n## VERDICT: SHIP\n"),
+            "SHIP")
+
+    def test_blocked_status_only_read_from_frontmatter(self):
+        self.assertEqual(self._review("## VERDICT: SHIP\n\nstatus: blocked-x\n"), "SHIP")
+        # No frontmatter, but a markdown rule further down: the body is not frontmatter.
+        self.assertEqual(
+            self._review("# Review\nstatus: blocked-x\n---\n## VERDICT: SHIP\n"), "SHIP")
+        # Empty frontmatter closes at line 2; a later rule doesn't extend it.
+        self.assertEqual(
+            self._review("---\n---\nstatus: blocked-x\n---\n## VERDICT: SHIP\n"), "SHIP")
+        self.assertEqual(self._review("---\nstatus: 'blocked-x'\n---\n## VERDICT: SHIP\n"),
+                         "UNAVAILABLE")
+        # Real reviewer frontmatter: status is NOT the first key (date, type, status).
+        self.assertEqual(self._review("---\ndate: 2026-10-10\ntype: image-review\n"
+                                      "status: blocked-missing-manifest\n---\n"
+                                      "## VERDICT: SHIP\n"), "UNAVAILABLE")
+        self.assertEqual(self._review("---\nStatus: BLOCKED-x\n---\n## VERDICT: SHIP\n"),
+                         "UNAVAILABLE")
+        self.assertEqual(self._review("VERDICT: `SHIP`\n"), "SHIP")
+
+
 class TestRunImageReviewMissingAgent(unittest.TestCase):
     def test_missing_agent_file_is_unavailable_not_crash(self):
         old = po.AGENTS_DIR
