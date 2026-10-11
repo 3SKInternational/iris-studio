@@ -31,6 +31,7 @@ import argparse
 import base64
 import collections
 import difflib
+import fcntl
 import json
 import os
 import re
@@ -574,6 +575,27 @@ def main() -> None:
     # that cannot possibly render must say so now, not after printing a plan and
     # a green spend guard. See preflight_interpreter's docstring.
     preflight_interpreter(provider, args.dry_run)
+
+    # One live run per ledger (2026-10-10). The orchestrator's per-video lock dies
+    # with the orchestrator, but this process does not: when the daemon's 3600 s
+    # cap stops a /pipeline spend-ok mid-batch (real flagship batches run 52-123
+    # min), this run keeps billing and the next spend-ok starts a second one over
+    # the same shots. The cap check below adds this run's estimate to what is
+    # already on the ledger, never the other run's unbilled shots, so that second
+    # run passes while the first is in its first ~$1 or its last ~$1. The kernel
+    # drops this lock however the process exits. Dry runs bill nothing and skip it.
+    # ponytail: one lock for every video; per-video locks if two batches must run at once.
+    if not args.dry_run:
+        lock_path = ledger_path.with_name(ledger_path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)  # ledger_append does the same
+        lock_fh = open(lock_path, "a")  # stays open, and locked, until exit
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            die(f"another live generate_images run (any video) holds {lock_path}. "
+                f"Refusing a second billed run: on the same video both would bill the "
+                f"same shots. Let it finish, then re-run (existing PNGs are skipped). "
+                f"Find it with: lsof {lock_path}")
 
     defaults = manifest.get("defaults", {})
     model = args.model or defaults.get("model", DEFAULT_MODEL)

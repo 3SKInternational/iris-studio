@@ -13,6 +13,7 @@ Telegram out of test runs.
 Run: python3 tests/test_generate_images_policy_cap.py
 """
 
+import fcntl
 import importlib.util
 import json
 import os
@@ -377,6 +378,104 @@ class TestPolicyCapGate(unittest.TestCase):
         self.assertEqual(gi.policy_gate_key("Video_98_Thumbnail_pop", "Video_99"),
                          "Video_98")
         self.assertEqual(gi.policy_gate_key("CTA_outro", "Video_99"), "Video_99")
+
+
+class TestOneLiveRun(unittest.TestCase):
+    """A second live run on the same ledger must refuse while the first is live.
+
+    THE GAP (2026-10-10). The daemon's 3600 s cap SIGTERMs a /pipeline spend-ok
+    mid-batch. The orchestrator dies and its per-video lock goes with it, but
+    generate_images keeps billing. A re-sent spend-ok then starts a second run over
+    the same shots, and the cap check passes it while the first run is in its first
+    or last ~$1, because the cap adds its own estimate to the ledger and never sees
+    the other run's unbilled shots. Real
+    flagship batches run 52-123 min, so the daemon's cap fires on nearly every one.
+    The test process plays the first run by holding the lock itself."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        d = Path(self.dir.name)
+        self.manifest = d / "video_99_hd.json"
+        self.manifest.write_text(json.dumps({
+            "project": "lock-test",
+            "images": [{"name": "Video_99_Shot_01", "prompt": "test shot",
+                        "use_references": False}],
+        }))
+        self.ledger = d / "ledger.jsonl"
+        self.out = d / "out"
+        self.env = {**os.environ, "IRIS_NOTIFY_DISABLE": "1"}
+
+    def _run(self, *extra):
+        # --provider flux: dies before any network call, so this can never bill
+        # (see TestPolicyCapGate._run). A short timeout, because a lock taken
+        # without LOCK_NB would block here instead of refusing.
+        return subprocess.run(
+            [sys.executable, str(_SCRIPT), str(self.manifest),
+             "--output", str(self.out), "--ledger", str(self.ledger),
+             "--provider", "flux", *extra],
+            capture_output=True, text=True, env=self.env, timeout=20)
+
+    def _hold_lock(self):
+        fh = open(f"{self.ledger}.lock", "a")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(fh.close)
+        return fh
+
+    def test_second_live_run_refuses_until_the_first_exits(self):
+        first = self._hold_lock()
+        p = self._run()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("another live generate_images run", p.stderr)
+        self.assertNotIn("spend guard", p.stdout + p.stderr,
+                         "must refuse before the spend guard runs")
+        first.close()                  # the first run exits; the kernel drops its lock
+        p2 = self._run()
+        self.assertIn("spend guard: OK", p2.stdout, p2.stderr)
+
+    def test_dry_run_ignores_the_lock(self):
+        self._hold_lock()
+        p = self._run("--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("dry run:", p.stdout)
+
+    def test_lock_is_held_exclusively_while_billing(self):
+        """Probe the lock from INSIDE the billed loop. The refusal test above holds
+        the lock itself, so it stays green if the run takes LOCK_SH (two real runs
+        would both get it) or drops the lock right after taking it. Here the
+        provider is replaced by a probe ($0: no client is built, no network), which
+        tries a shared lock on a fresh fd and must be refused."""
+        import unittest.mock
+        seen = {}
+
+        def probe(*_a, **_k):
+            fh = open(f"{self.ledger}.lock", "a")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                seen["held"] = False
+            except BlockingIOError:
+                seen["held"] = True
+            finally:
+                fh.close()
+            raise NotImplementedError("probe: no network")
+
+        argv = ["generate_images.py", str(self.manifest), "--output", str(self.out),
+                "--ledger", str(self.ledger), "--provider", "flux"]
+        with unittest.mock.patch.dict(gi.PROVIDERS, {"flux": probe}), \
+                unittest.mock.patch.object(sys, "argv", argv), \
+                unittest.mock.patch.dict(os.environ, {"IRIS_NOTIFY_DISABLE": "1"}):
+            with self.assertRaises(SystemExit):
+                gi.main()
+        self.assertTrue(seen.get("held"),
+                        "the billed loop must run under an EXCLUSIVE lock")
+
+    def test_missing_ledger_dir_does_not_crash(self):
+        """ledger_append creates the ledger's folder; the lock must not trip over a
+        folder that does not exist yet (a FileNotFoundError traceback here)."""
+        self.ledger = Path(self.dir.name) / "new" / "ledger.jsonl"
+        p = self._run()
+        self.assertNotIn("FileNotFoundError", p.stderr)
+        self.assertIn("spend guard: OK", p.stdout, p.stderr)
 
 
 class TestFirstBatchVsReprint(unittest.TestCase):
