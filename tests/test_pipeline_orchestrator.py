@@ -709,6 +709,50 @@ class TestImageGateStrictVerdict(unittest.TestCase):
         self.assertEqual(self._review("VERDICT: `SHIP`\n"), "SHIP")
 
 
+class TestVoGateStrictVerdict(unittest.TestCase):
+    """run_vo_review's SHIP is the go-signal for a billed ElevenLabs render, so it
+    reads the verdict file as strictly as the image gate (2026-10-10)."""
+
+    def _review(self, file_text, stdout=""):
+        saved = (po.AGENTS_DIR, po._run_agent, po.vault_abs)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / f"{po.VO_REVIEWER_AGENT}.md").write_text("stub")
+            verdict_file = d / "verdict.md"
+            if file_text is not None:
+                verdict_file.write_text(file_text)
+            po.AGENTS_DIR = d
+            po._run_agent = lambda cmd, timeout, label: subprocess.CompletedProcess(
+                cmd, 0, stdout=stdout, stderr="")
+            po.vault_abs = lambda rel: verdict_file
+            try:
+                return po.run_vo_review(3, "kit.md")[0]
+            finally:
+                po.AGENTS_DIR, po._run_agent, po.vault_abs = saved
+
+    def test_blocked_status_is_unavailable(self):
+        self.assertEqual(
+            self._review("---\ndate: 2026-10-10\ntype: vo-review\n"
+                         "status: blocked-no-kit\n---\n## VERDICT: SHIP\n"), "UNAVAILABLE")
+        self.assertEqual(
+            self._review("---\nstatus: blocked-no-kit\n---\n"
+                         "No verdict, so this render will not ship.\n"), "UNAVAILABLE")
+
+    def test_stdout_is_never_parsed(self):
+        self.assertEqual(self._review("---\nstatus: ok\n---\n# VO review\n",
+                                      "VERDICT: SHIP"), "UNAVAILABLE")
+        self.assertEqual(self._review(None, "VERDICT: SHIP"), "UNAVAILABLE")
+
+    def test_canonical_line_must_lead_with_a_token(self):
+        self.assertEqual(self._review("## VERDICT: BLOCKED - nothing should ship\n"),
+                         "UNAVAILABLE")
+
+    def test_real_shapes_parse(self):
+        ok = "---\ndate: 2026-10-10\ntype: vo-review\nstatus: ok\n---\n\n"
+        self.assertEqual(self._review(ok + "## VERDICT: SHIP\n"), "SHIP")
+        self.assertEqual(self._review(ok + "**VERDICT: REVISE** — 4 fixes.\n"), "REVISE")
+
+
 class TestRunImageReviewMissingAgent(unittest.TestCase):
     def test_missing_agent_file_is_unavailable_not_crash(self):
         old = po.AGENTS_DIR

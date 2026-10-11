@@ -1947,9 +1947,11 @@ def _vo_review_verdict_rel(video: int) -> str:
 def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
     """Dispatch vo-reviewer on the billed VO kit and read back its BINARY verdict.
     Returns (verdict, vrel, detail): SHIP (clean → safe to render), REVISE (block),
-    or the sentinel UNAVAILABLE (could not run / no parseable VERDICT). Reuses the
-    shared _parse_image_verdict, which also ranks the retired SHIP WITH FIXES token
-    as blocking so a drifting reviewer can't sneak it past. $0 — read-only review."""
+    or the sentinel UNAVAILABLE (could not run / no parseable VERDICT). SHIP is the
+    go-signal for a billed ElevenLabs render, so the verdict FILE is parsed strictly,
+    as the image gate is (_parse_gate_verdict; a `status: blocked-*` file is
+    UNAVAILABLE; stdout is never read). The retired SHIP WITH FIXES token still
+    ranks as blocking. $0 — read-only review."""
     verdict_rel = _vo_review_verdict_rel(video)
     agent_file = AGENTS_DIR / f"{VO_REVIEWER_AGENT}.md"
     if not agent_file.exists():
@@ -1978,9 +1980,11 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
     text = ""
     if verdict_abs and verdict_abs.exists():
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
-    verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
+    if _status_blocked(text):
+        return "UNAVAILABLE", verdict_rel, "reviewer wrote status: blocked-* (no verdict)"
+    verdict = _parse_gate_verdict(text)
     if verdict is None:
-        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in file or stdout"
+        return "UNAVAILABLE", verdict_rel, "no parseable VERDICT line in the verdict file"
     return verdict, verdict_rel, f"VO kit verdict {verdict}"
 
 
