@@ -268,6 +268,140 @@ class TestNotify(_Tmp):
 
 
 # --- main() / run_recovery() orchestration --------------------------------- #
+def _ok_log(log_dir, job, when, extra=""):
+    """Write a claude-code-<job>.log whose last success line is at `when` (local)."""
+    (log_dir / f"claude-code-{job}.log").write_text(
+        f"run_claude_job: '{job}' completed ok at {when:%Y-%m-%d %H:%M} EDT\n{extra}")
+
+
+def _agents(dir_, *jobs):
+    """A LaunchAgents dir holding plists for `jobs` (only those count as real runs)."""
+    dir_.mkdir(exist_ok=True)
+    for j in jobs:
+        (dir_ / f"com.iris.claude-code-{j}.plist").write_text("x")
+    return dir_
+
+
+# --- fleet liveness -------------------------------------------------------- #
+LOCAL_NOW = dt.datetime(2026, 10, 10, 5, 30)
+
+
+class TestFleetLiveness(_Tmp):
+    def setUp(self):
+        super().setUp()
+        self.logs = self.tmp / "logs"; self.logs.mkdir()
+        self.agents = _agents(self.tmp / "agents", "nightly", "pre-brief")
+
+    def last(self):
+        return pr.last_claude_success(self.logs, LOCAL_NOW, self.agents)
+
+    def test_newest_success_across_logs(self):
+        _ok_log(self.logs, "nightly", dt.datetime(2026, 9, 20, 3, 0))
+        _ok_log(self.logs, "pre-brief", dt.datetime(2026, 9, 21, 5, 3))
+        self.assertEqual(self.last(), dt.datetime(2026, 9, 21, 5, 3))
+
+    def test_newest_line_within_one_log(self):
+        (self.logs / "claude-code-nightly.log").write_text(
+            "run_claude_job: 'nightly' completed ok at 2026-09-21 03:05 EDT\n"
+            "run_claude_job: 'nightly' completed ok at 2026-09-19 03:05 EDT\n")
+        self.assertEqual(self.last(), dt.datetime(2026, 9, 21, 3, 5))
+
+    def test_selftest_log_does_not_count(self):
+        _ok_log(self.logs, "nightly", dt.datetime(2026, 9, 21, 3, 0))
+        _ok_log(self.logs, "WRAPPER-SELFTEST", dt.datetime(2026, 10, 10, 5, 0))
+        self.assertEqual(self.last(), dt.datetime(2026, 9, 21, 3, 0))
+
+    def test_non_claude_logs_ignored(self):
+        (self.logs / "job-pipeline-sweep.log").write_text(
+            "run_claude_job: 'x' completed ok at 2026-10-10 05:00 EDT\n")
+        self.assertIsNone(self.last())
+
+    def test_failure_lines_are_not_success(self):
+        (self.logs / "claude-code-nightly.log").write_text(
+            "run_claude_job: 'nightly' AUTH/CREDIT FAILURE at 2026-10-10 03:00 EDT\n"
+            "run_claude_job: 'nightly' completed WITHOUT sentinel at 2026-10-10 03:10 EDT\n"
+            "run_claude_job: 'nightly' INCOMPLETE at 2026-10-10 03:20 EDT\n")
+        self.assertIsNone(self.last())
+
+    def test_job_without_plist_does_not_count(self):
+        # hand tests of run_claude_job.sh (e2ejob, testjob2, ...) write real-looking lines
+        _ok_log(self.logs, "nightly", dt.datetime(2026, 9, 21, 3, 0))
+        _ok_log(self.logs, "e2ejob", dt.datetime(2026, 10, 10, 5, 0))
+        self.assertEqual(self.last(), dt.datetime(2026, 9, 21, 3, 0))
+
+    def test_future_dated_line_ignored(self):
+        (self.logs / "claude-code-nightly.log").write_text(
+            "run_claude_job: 'nightly' completed ok at 2026-09-21 03:00 EDT\n"
+            "run_claude_job: 'nightly' completed ok at 2027-01-01 03:00 EDT\n")
+        self.assertEqual(self.last(), dt.datetime(2026, 9, 21, 3, 0))
+
+    def test_line_exactly_now_counts(self):
+        _ok_log(self.logs, "nightly", LOCAL_NOW)
+        self.assertEqual(self.last(), LOCAL_NOW)
+
+    def test_impossible_date_skipped_not_fatal(self):
+        (self.logs / "claude-code-nightly.log").write_text(
+            "run_claude_job: 'nightly' completed ok at 2026-13-01 00:00 EDT\n"
+            "run_claude_job: 'nightly' completed ok at 2026-09-21 03:00 EDT\n")
+        self.assertEqual(self.last(), dt.datetime(2026, 9, 21, 3, 0))
+
+
+    def test_dark_threshold_edges(self):
+        self.assertIsNone(pr.fleet_dark_hours(LOCAL_NOW - dt.timedelta(hours=47), LOCAL_NOW))
+        self.assertIsNone(pr.fleet_dark_hours(LOCAL_NOW - dt.timedelta(hours=48), LOCAL_NOW))
+        h = pr.fleet_dark_hours(LOCAL_NOW - dt.timedelta(hours=49), LOCAL_NOW)
+        self.assertAlmostEqual(h, 49.0)
+        self.assertEqual(pr.fleet_dark_hours(None, LOCAL_NOW), float("inf"))
+
+    def test_auth_failure_seen_in_recent_tail(self):
+        _ok_log(self.tmp, "nightly", dt.datetime(2026, 9, 21, 3, 0),
+                extra="Failed to authenticate. API Error: 401 OAuth access token has expired.\n")
+        self.assertTrue(pr.auth_failure_seen(self.tmp, dt.datetime.now() - dt.timedelta(hours=24)))
+
+    def test_auth_failure_ignored_in_old_file(self):
+        _ok_log(self.tmp, "nightly", dt.datetime(2026, 9, 21, 3, 0), extra="API Error: 401\n")
+        import os
+        old = (dt.datetime.now() - dt.timedelta(days=3)).timestamp()
+        os.utime(self.tmp / "claude-code-nightly.log", (old, old))
+        self.assertFalse(pr.auth_failure_seen(self.tmp, dt.datetime.now() - dt.timedelta(hours=24)))
+
+    def test_credit_error_counts_as_auth(self):
+        _ok_log(self.tmp, "nightly", dt.datetime(2026, 9, 21, 3, 0),
+                extra="Your account is out of usage credits.\n")
+        self.assertTrue(pr.auth_failure_seen(self.tmp, dt.datetime.now() - dt.timedelta(hours=24)))
+
+    def test_no_auth_failure(self):
+        _ok_log(self.tmp, "nightly", dt.datetime(2026, 9, 21, 3, 0), extra="EPERM on /Volumes\n")
+        self.assertFalse(pr.auth_failure_seen(self.tmp, dt.datetime.now() - dt.timedelta(hours=24)))
+
+    def test_line_wording(self):
+        last = dt.datetime(2026, 9, 21, 5, 33)
+        auth = pr.fleet_dark_line(18 * 24.0, last, True)
+        self.assertIn("FLEET DARK 18.0 days", auth)
+        self.assertIn("since 2026-09-21 05:33", auth)
+        self.assertIn("401", auth)
+        self.assertIn("credit", auth)
+        other = pr.fleet_dark_line(50.0, last, False)
+        self.assertIn("FLEET DARK 2.1 days", other)
+        self.assertIn("Full Disk Access", other)
+        self.assertNotIn("401", other)
+        self.assertIn("no scheduled Claude job has a completed run on record",
+                      pr.fleet_dark_line(float("inf"), None, False))
+
+    def test_ping_throttle(self):
+        state = self.tmp / "s"
+        now = dt.datetime(2026, 10, 10, 9, 30, tzinfo=UTC)
+        self.assertTrue(pr.ping_due(state, now))                      # first dark morning
+        pr.mark_pinged(state, now)
+        self.assertFalse(pr.ping_due(state, now + dt.timedelta(hours=71)))
+        self.assertTrue(pr.ping_due(state, now + dt.timedelta(hours=72)))
+        state.write_text("garbage")
+        self.assertTrue(pr.ping_due(state, now))                      # unreadable -> ping
+        pr.clear_fleet_state(state)
+        self.assertFalse(state.exists())
+        pr.clear_fleet_state(state)                                   # absent is fine
+
+
 class TestMain(_Tmp):
     def _wire(self, stack):
         """Point module globals at tmp paths; stub the pure computations + notify."""
@@ -281,6 +415,15 @@ class TestMain(_Tmp):
         stack.enter_context(mock.patch.object(
             pr, "publish_runway",
             return_value={"runway_days": 0.0, "n_scheduled": 0, "days_dark": 9.0, "n_receipts": 14}))
+        # Hermetic fleet check: a Claude success one hour ago (alive), and a tmp
+        # ping-state file, so these tests never read the real logs or state.
+        logs = self.tmp / "logs"; logs.mkdir()
+        self.fleet_state = self.tmp / "fleet_dark.state"
+        _ok_log(logs, "nightly", dt.datetime.now() - dt.timedelta(hours=1))
+        self.logs = logs
+        stack.enter_context(mock.patch.object(pr, "CLAUDE_LOG_DIR", logs))
+        stack.enter_context(mock.patch.object(pr, "FLEET_STATE", self.fleet_state))
+        stack.enter_context(mock.patch.object(pr, "LAUNCH_AGENTS", _agents(self.tmp / "agents", "nightly")))
         # each test patches open_deadline_due itself (so a hermetic value is used,
         # never the live Decision_Queue).
         return sess, daily, inbox
@@ -346,6 +489,138 @@ class TestMain(_Tmp):
             stack.enter_context(mock.patch.object(pr, "_notify"))
             rc = pr.main(["--today", "2026-01-15"])
             self.assertEqual(rc, pr.EXIT_NOOP)
+
+
+    def _go_dark(self, days=18, extra="Failed to authenticate. API Error: 401\n"):
+        for f in self.logs.iterdir():
+            f.unlink()
+        _ok_log(self.logs, "nightly", dt.datetime.now() - dt.timedelta(days=days), extra=extra)
+
+    def test_fleet_dark_overrides_present_digest_and_pings_once(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark()
+            (sess / "2026-08-31_0030_Nightly_Value_Pulse.md").write_text("x")  # pulse fired
+            notify = stack.enter_context(mock.patch.object(pr, "_notify"))
+            self.assertEqual(pr.main(["--today", "2026-08-31"]), 0)
+            text = inbox.read_text()
+            self.assertIn("FLEET DARK 18", text)
+            self.assertIn("401", text)
+            self.assertNotIn("Deadline", text)           # DQ list dropped in this state
+            self.assertIn("FLEET DARK 18", (daily / "2026-08-31.md").read_text())
+            notify.assert_called_once()
+            self.assertIn("FLEET DARK", notify.call_args[0][0])
+            # same morning re-run, and the next morning: inside 72h -> no second ping
+            pr.main(["--today", "2026-08-31"])
+            pr.main(["--today", "2026-09-01"])
+            notify.assert_called_once()
+            self.assertIn("FLEET DARK", (daily / "2026-09-01.md").read_text())
+
+    def test_fleet_alive_clears_ping_state(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self.fleet_state.write_text("123\n")
+            (sess / "2026-08-31_0030_Nightly_Value_Pulse.md").write_text("x")
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            self.assertEqual(pr.main(["--today", "2026-08-31"]), pr.EXIT_NOOP)
+            self.assertFalse(self.fleet_state.exists())
+
+    def test_fleet_dark_dry_run_writes_nothing(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark()
+            before = inbox.read_text()
+            notify = stack.enter_context(mock.patch.object(pr, "_notify"))
+            self.assertEqual(pr.main(["--today", "2026-08-31", "--dry-run"]), 0)
+            self.assertEqual(inbox.read_text(), before)
+            self.assertFalse((daily / "2026-08-31.md").exists())
+            self.assertFalse(self.fleet_state.exists())
+            notify.assert_not_called()
+
+    def test_unreadable_vault_still_pings(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark()
+            stack.enter_context(mock.patch.object(pr, "INBOX", self.tmp / "missing" / "INBOX.md"))
+            notify = stack.enter_context(mock.patch.object(pr, "_notify"))
+            self.assertEqual(pr.main(["--today", "2026-08-31"]), 0)
+            notify.assert_called_once()
+            self.assertTrue(self.fleet_state.exists())
+
+    def test_recovery_clears_stale_fleet_block(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark()
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            pr.main(["--today", "2026-08-31"])
+            self.assertIn("FLEET DARK", inbox.read_text())
+            # next day: a fresh success and the pulse fired
+            _ok_log(self.logs, "nightly", dt.datetime.now() - dt.timedelta(hours=1))
+            (sess / "2026-09-01_0030_Nightly_Value_Pulse.md").write_text("x")
+            self.assertEqual(pr.main(["--today", "2026-09-01"]), pr.EXIT_NOOP)
+            text = inbox.read_text()
+            self.assertNotIn("FLEET DARK", text)
+            self.assertIn("✅ Fleet back", text)
+            self.assertEqual(text.count(pr.INBOX_BEGIN), 1)
+
+    def test_recovery_leaves_pulse_missed_block_alone(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            stack.enter_context(mock.patch.object(pr, "open_deadline_due", return_value=([], None)))
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            pr.main(["--today", "2026-08-31"])                       # alive, pulse missed
+            before = inbox.read_text()
+            (sess / "2026-09-01_0030_Nightly_Value_Pulse.md").write_text("x")
+            pr.main(["--today", "2026-09-01"])
+            self.assertEqual(inbox.read_text(), before)
+
+    def test_fleet_dark_heading_is_the_headline(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark()
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            pr.main(["--today", "2026-08-31"])
+            self.assertIn("\n## 🚨 FLEET DARK 18.0 days (2026-08-31)\n", inbox.read_text())
+
+    def test_auth_error_older_than_24h_is_not_blamed(self):
+        # A 401 in a log last written 24.5h ago is stale: the cause line must not
+        # claim auth. Pins the 24h look-back window.
+        import contextlib, os
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark()
+            old = (dt.datetime.now() - dt.timedelta(hours=24, minutes=30)).timestamp()
+            os.utime(self.logs / "claude-code-nightly.log", (old, old))
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            pr.main(["--today", "2026-08-31"])
+            self.assertNotIn("401", inbox.read_text())
+            self.assertIn("Full Disk Access", inbox.read_text())
+
+    def test_dry_run_while_alive_keeps_ping_state(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self.fleet_state.write_text("123\n")
+            stack.enter_context(mock.patch.object(pr, "open_deadline_due", return_value=([], None)))
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            pr.main(["--today", "2026-08-31", "--dry-run"])
+            self.assertTrue(self.fleet_state.exists())
+
+    def test_fleet_dark_without_auth_error_names_other_causes(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            sess, daily, inbox = self._wire(stack)
+            self._go_dark(days=3, extra="")
+            stack.enter_context(mock.patch.object(pr, "_notify"))
+            pr.main(["--today", "2026-08-31"])
+            self.assertIn("Full Disk Access", inbox.read_text())
 
 
 if __name__ == "__main__":

@@ -29,6 +29,14 @@ HARD CONSTRAINTS (from the pickup spec):
     MUST NOT write anything matching `*Nightly_Value_Pulse*.md` (Pass 17 keys off
     that glob — a forged digest blinds it to real misses forever).
 
+FLEET DARK (added 2026-10-10, DQ-49 follow-up): this is a shell job, so it
+survives the faults that kill every Claude job (expired auth, Full Disk Access
+revoked, Mac asleep). From 9/22 to 10/09 it was the only thing writing to the
+vault and it said "pulse missed" for 18 days. Now it first checks when a
+scheduled Claude job last finished (`run_claude_job.sh`'s "completed ok" log
+line). Over 48h ago -> it reports FLEET DARK every morning, pulse digest or
+not, and pings Telegram on the first dark morning and then every 72h.
+
 Stdlib-only. Reuses stale_on_you.parse_decision_queue() as the canonical DQ open-row
 parser (a second parser would disagree, and every disagreement is a silent bypass).
 """
@@ -57,6 +65,12 @@ INBOX_END = "<!-- PULSE_RECOVERY:END -->"
 INBOX_ANCHOR = "<!-- C2_STALE_ON_YOU:END -->"
 DAILY_MARKER = "<!-- pulse-recovery-ran -->"
 DAILY_HEADING = "## 🤖 Claude Code intra-day log"
+
+CLAUDE_LOG_DIR = Path("/Users/steve/iris_studio/logs")
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+FLEET_STATE = Path("/Users/steve/iris_studio/state/fleet_dark.state")  # last ping epoch
+FLEET_DARK_HOURS = 48
+FLEET_PING_EVERY_HOURS = 72
 
 EXIT_NOOP = 75  # EX_TEMPFAIL — digest present, nothing to do (run_job stays silent)
 
@@ -149,6 +163,171 @@ def open_deadline_due(today: str) -> tuple[list[str], str | None]:
     except Exception as e:  # noqa: BLE001 — degrade the sweep, don't kill the net
         return [], f"deadline sweep unavailable ({type(e).__name__})"
     return deadline_due_ids(parse_decision_queue(), today), None
+
+
+# --------------------------------------------------------------------------- #
+# fleet liveness — has any scheduled Claude job finished recently?
+# --------------------------------------------------------------------------- #
+def _ok_regex() -> re.Pattern:
+    """The success-line regex overnight_selfcheck.py already uses, so the two
+    watchdogs can never disagree about what counts as a completed run."""
+    sys.path.insert(0, str(SCRIPT_DIR))  # mutequiv: index 0 vs 1 resolves the same import ahead of site-packages
+    from overnight_selfcheck import _SENTINEL
+    return _SENTINEL
+
+
+def _claude_logs(log_dir: Path) -> list[Path]:
+    # SELFTEST logs come from wrapper tests, not real runs; a success line there
+    # would hide a dark fleet.
+    return [f for f in sorted(log_dir.glob("claude-code-*.log")) if "SELFTEST" not in f.name]
+
+
+def last_claude_success(log_dir: Path, now_local: dt.datetime,
+                        agents_dir: Path | None = None) -> dt.datetime | None:
+    """Local time of the newest "completed ok" line run_claude_job.sh wrote, or None.
+    These logs are never rotated, so one bad line stays forever: unparseable
+    and future-dated timestamps are skipped, and only jobs with an installed
+    launchd plist count (hand tests of the wrapper write real-looking lines)."""
+    agents_dir = LAUNCH_AGENTS if agents_dir is None else agents_dir
+    ok_re = _ok_regex()
+    newest = None
+    for f in _claude_logs(log_dir):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in ok_re.finditer(text):
+            if not (agents_dir / f"com.iris.claude-code-{m.group('job')}.plist").exists():
+                continue
+            try:
+                t = dt.datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+            if t > now_local:
+                continue
+            if newest is None or t > newest:
+                newest = t
+    return newest
+
+
+def fleet_dark_hours(last_ok: dt.datetime | None, now_local: dt.datetime) -> float | None:
+    """Hours since the last Claude success if past FLEET_DARK_HOURS (or no success
+    on record at all, reported as inf); None while the fleet is alive."""
+    if last_ok is None:
+        return float("inf")
+    hours = (now_local - last_ok).total_seconds() / 3600
+    return hours if hours > FLEET_DARK_HOURS else None
+
+
+def auth_failure_seen(log_dir: Path, since: dt.datetime) -> bool:
+    """True if a Claude log written since `since` ends with an auth/credit error."""
+    for f in _claude_logs(log_dir):
+        try:
+            if dt.datetime.fromtimestamp(f.stat().st_mtime) < since:
+                continue
+            with f.open("rb") as fh:
+                fh.seek(max(0, f.stat().st_size - 4096))  # mutequiv: 0/4096 ±1 shift the tail window by one byte; an error line is never exactly at its edge
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if re.search(r"API Error: 40[13]|Failed to authenticate|out of usage credits", tail):
+            return True
+    return False
+
+
+def fleet_dark_line(hours: float, last_ok: dt.datetime | None, auth_seen: bool) -> str:
+    if last_ok is None:
+        head = "🚨 FLEET DARK — no scheduled Claude job has a completed run on record."
+    else:
+        head = (f"🚨 FLEET DARK {hours / 24:.1f} days — no scheduled Claude job has "
+                f"completed since {last_ok:%Y-%m-%d %H:%M}.")
+    if auth_seen:
+        cause = ("Logs show auth or credit errors (401/403/out of credits). The auth-canary "
+                 "alert names the fix for the credential in use (setup-token or "
+                 "`claude auth login`).")
+    else:
+        cause = ("No auth error in the logs. Check ~/iris_studio/logs/claude-code-*.log. "
+                 "Past causes: Full Disk Access revoked by a cask upgrade, Mac asleep, "
+                 "vault unreadable.")
+    return f"{head} {cause}"
+
+
+def ping_due(state_path: Path, now: dt.datetime) -> bool:
+    """First dark morning, then every FLEET_PING_EVERY_HOURS."""
+    try:
+        last = float(state_path.read_text().strip())
+    except (OSError, ValueError):
+        return True
+    return now.timestamp() - last >= FLEET_PING_EVERY_HOURS * 3600
+
+
+def mark_pinged(state_path: Path, now: dt.datetime) -> None:
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(f"{now.timestamp():.0f}\n")
+    except OSError as e:
+        _log(f"could not write {state_path}: {e}")
+
+
+def clear_fleet_state(state_path: Path) -> None:
+    """Fleet is alive again: the next dark spell pings on its first morning."""
+    try:
+        state_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        _log(f"could not clear {state_path}: {e}")
+
+
+def run_fleet_dark(today: str, now: dt.datetime, line: str, *, dry_run: bool) -> int:
+    """Replace the usual recovery stub: one line, one action. The DQ-id list is
+    dropped on purpose (it repeated unchanged for 18 days next to the real fault)."""
+    block = "\n".join([
+        INBOX_BEGIN,
+        f"## {line.split(' — ')[0]} ({today})",
+        "",
+        line,
+        "",
+        "_From `scripts/pulse_recovery.py`, a shell job that keeps running when every "
+        "Claude job is down._",
+        "",
+        INBOX_END,
+    ])
+    if dry_run:
+        print(block)
+        print(f"\n[dry-run] daily marker would read: {line}")
+        print(f"[dry-run] ping due: {ping_due(FLEET_STATE, now)}")
+        return 0
+    _log(line)
+    # Ping BEFORE the vault writes: "vault unreadable" is one of the faults this
+    # reports, and it must not stop the report.
+    if ping_due(FLEET_STATE, now):
+        _notify(line)
+        mark_pinged(FLEET_STATE, now)
+    try:
+        upsert_inbox_block(INBOX, block)
+        append_daily_marker(DAILY_DIR / f"{today}.md", when=now.astimezone().strftime("%H:%M"), summary=line)
+    except OSError as e:
+        _log(f"vault write failed ({e}); Telegram ping was the report")
+    return 0
+
+
+def clear_stale_fleet_block(inbox_path: Path, last_ok: dt.datetime) -> bool:
+    """Fleet alive again: swap a leftover FLEET DARK block for a one-line all-clear,
+    so INBOX never shows an outage that has ended."""
+    try:
+        text = inbox_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    m = re.search(re.escape(INBOX_BEGIN) + r".*?" + re.escape(INBOX_END), text, re.DOTALL)
+    if not m or "FLEET DARK" not in m.group(0):
+        return False
+    block = "\n".join([INBOX_BEGIN, f"✅ Fleet back: a scheduled Claude job completed at "
+                        f"{last_ok:%Y-%m-%d %H:%M}.", INBOX_END])
+    try:
+        return upsert_inbox_block(inbox_path, block)
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +453,18 @@ def main(argv: list[str] | None = None) -> int:
 
     now = dt.datetime.now(dt.timezone.utc)
     today = a.today or dt.datetime.now().strftime("%Y-%m-%d")
+
+    # Fleet first, and regardless of the pulse digest: a Cowork pulse that fired
+    # says nothing about whether Claude Code is alive.
+    now_local = dt.datetime.now()
+    last_ok = last_claude_success(CLAUDE_LOG_DIR, now_local)
+    hours = fleet_dark_hours(last_ok, now_local)
+    if hours is not None:
+        auth_seen = auth_failure_seen(CLAUDE_LOG_DIR, now_local - dt.timedelta(hours=24))
+        return run_fleet_dark(today, now, fleet_dark_line(hours, last_ok, auth_seen), dry_run=a.dry_run)
+    if not a.dry_run:
+        clear_fleet_state(FLEET_STATE)
+        clear_stale_fleet_block(INBOX, last_ok)
 
     if not a.force_miss:
         digest = find_pulse_digest(SESSIONS_DIR, today)
