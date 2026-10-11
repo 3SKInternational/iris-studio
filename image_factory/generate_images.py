@@ -54,11 +54,15 @@ LEDGER_DEFAULT = Path(__file__).resolve().parent / "cost_ledger.jsonl"
 # error (measured: cents on the with-refs flagship path) — the next run sees
 # the true total. LOCKED VALUE: changing it requires a Decisions_Log why-stub
 # in the same session (CLAUDE.md rule, 2026-07-08).
-POLICY_CAP_USD = 9.0
+# Raised $9 -> $11 on 2026-10-10 (Steve): 75-95 shots at the measured ~$0.128 a
+# shot overran $9, and ~85 shots fit $11 while dwell stays in the 8-12 s band.
+# Why-stub: 06_CEO/Decisions_Log/2026-10-10_image_spend_cap_11.md.
+POLICY_CAP_USD = 11.0
 # Reprint budget, held back from the cap above (Steve, 2026-07-27). The FIRST batch
 # for a video may spend up to POLICY_CAP_USD; any later run — a regen after the
 # contact-sheet review, a fixup, a thumbnail redo — is a REPRINT and may add at most
-# REPRINT_CAP_USD, with the absolute per-video ceiling at the sum ($10).
+# REPRINT_CAP_USD, with the absolute per-video ceiling at the sum ($12 since
+# 2026-10-10; $10 when the split was made).
 # WHY the split: a single $10 cap could be consumed entirely by pass 1, leaving zero
 # budget to fix the shots that review then rejects — the money ran out exactly when
 # it was needed most. V14 surfaced it: a 102-shot first batch estimated $12.65, and
