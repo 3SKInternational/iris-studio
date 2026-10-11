@@ -420,17 +420,22 @@ CLAUDE_CLI_PATH = (
 # deliverable into. Deliverable detection scans that dir for files modified after
 # dispatch start; if none, it falls back to the newest file modified anywhere in
 # the vault during the run, then to the subagent's stdout. Timeouts per the
-# architecture doc's "Per-agent timeouts" table.
+# architecture doc's "Per-agent timeouts" table, with one floor: no timeout may sit
+# below a budget scripts/pipeline_orchestrator.py gives the same agent, since a
+# Telegram dispatch does the same work. tests/test_pipeline_subprocess_timeout.py
+# fails when one does.
 DISPATCH_AGENTS: dict[str, dict] = {
     "market-researcher": {
         "timeout_seconds": 1800,  # 30 min — multi-source web research is slow
         "deliverable_dir": "05_Research_and_Intelligence/Research_Reports",
     },
     "scriptwriter": {
-        # 20 min — bumped 2026-05-30 from 10 min after a flagship dispatch hit
-        # the cap. The original 10-min figure was a design-doc estimate; reality
-        # for a 2,250-word structured draft + 3 reference reads runs longer.
-        "timeout_seconds": 1200,
+        # 40 min, raised from 20 (2026-10-10) to match pipeline stage 1_script, which
+        # went to 2400s after V14's drafts ran past 1200s twice. The orchestrator's
+        # script fixer runs this agent on the same budget. (10 → 20 min on 2026-05-30
+        # after a flagship dispatch hit the 10-min cap.)
+        # mutequiv: 2400 vs 2401s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 2400,
         "deliverable_dir": "BRANDS/3SK_Finance/Scripts",
     },
     # --- Added 2026-06-18: the skeptical reviewer pair for scriptwriter. ---
@@ -438,7 +443,11 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # reads it (PASS/REVISE per dimension + line-level fixes). Pairs with
     # scriptwriter exactly as skeptical-code-reviewer pairs with senior-engineer.
     "script-reviewer": {
-        "timeout_seconds": 480,  # 8 min — read-only single-pass critique, no web
+        # 30 min, raised from 8 (2026-10-10) to match pipeline stage 2_review. A
+        # flagship review reads the whole script plus canon: V14's timed out at 480s
+        # with 0-byte agent logs, and the stage went to 1800s on 2026-07-27.
+        # mutequiv: 1800 vs 1801s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 1800,
         "deliverable_dir": "BRANDS/3SK_Finance/Scripts/_REVIEW_PREP",
     },
     "thumbnail-coordinator": {
@@ -470,8 +479,11 @@ DISPATCH_AGENTS: dict[str, dict] = {
     },
     # --- Added 2026-05-30: 4 vault-native agents (the "easy adds" pass) ---
     "scene-image-prompt-generator": {
-        # mutequiv: 600 vs 601s dispatch timeout is a tunable knob, no exact-value contract
-        "timeout_seconds": 600,  # 10 min — Sonnet, mechanical 5-field transformation
+        # 15 min, raised from 10 (2026-10-10) to match the orchestrator, which gives
+        # this agent IMAGE_REVIEW_TIMEOUT (900s) to fix a manifest at the PROMPTS gate.
+        # A Telegram dispatch writes prompts for every scene, which is no less work.
+        # mutequiv: 900 vs 901s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 900,  # Sonnet, mechanical 5-field transformation
         "deliverable_dir": "BRANDS/3SK_Finance/Scene_Image_Prompts",
     },
     "video-description-writer": {
@@ -620,7 +632,11 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # cron. Dedicated dir _VO_Review_Prep (NOT script-reviewer's _REVIEW_PREP) to
     # avoid the newest-in-window mis-attribution between the two reviewers.
     "vo-reviewer": {
-        "timeout_seconds": 600,  # 10 min — read-only single-pass VO critique, no web
+        # 15 min, raised from 10 (2026-10-10) to match the orchestrator's
+        # VO_REVIEW_TIMEOUT: a cold dispatch can pass 600s while a billed render or
+        # assemble saturates the CPU.
+        # mutequiv: 900 vs 901s dispatch timeout is a tunable knob, no exact-value contract
+        "timeout_seconds": 900,  # read-only single-pass VO critique, no web
         "deliverable_dir": "BRANDS/3SK_Finance/Scripts/_VO_Review_Prep",
     },
     # newsletter-writer: turns a published video into a Beehiiv newsletter issue
@@ -785,14 +801,14 @@ Available subagents (agent_name -> what it does):
   a YouTube Studio analytics-export CSV path OR a pasted metrics block in the
   prompt (no live API until YouTube OAuth lands) — best invoked interactively /
   from Cowork with the export, not a bare Telegram message. ~12 min.
-- `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. ~20 min.
+- `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. Up to ~40 min.
 - `script-reviewer` — skeptical second pass on a drafted script before Steve reads
   it (voice, banned vocab, number-spine, hook, VO density, structure/CTA, moat,
   scene-field baked text, sibling duplication).
   Read-only — writes a review, never edits the script. Dispatch right after
-  scriptwriter. ~8 min.
+  scriptwriter. Up to ~30 min.
 - `scene-image-prompt-generator` — turns a script's scene blocks into paste-ready
-  ChatGPT 5-field SCENE PROMPTs + verbatim Master Character Prompt v3. ~10 min.
+  ChatGPT 5-field SCENE PROMPTs + verbatim Master Character Prompt v3. Up to ~15 min.
 - `video-description-writer` — drafts a YouTube upload pack from a finished script
   (description, chapter timestamps, affiliate disclosure, hashtags, pinned). ~10 min.
 - `thumbnail-coordinator` — turns a script into a thumbnail brief (image-gen

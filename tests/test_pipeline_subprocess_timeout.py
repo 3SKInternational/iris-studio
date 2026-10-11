@@ -17,18 +17,24 @@ with a bounded timeout, mirroring `_run_dispatch`'s pattern.
 Imports the REAL iris.py (module-stubbing pattern from
 tests/test_ceo_brief_recency.py — see that file for why each stub exists).
 
+Also holds the dispatch-timeout floor (TestDispatchTimeoutCoversPipelineBudget):
+iris.py's per-agent timeouts against the orchestrator's budgets for the same agents.
+
 Run: python3 tests/test_pipeline_subprocess_timeout.py
 """
+import ast
 import asyncio
 import importlib
 import importlib.util
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -77,6 +83,9 @@ def _load_iris():
 
 
 iris = _load_iris()
+
+sys.path.insert(0, str(REPO / "scripts"))
+import pipeline_orchestrator as po  # noqa: E402  (stdlib only, no import side effects)
 
 
 class _CapturingTelegram:
@@ -317,6 +326,66 @@ class TestRunnersShareTheHelper(unittest.TestCase):
         self.assertIn("--advance-all", cmd)
         self.assertNotIn("--video", cmd)
         self.assertEqual(label, "/pipeline all advance")
+
+
+class TestDispatchTimeoutCoversPipelineBudget(unittest.TestCase):
+    """A Telegram /agent dispatch must get at least the time the pipeline gives the
+    same agent. The two are separate copies and they drifted: script-reviewer 480 vs
+    2_review 1800, scriptwriter 1200 vs 1_script 2400, vo-reviewer and
+    scene-image-prompt-generator 600 vs 900, packaging-strategist 480 vs 1800 (fixed
+    in 5a9f9cd after it timed out 3x on V13/V14).
+
+    The pipeline side is measured, not retyped: every orchestrator dispatch site is
+    driven with _run_agent stubbed, recording the timeout the code really passes. A
+    site this test does not drive fails the completeness check, so a new review gate
+    cannot add a budget nobody compares."""
+
+    def test_every_shared_agent_gets_at_least_the_pipeline_budget(self):
+        budgets, sites = {}, set()
+
+        def fake_run_agent(cmd, timeout, label):
+            agent = cmd[cmd.index("--agent") + 1]
+            budgets[agent] = max(budgets.get(agent, 0), timeout)
+            sites.add(sys._getframe(1).f_code.co_name)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        # Every dispatch site checks AGENTS_DIR/<agent>.md first, so give each a stub.
+        names = {c["agent"] for c in po.RUN_TABLE.values() if c["agent"]}
+        names |= {c[r] for c in po.STAGE_REVIEW.values() for r in ("reviewer", "fixer")}
+        names |= {v for k, v in vars(po).items() if k.endswith("_AGENT") and isinstance(v, str)}
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(po, "_run_agent", fake_run_agent), \
+                mock.patch.object(po, "AGENTS_DIR", Path(td)), \
+                mock.patch.object(po, "STATE_DIR", Path(td)), \
+                mock.patch.object(po, "CLAUDE_CLI_PATH", "/nonexistent/claude-must-not-run"):
+            for name in names:
+                (Path(td) / f"{name}.md").write_text("---\ntools: Read\n---\n")
+            for key, cfg in po.RUN_TABLE.items():
+                if cfg["agent"]:
+                    po._dispatch_stage_agent(key, 99)
+            for key in po.STAGE_REVIEW:
+                po.run_stage_review(key, 99)
+                po.run_stage_fixer(key, 99, "verdict.md")
+            po.run_script_review(99)
+            po.run_script_fixer(99, "verdict.md")
+            po.run_image_review("prompts", 99)
+            po.run_prompt_fixer(99, "verdict.md", "manifest.json")
+            po.run_vo_review(99, "kit.md")
+
+        tree = ast.parse(Path(po.__file__).read_text(encoding="utf-8"))
+        callers = {f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                   and any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_run_agent"
+                           for n in ast.walk(f))}
+        self.assertEqual(callers - sites, set(),
+                         "these orchestrator functions dispatch agents but this test does "
+                         "not drive them, so their timeouts go unchecked: add a call above")
+
+        shared = budgets.keys() & iris.DISPATCH_AGENTS.keys()
+        self.assertTrue(shared, "no agent is in both tables, so this compares nothing")
+        low = {a: (iris.DISPATCH_AGENTS[a]["timeout_seconds"], budgets[a]) for a in shared
+               if iris.DISPATCH_AGENTS[a]["timeout_seconds"] < budgets[a]}
+        self.assertEqual(low, {}, "iris.py DISPATCH_AGENTS timeout below the pipeline's "
+                                  "budget for the same agent, as {agent: (iris.py, pipeline)}")
 
 
 if __name__ == "__main__":
