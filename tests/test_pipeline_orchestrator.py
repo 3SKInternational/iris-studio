@@ -1311,6 +1311,19 @@ class TestAnalyzeWaitsForData(unittest.TestCase):
                                          also="2026-10-12_video16-analysis.md")
         self.assertTrue(ok, msg)
 
+    def test_zero_padded_name_is_this_video(self):
+        # "video015" is video 15: the 0* in the name match must keep it.
+        (ok, msg), reviewed = self._gate("---\nstatus: ok\n---\nCTR 4.1%",
+                                         also="2026-10-12_video015-analysis.md")
+        self.assertFalse(ok)
+        self.assertIn("video015", msg)
+
+    def test_longer_number_is_another_video(self):
+        # "video150" is not video 15: the (?!\d) in the name match must drop it.
+        (ok, msg), reviewed = self._gate("---\nstatus: ok\n---\nCTR 4.1%",
+                                         also="2026-10-12_video150-analysis.md")
+        self.assertTrue(ok, msg)
+
     def test_real_analysis_goes_to_review(self):
         (ok, msg), reviewed = self._gate("---\nstatus: ok\n---\nCTR 4.1%")
         self.assertTrue(ok, msg)
