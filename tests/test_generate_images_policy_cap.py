@@ -547,5 +547,105 @@ class TestFirstBatchVsReprint(unittest.TestCase):
         self.assertAlmostEqual(gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD, 12.0)
 
 
+class TestResumeSameManifest(unittest.TestCase):
+    """A part-done first batch resumes against the first-batch cap (2026-10-10).
+
+    A first batch stopped part way (time cap, dead parent, daemon restart) has
+    billed over the reprint cap, so first_batch_done() called it finished and the
+    resume was refused above $1: the batch could not finish through spend-ok, only
+    with --over-cap-ok. A re-run of the SAME manifest now spends what is left of
+    POLICY_CAP_USD. Images cost ~$0.095 each here (no refs). Seeds sit $4 under the
+    cap, so these hold whatever POLICY_CAP_USD is set to."""
+
+    PART = gi.POLICY_CAP_USD - 4.00                      # a part-done first batch
+
+    setUp = TestPolicyCapGate.setUp
+    _run = TestPolicyCapGate._run
+    _widen_manifest = TestPolicyCapGate._widen_manifest
+
+    def _seed_batch(self, manifest, amount, shot="Video_99_Shot_00", **extra):
+        self.ledger.write_text(json.dumps(
+            {"video": "video_99_hd", "manifest": manifest,
+             "shot": shot, "cost_usd": amount, **extra}) + "\n")
+
+    def _out(self, n, *extra):
+        self._widen_manifest(n)
+        p = self._run("--max-images", "150", "--max-cost", "99", *extra)
+        return p.stdout + p.stderr
+
+    def test_resume_of_same_manifest_uses_the_first_batch_cap(self):
+        self._seed_batch(self.manifest.name, self.PART)
+        out = self._out(40)                              # ~$3.80: fits the $4 left
+        self.assertIn("spend guard: OK", out)
+        self.assertNotIn("reprint limit", out)
+
+    def test_same_spend_from_another_manifest_is_a_reprint(self):
+        self._seed_batch("video_99_other.json", self.PART)
+        out = self._out(40)
+        self.assertIn("reprint limit", out)
+
+    def test_resume_past_the_first_batch_cap_is_judged_as_a_reprint(self):
+        self._seed_batch(self.manifest.name, self.PART)
+        out = self._out(45)                              # ~$4.28: over the $4 left
+        self.assertIn("reprint limit", out)
+
+    def test_finished_batch_keeps_its_reprint_allowance(self):
+        # Same manifest, already at the cap: a small regen is still a $1 reprint,
+        # not refused for passing the first-batch cap.
+        self._seed_batch(self.manifest.name, gi.POLICY_CAP_USD)
+        out = self._out(1)
+        self.assertIn("spend guard: OK", out)
+
+    def test_force_reroll_of_the_first_batch_manifest_is_a_reprint(self):
+        """Re-rolls reuse the first batch's manifest name (V10/V11/V13 ledger rows).
+        Judged by name alone, a --force re-roll passed as a resume with no $1 limit
+        and no ping (review H1, 2026-10-10)."""
+        self._seed_batch(self.manifest.name, self.PART)
+        out = self._out(40, "--force")
+        self.assertIn("reprint limit", out)
+
+    def test_dry_run_labels_a_force_reroll_as_a_reprint(self):
+        # The dry run must say what the live gate will do (review round 2).
+        self._seed_batch(self.manifest.name, self.PART)
+        out = self._out(40, "--force", "--dry-run")
+        self.assertIn("REPRINT", out)
+        self.assertIn("OVER", out)
+
+    def test_rebilling_an_already_rendered_shot_is_a_reprint(self):
+        # PNG deleted, no --force: Shot_01 already has a saved render on the ledger.
+        self._seed_batch(self.manifest.name, self.PART, shot="Video_99_Shot_01")
+        out = self._out(40)
+        self.assertIn("reprint limit", out)
+
+    def test_a_shot_that_billed_but_never_saved_still_resumes(self):
+        self._seed_batch(self.manifest.name, self.PART, shot="Video_99_Shot_01",
+                         saved=False)
+        out = self._out(40)
+        self.assertIn("spend guard: OK", out)
+        self.assertNotIn("reprint limit", out)
+
+    def test_ceiling_still_holds_for_a_resume(self):
+        self._seed_batch(self.manifest.name, gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD)
+        out = self._out(1)
+        self.assertIn("--over-cap-ok", out)
+
+    def test_dry_run_labels_a_resume_as_first_batch(self):
+        self._seed_batch(self.manifest.name, self.PART)
+        out = self._out(40, "--dry-run")
+        self.assertIn("[first batch]", out)
+        self.assertNotIn("OVER", out)
+
+    def test_is_reprint_unit(self):
+        self._seed_batch("a.json", self.PART)
+        r = gi.is_reprint
+        self.assertFalse(r(self.ledger, "Video_99", self.PART, 4.00, "a.json", False))
+        self.assertTrue(r(self.ledger, "Video_99", self.PART, 4.00, "a.json", True))
+        self.assertTrue(r(self.ledger, "Video_99", self.PART, 4.01, "a.json", False))
+        self.assertTrue(r(self.ledger, "Video_99", self.PART, 0.10, "b.json", False))
+        self.assertFalse(r(self.ledger, "Video_98", 0.0, 8.0, "b.json", False))
+        self.assertFalse(r(self.ledger, "Video_98", 0.0, 8.0, "b.json", True),
+                         "a --force first batch on a fresh video is still a first batch")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

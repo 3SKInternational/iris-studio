@@ -341,8 +341,9 @@ def policy_gate_key(image_name: str, manifest_video: str) -> str:
     return f"Video_{int(m.group(1)):02d}" if m else manifest_video
 
 
-def load_render_counts(ledger_path: Path, video: str) -> dict:
-    """shot -> times already billed for THIS video, so a repeat render is flagged."""
+def load_render_counts(ledger_path: Path, video: str, saved_only: bool = False) -> dict:
+    """shot -> times already billed for THIS video, so a repeat render is flagged.
+    saved_only skips rows whose PNG failed to save (`saved: false`)."""
     counts: dict = {}
     if not ledger_path.exists():
         return counts
@@ -356,6 +357,8 @@ def load_render_counts(ledger_path: Path, video: str) -> dict:
             continue  # ponytail: tolerate a torn last line, never crash the batch on it
         # canonical_video, not raw rec['video']: a fixup/regen manifest's rows must
         # count as re-renders of the SAME video (pre-fix keys fragmented this).
+        if saved_only and rec.get("saved") is False:
+            continue
         if canonical_video(rec) == video and rec.get("shot"):
             counts[rec["shot"]] = counts.get(rec["shot"], 0) + 1
     return counts
@@ -410,7 +413,8 @@ def load_video_batches(ledger_path: Path, video: str) -> dict:
     return batches
 
 
-def first_batch_done(ledger_path: Path, video: str) -> bool:
+def first_batch_done(ledger_path: Path, video: str,
+                     exclude_manifest: str | None = None) -> bool:
     """Has this video already had its REAL first batch?
 
     True iff some prior manifest billed MORE than the reprint cap. Anything at or
@@ -430,8 +434,36 @@ def first_batch_done(ledger_path: Path, video: str) -> bool:
     video has $0 prior ledger spend ... bounded by POLICY_CAP_USD alone") without
     the smoke test counting as spend. The absolute ceiling is untouched:
     POLICY_CAP_USD + REPRINT_CAP_USD.
+
+    exclude_manifest skips that manifest's rows (see is_reprint).
     """
-    return any(v > REPRINT_CAP_USD for v in load_video_batches(ledger_path, video).values())
+    return any(v > REPRINT_CAP_USD for m, v in load_video_batches(ledger_path, video).items()
+               if m != exclude_manifest)
+
+
+def is_reprint(ledger_path: Path, video: str, prior: float, add: float,
+               manifest_name: str, rebills: bool) -> bool:
+    """Is this run a REPRINT (limit REPRINT_CAP_USD) rather than the first batch?
+
+    A reprint when ANOTHER manifest already billed the first batch, or when this
+    manifest did and the run does not fit what is left of POLICY_CAP_USD.
+
+    The second half is the resume rule (2026-10-10). A first batch that stopped part
+    way (killed at a time cap, a dead parent, a daemon restart) has billed over the
+    reprint cap, so it counted as done and the resume was refused above $1, though
+    the batch as a whole stayed under POLICY_CAP_USD. Re-running the SAME manifest
+    now spends the rest of the first-batch cap. A same-manifest run that would pass
+    POLICY_CAP_USD is still judged as a reprint, so a regen of a finished batch keeps
+    its $1 allowance. The ceiling, POLICY_CAP_USD + REPRINT_CAP_USD, does not move.
+
+    rebills: this run bills a shot the ledger already has a saved render of, or runs
+    with --force. That is a re-roll, never a resume, whatever the file name: re-rolls
+    of the first batch reuse its manifest (V10, V11, V13 and V12 have such rows), so
+    the name alone would let them skip the $1 limit and its ping.
+    """
+    if first_batch_done(ledger_path, video, exclude_manifest=manifest_name):
+        return True
+    return first_batch_done(ledger_path, video) and (rebills or prior + add > POLICY_CAP_USD)
 
 
 def notify(msg: str) -> None:
@@ -742,6 +774,8 @@ def main() -> None:
     _mvideo = video_label(manifest_path.name)
     would_render, pre_est = 0, 0.0
     gate_adds: dict = {}   # policy-cap gate key -> this run's estimated add
+    _saved: dict = {}      # gate key -> shots with a saved render on the ledger
+    rebills: set = set()   # gate keys where this run re-bills a shot (see is_reprint)
     for _img in images:
         if not isinstance(_img, dict):
             continue
@@ -762,6 +796,12 @@ def main() -> None:
         pre_est += _est
         _k = policy_gate_key(_name, _mvideo)
         gate_adds[_k] = gate_adds.get(_k, 0.0) + _est
+        # mutequiv: a cache only; reloading the ledger each time gives the same dict,
+        # since nothing writes the ledger before the billed loop below
+        if _k not in _saved:
+            _saved[_k] = load_render_counts(ledger_path, _k, saved_only=True)
+        if args.force or _name in _saved[_k]:
+            rebills.add(_k)
 
     # DQ-40 policy-cap state, grouped by each image's OWN video index (falling
     # back to the manifest's video) — a multi-video batch manifest like
@@ -779,8 +819,9 @@ def main() -> None:
     breaches = []
     for k, p, a in gate_state:
         # REPRINT is judged on whether the real first batch already happened, not
-        # on `p > 0.0` — see first_batch_done(). A smoke test is not a first batch.
-        _is_reprint = first_batch_done(ledger_path, k)
+        # on `p > 0.0` — see first_batch_done(). A smoke test is not a first batch,
+        # and a resume of the same manifest is not a reprint — see is_reprint().
+        _is_reprint = is_reprint(ledger_path, k, p, a, manifest_path.name, k in rebills)
         if _is_reprint and a > REPRINT_CAP_USD:
             breaches.append((k, p, a, f"reprint run adds ~${a:.2f}, over the "
                                       f"${REPRINT_CAP_USD:.2f} reprint limit"))
@@ -834,7 +875,8 @@ def main() -> None:
         # nothing would render, so the info line still appears.
         _rows = gate_state or [(_mvideo, load_video_spend(ledger_path, _mvideo), 0.0)]
         for _k, _p, _a in _rows:
-            _isreprint = _p > 0.0
+            _isreprint = is_reprint(ledger_path, _k, _p, _a, manifest_path.name,
+                                    _k in rebills)
             _ceil = POLICY_CAP_USD + (REPRINT_CAP_USD if _isreprint else 0.0)
             _bad = (_a > REPRINT_CAP_USD) if _isreprint else False
             _over = " — OVER, a live run will need Steve's ok + --over-cap-ok" \
