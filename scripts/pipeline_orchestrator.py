@@ -1080,7 +1080,12 @@ def _dispatch_stage_agent(key: str, video: int) -> tuple[bool, str]:
                f"at {agent_file} — cannot dispatch. Create the agent or fix the run-table.")
         notify(msg)
         return False, msg
-    prompt = _stage_prompt(key, video)
+    try:
+        prompt = _stage_prompt(key, video)
+    except DispatchContextError as e:
+        msg = f"⚠️ Video {video}: stage {key} not dispatched: {e}"
+        notify(msg)
+        return False, msg
     cmd = _build_agent_cmd(agent, prompt)
     try:
         proc = _run_agent(cmd, cfg["timeout"], _agent_log_label(cmd, "produce"))
@@ -1111,6 +1116,45 @@ def _stage_title(video: int) -> str:
     if title == f"Video {nn(video)}":
         return ""
     return re.sub(r"\s+", " ", title.replace("\x00", ""))[:200].strip()
+
+
+class DispatchContextError(Exception):
+    """A video's staged constraints file is ambiguous or unreadable; refuse to dispatch."""
+
+
+# Stages whose agent WRITES the video's content and must obey its staged constraints.
+_CONTEXT_STAGES = ("1_script", "7_packaging", "12_leadmagnet", "9_description")
+
+
+def _dispatch_context_rel(video: int) -> str | None:
+    """Vault-relative path of the video's staged constraints file, or None.
+
+    A file BRANDS/3SK_Finance/*V<NN>*_Dispatch_Context.md carries the per-video rules
+    (cold open, first-act, proof density, packaging title gate) that no agent def
+    reads on its own; V15's sat unread until 2026-10-11. The number must not be part
+    of a longer one (V15 is not V150 or V1). More than one match, or a folder that
+    cannot be listed, raises DispatchContextError: dispatching without the rules
+    would silently drop them, which is the failure this exists to stop."""
+    pat = re.compile(rf"(?<![0-9a-z])v(?:ideo[_ -]?)?0*{video}(?![0-9])", re.I)
+    try:
+        hits = sorted(f.name for f in (WORKSPACE_DIR / VAULT_REL).glob("*_Dispatch_Context.md")
+                      if pat.search(f.name))
+    except OSError as e:
+        raise DispatchContextError(
+            f"could not list {VAULT_REL} for a Dispatch_Context file: {e}") from e
+    if len(hits) > 1:
+        raise DispatchContextError(
+            f"{len(hits)} Dispatch_Context files match Video {video} in {VAULT_REL} "
+            f"({', '.join(hits)}); keep exactly one.")
+    return f"{VAULT_REL}/{hits[0]}" if hits else None
+
+
+def _context_clause(key: str, video: int, verb: str) -> str:
+    """" " + verb with {ctx} filled in when the video has a constraints file, else "".
+    Producers, fixers and reviewers of the same artifact all get it, so a review-fix
+    loop can't undo a rule nobody on that loop was told about."""
+    ctx = _dispatch_context_rel(video) if key in _CONTEXT_STAGES else None
+    return f" {verb.format(ctx=ctx)}" if ctx else ""
 
 
 def _stage_prompt(key: str, video: int) -> str:
@@ -1148,7 +1192,9 @@ def _stage_prompt(key: str, video: int) -> str:
                       f"BRANDS/3SK_Finance/Channel_Intelligence/Analytics/ (manual CSV/paste mode). "
                       f"Write routable fixes for scriptwriter + packaging.",
     }
-    return prompts[key]
+    return prompts[key] + _context_clause(
+        key, video, "Before writing, read {ctx} and obey its constraint block and every "
+                    "addendum; they override defaults.")
 
 
 def run_script_stage(key: str, video: int, force: bool = False) -> tuple[bool, str]:
@@ -1715,6 +1761,10 @@ def run_script_review(video: int) -> tuple[str, str, str]:
         f"REVISE (anything less — list every fix under REVISE). There is no 'ship with "
         f"fixes': if it is not all good to go, none of it goes."
     )
+    try:
+        prompt += _context_clause("1_script", video, "Also grade against {ctx}: breaking any rule in its constraint block or addenda is a REVISE.")
+    except DispatchContextError as e:
+        return "UNAVAILABLE", verdict_rel, f"dispatch context ambiguous: {e}"
     cmd = _build_agent_cmd(SCRIPT_REVIEWER_AGENT, prompt)
     try:
         proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "review"))
@@ -1753,6 +1803,10 @@ def run_script_fixer(video: int, verdict_rel: str) -> tuple[bool, str]:
         f"every already-passing section UNCHANGED. Write the corrected script back to the "
         f"same path."
     )
+    try:
+        prompt += _context_clause("1_script", video, "Read {ctx} first; every fix must keep its constraint block and addenda intact, and they override defaults.")
+    except DispatchContextError as e:
+        return False, f"script-fixer not dispatched: {e}"
     cmd = _build_agent_cmd(SCRIPT_FIXER_AGENT, prompt)
     try:
         proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "fix"))
@@ -2482,6 +2536,10 @@ def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
     v = f"Video_{nn(video)}"
     timeout = RUN_TABLE[key]["timeout"]
     prompt = cfg["review_prompt"].format(v=v, verdict_rel=verdict_rel)
+    try:
+        prompt += _context_clause(key, video, "Also grade against {ctx}: breaking any rule in its constraint block or addenda is a REVISE.")
+    except DispatchContextError as e:
+        return "UNAVAILABLE", verdict_rel, f"dispatch context ambiguous: {e}"
     cmd = _build_agent_cmd(reviewer, prompt)
     try:
         proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "review"))
@@ -2515,6 +2573,10 @@ def run_stage_fixer(key: str, video: int, verdict_rel: str) -> tuple[bool, str]:
     v = f"Video_{nn(video)}"
     timeout = RUN_TABLE[key]["timeout"]
     prompt = cfg["fix_prompt"].format(v=v, verdict_rel=verdict_rel)
+    try:
+        prompt += _context_clause(key, video, "Read {ctx} first; every fix must keep its constraint block and addenda intact, and they override defaults.")
+    except DispatchContextError as e:
+        return False, f"{fixer} not dispatched: {e}"
     cmd = _build_agent_cmd(fixer, prompt)
     try:
         proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "fix"))

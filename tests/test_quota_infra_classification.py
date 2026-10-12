@@ -187,9 +187,10 @@ def test_placeholder_title_is_never_injected_as_a_topic():
     meant to fix, on the normal path for any video created without --title."""
     import json
     import tempfile
-    real_dir = po.STATE_DIR
+    real = (po.STATE_DIR, po.WORKSPACE_DIR)
     with tempfile.TemporaryDirectory() as td:
         po.STATE_DIR = pathlib.Path(td)
+        po.WORKSPACE_DIR = pathlib.Path(td)  # no live-vault Dispatch_Context lookup
         # Exactly what cmd_init writes when --title is omitted.
         (po.STATE_DIR / "Video_15_pipeline.json").write_text(
             json.dumps({"video": 15, "title": "Video 15", "stages": {}}))
@@ -204,7 +205,7 @@ def test_placeholder_title_is_never_injected_as_a_topic():
                 json.dumps({"video": 15, "title": "Every Level of Something", "stages": {}}))
             assert "Every Level of Something" in po._stage_prompt("1_script", 15)
         finally:
-            po.STATE_DIR = real_dir
+            po.STATE_DIR, po.WORKSPACE_DIR = real
 
 
 def test_real_title_is_injected():
@@ -230,6 +231,134 @@ def test_real_title_is_injected():
             assert "do not re-derive" in prompt
         finally:
             po.STATE_DIR = real_dir
+
+
+def _ctx_vault(td, names):
+    """A temp vault whose brand folder holds the given Dispatch_Context names."""
+    brand = pathlib.Path(td) / po.VAULT_REL
+    brand.mkdir(parents=True)
+    for n in names:
+        (brand / n).write_text("constraints")
+    return pathlib.Path(td)
+
+
+def test_dispatch_context_reaches_the_writing_stages():
+    """A staged per-video constraints file must be named in the prompt of every stage
+    that writes the video's content (2026-10-11: V15's sat unread by any agent)."""
+    import tempfile
+    real = (po.WORKSPACE_DIR, po.STATE_DIR)
+    with tempfile.TemporaryDirectory() as td:
+        po.WORKSPACE_DIR = _ctx_vault(td, ["2026-08-02_V15_B22_Dispatch_Context.md",
+                                           "x_V150_Dispatch_Context.md",
+                                           "y_V1_Dispatch_Context.md"])
+        # A parked context in a subfolder must never count (the lookup is not recursive).
+        parked = po.WORKSPACE_DIR / po.VAULT_REL / "Topic_Backlog" / "Parked"
+        parked.mkdir(parents=True)
+        (parked / "old_V15_B22_Dispatch_Context.md").write_text("parked")
+        po.STATE_DIR = pathlib.Path(td)
+        try:
+            rel = f"{po.VAULT_REL}/2026-08-02_V15_B22_Dispatch_Context.md"
+            for key in ("1_script", "7_packaging", "12_leadmagnet", "9_description"):
+                prompt = po._stage_prompt(key, 15)
+                assert f"read {rel} and obey" in prompt, (key, prompt)
+            assert "Dispatch_Context" not in po._stage_prompt("11_analyze", 15)
+            # V150 and V1 files must not count as V15's, nor V15's as theirs.
+            assert po._dispatch_context_rel(150).endswith("x_V150_Dispatch_Context.md")
+            assert po._dispatch_context_rel(1).endswith("y_V1_Dispatch_Context.md")
+            assert po._dispatch_context_rel(14) is None
+            # The repo's other naming styles count too: Video_NN and lower-case vNN.
+            for name in ("2026_Video_24_Dispatch_Context.md", "q_v16_Dispatch_Context.md",
+                         "Review_17_Dispatch_Context.md", "x_rev18_Dispatch_Context.md"):
+                (po.WORKSPACE_DIR / po.VAULT_REL / name).write_text("c")
+            assert po._dispatch_context_rel(24).endswith("2026_Video_24_Dispatch_Context.md")
+            assert po._dispatch_context_rel(16).endswith("q_v16_Dispatch_Context.md")
+            assert po._dispatch_context_rel(17) is None   # "Review_17" is not a video tag
+            assert po._dispatch_context_rel(18) is None   # "rev18" is not a video tag
+            assert "Before writing, read" not in po._stage_prompt("1_script", 14)
+        finally:
+            po.WORKSPACE_DIR, po.STATE_DIR = real
+
+
+def test_reviewers_and_fixers_carry_the_dispatch_context():
+    """The review-fix loop rewrites and grades the same files, so every agent on it must
+    see the constraints, or a fixer can undo a rule (e.g. the V15 title gate)."""
+    import tempfile
+    real = (po.WORKSPACE_DIR, po.STATE_DIR, po.AGENTS_DIR, po._run_agent)
+    prompts = []
+    with tempfile.TemporaryDirectory() as td:
+        po.WORKSPACE_DIR = _ctx_vault(td, ["2026-10-11_V15_B33_Dispatch_Context.md"])
+        po.STATE_DIR = pathlib.Path(td)
+        po.AGENTS_DIR = pathlib.Path(td)
+        for a in ("scriptwriter", "script-reviewer", "packaging-strategist",
+                  "packaging-reviewer"):
+            (po.AGENTS_DIR / f"{a}.md").write_text("stub")
+
+        def _capture(cmd, timeout, label):
+            prompts.append(cmd[-1])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        po._run_agent = _capture
+        try:
+            po.run_script_review(15)
+            po.run_script_fixer(15, "x")
+            po.run_stage_review("7_packaging", 15)
+            po.run_stage_fixer("7_packaging", 15, "x")
+        finally:
+            po.WORKSPACE_DIR, po.STATE_DIR, po.AGENTS_DIR, po._run_agent = real
+    rel = f"{po.VAULT_REL}/2026-10-11_V15_B33_Dispatch_Context.md"
+    assert len(prompts) == 4, prompts
+    assert "Also grade against " + rel in prompts[0] and "Also grade against " + rel in prompts[2]
+    assert "Read " + rel + " first" in prompts[1] and "Read " + rel + " first" in prompts[3]
+
+
+def test_two_dispatch_contexts_refuse_the_dispatch():
+    """Two files for one video is ambiguous: refuse and ping, never pick one or drop both."""
+    import tempfile
+    real = (po.WORKSPACE_DIR, po.STATE_DIR, po.AGENTS_DIR, po.notify, po._run_agent)
+    pings = []
+    with tempfile.TemporaryDirectory() as td:
+        po.WORKSPACE_DIR = _ctx_vault(td, ["a_V15_Dispatch_Context.md",
+                                           "b_V15_Dispatch_Context.md"])
+        po.STATE_DIR = pathlib.Path(td)
+        po.AGENTS_DIR = pathlib.Path(td)
+        (po.AGENTS_DIR / "scriptwriter.md").write_text("stub")
+        po.notify = lambda msg, force=False: pings.append(msg)
+
+        def _boom(*a, **k):
+            raise AssertionError("agent must not run when the context is ambiguous")
+        po._run_agent = _boom
+        try:
+            ok, detail = po._dispatch_stage_agent("1_script", 15)
+            assert not ok and "2 Dispatch_Context files" in detail, detail
+            assert pings and "not dispatched" in pings[0], pings
+        finally:
+            (po.WORKSPACE_DIR, po.STATE_DIR, po.AGENTS_DIR, po.notify,
+             po._run_agent) = real
+
+
+def test_ambiguous_context_stops_reviewers_and_fixers_cleanly():
+    """Two V15 files: every review-loop agent must refuse without raising and without running."""
+    import tempfile
+    real = (po.WORKSPACE_DIR, po.STATE_DIR, po.AGENTS_DIR, po._run_agent)
+    with tempfile.TemporaryDirectory() as td:
+        po.WORKSPACE_DIR = _ctx_vault(td, ["a_V15_Dispatch_Context.md",
+                                           "b_V15_Dispatch_Context.md"])
+        po.STATE_DIR = po.AGENTS_DIR = pathlib.Path(td)
+        for a in ("scriptwriter", "script-reviewer", "packaging-strategist",
+                  "packaging-reviewer"):
+            (po.AGENTS_DIR / f"{a}.md").write_text("stub")
+
+        def _boom(*a, **k):
+            raise AssertionError("agent must not run when the context is ambiguous")
+        po._run_agent = _boom
+        try:
+            for verdict, _, detail in (po.run_script_review(15),
+                                       po.run_stage_review("7_packaging", 15)):
+                assert verdict == "UNAVAILABLE" and "2 Dispatch_Context files" in detail, detail
+            for ok, detail in (po.run_script_fixer(15, "x"),
+                               po.run_stage_fixer("7_packaging", 15, "x")):
+                assert not ok and "not dispatched" in detail, detail
+        finally:
+            po.WORKSPACE_DIR, po.STATE_DIR, po.AGENTS_DIR, po._run_agent = real
 
 
 def test_reaper_kills_registered_agent_groups():
