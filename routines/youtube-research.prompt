@@ -7,7 +7,7 @@ NICHE DIR:  /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Channel_Intell
 
 HARD RULES (read before doing anything):
 - NEVER fabricate a view count or a metric. The ONLY hard numbers allowed downstream are the ones the pull script wrote from the Data API. If the pull returns no real data, the agent still runs its web research — it just has no ranked feed to lean on that cycle.
-- This routine writes only: the niche feed file (written by the pull script), the agent's own 7 intel files + _index.md + its caption cache under INTEL DIR/_captions/ and watch packs under REPO/video_studies/ (written by the agent), and your one daily-note line. Do not edit scripts, other agents' files, or anything else.
+- This routine writes only: the niche feed file (written by the pull script), the premise-saturation file (written by premise_saturation.py), the agent's own 7 intel files + _index.md + its caption cache under INTEL DIR/_captions/ and watch packs under REPO/video_studies/ (written by the agent), and your one daily-note line. Do not edit scripts, other agents' files, or anything else.
 - Do not delete or move any file.
 
 PASS 1 — PULL THE NICHE FEED (deterministic, no analysis):
@@ -34,6 +34,34 @@ PASS 1b — PULL THE CAPTION-HOOK FEED (deterministic, no analysis):
     stop the routine — set TRANSCRIPTS to "(no caption feed this cycle)" and
     continue. Captions can be disabled/region-locked/rate-limited; the agent's
     title + web research still has value without them.
+
+PASS 1c — MEASURE PREMISE SATURATION FOR THE TOP TOPICS (deterministic counts):
+  The peer feed only sweeps established channels, so it cannot see a wave of
+  same-premise copies from new tiny channels (V15/B22, 2026-10-11: 29 copies in
+  60 days, invisible to every feed). Measure the top topics directly:
+  - Read /Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Topic_Backlog/Topic_Backlog.md
+    and take the 5 rows with the highest **Total**. Also include every backlog row
+    whose evidence carries a `⚠ SATURATED <date>` flag, wherever it ranks: the flag
+    holds a row down until it is re-measured, so it must be re-measured here or it
+    can never clear. Also include the topic of any
+    ACTIVE dispatch context: BRANDS/3SK_Finance/*_Dispatch_Context.md (top level only)
+    whose `status:` starts with "active".
+  - For each, write ONE 4-8 word search phrase: what a viewer would type, built
+    from the row's first title angle. Prefix it with the backlog ID and a colon
+    (e.g. "B22: POV richest person in your friend group",
+    "B33: first in your family to break the paycheck cycle"). No quotes or operators
+    inside the phrase. topic-scout matches results to rows by that ID.
+  - Run once, with all phrases, and set the Bash tool timeout to 600000 ms (each
+    phrase takes about a minute; the default 2-minute timeout would kill it):
+      cd /Volumes/AI_Workspace/iris_studio && python3 scripts/premise_saturation.py "<ID>: <phrase 1>" "<ID>: <phrase 2>" ...
+    It writes INTEL DIR/Premise_Saturation/<today>_premise-saturation.md after every
+    phrase, so a killed run still leaves the finished rows, and prints one VERDICT
+    line per phrase. ERROR means that search failed, not that the premise is clear.
+  - Best effort: on non-zero exit, note it and continue. Do not judge or edit the
+    numbers. topic-scout reads the file.
+  - If any ACTIVE dispatch topic comes back SATURATED, send ONE Telegram line:
+      /Volumes/AI_Workspace/iris_studio/scripts/notify.sh "⚠️ Premise saturation: active dispatch topic '<phrase>' is SATURATED (<recent> same-premise uploads in 60d). See <file>."
+    Do not ping for backlog rows; topic-scout handles those.
 
 PASS 2 — READ THE FEED STATUS (so you brief the agent honestly):
   If PASS 1 succeeded, read FEED and parse its YAML frontmatter `status:` field:

@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -216,7 +217,8 @@ def _is_quota_error(exc) -> bool:
     return "quotaexceeded" in txt or "dailylimitexceeded" in txt
 
 
-def resolve_uploads_playlist(data_service, handle: str) -> str | None:
+def resolve_uploads_playlist(data_service, handle: str,
+                             api_errors: list[str] | None = None) -> str | None:
     """@handle -> the channel's uploads-playlist id via channels.list(forHandle).
 
     One channels.list call (1 unit) returns contentDetails.relatedPlaylists.uploads,
@@ -235,6 +237,8 @@ def resolve_uploads_playlist(data_service, handle: str) -> str | None:
         if _is_quota_error(exc):
             raise QuotaExceeded(str(exc)) from exc
         print(f"  ⚠ resolve @{handle} failed: {exc}", file=sys.stderr)
+        if api_errors is not None:  # an API error, not proof the handle is gone
+            api_errors.append(handle)
         return None
     items = resp.get("items", [])
     if not items:
@@ -421,8 +425,49 @@ def skeleton(path: Path, status: str, note: str, window_days: int) -> None:
     ))
 
 
+def unresolved_note(handles: list[str]) -> str:
+    """Feed warning for roster handles that did not resolve. A renamed channel
+    used to vanish from the feed with nothing but a stdout line: @BizLifePOV,
+    the direct-premise competitor, became @DAGOLDENTOOTH and sat at 0 rows for
+    weeks (found 2026-10-11)."""
+    if not handles:
+        return ""
+    return ("Roster handle(s) did not resolve and were skipped: "
+            + ", ".join(f"@{h.lstrip('@')}" for h in handles)
+            + ". The channel was renamed or deleted: update " + ROSTER_REL + ".")
+
+
+def roster_report(missing: list[str], api_errors: list[str]) -> tuple[list[str], str]:
+    """(handles that are really gone, feed note). A handle whose lookup raised an
+    API error is reported as transient, never as renamed: only the gone ones ping."""
+    gone = [h for h in missing if h not in api_errors]
+    note = unresolved_note(gone)
+    if api_errors:
+        note = (note + " " if note else "") + (
+            "Data API error while resolving " + ", ".join(f"@{h}" for h in api_errors)
+            + " (transient; skipped this run, not a rename).")
+    return gone, note
+
+
+def with_roster_note(note: str, roster_note: str) -> str:
+    """A skeleton feed's note plus the roster warning, when there is one."""
+    return note + (f"\n\n> ⚠️ {roster_note}" if roster_note else "")
+
+
+def alert_unresolved(handles: list[str]) -> None:
+    """One Telegram line per run while a roster handle is dead. Best effort."""
+    note = unresolved_note(handles)
+    if not note:
+        return
+    notify = REPO / "scripts" / "notify.sh"
+    try:
+        subprocess.run([str(notify), f"⚠️ niche_pull: {note}"], check=False, timeout=30)  # mutequiv: 30 vs 31s timeout — no observable behavior diff
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  ⚠ notify failed: {exc}", file=sys.stderr)
+
+
 def build_body(rows: list[dict], queries: list[str], window_days: int,
-               quota_note: str, keyword_search: bool) -> str:
+               quota_note: str, keyword_search: bool, roster_note: str = "") -> str:
     lines = [
         "---",
         f"date: {date.today().isoformat()}",
@@ -454,6 +499,8 @@ def build_body(rows: list[dict], queries: list[str], window_days: int,
         ]
     if quota_note:
         lines += [f"> ⚠️ {quota_note}", ""]
+    if roster_note:
+        lines += [f"> ⚠️ {roster_note}", ""]
     lines += [
         f"## Top {len(rows)} by views (most-viewed first)",
         "",
@@ -538,11 +585,14 @@ def main() -> None:
     # creator attribution if a keyword search later surfaces the same video.
     source: dict[str, str] = {}
     quota_note = ""
+    missing: list[str] = []      # every handle that did not resolve
+    api_errors: list[str] = []   # of those, the ones whose lookup itself failed
     try:
         for h in handles:
-            uploads = resolve_uploads_playlist(data, h)
+            uploads = resolve_uploads_playlist(data, h, api_errors)
             if not uploads:
                 print(f"  creator @{h}: unresolved (skipped)")
+                missing.append(h)
                 continue
             ids = recent_upload_ids(data, uploads, after, args.per_query)
             for vid in ids:
@@ -559,13 +609,16 @@ def main() -> None:
                       "(only the sources that ran before the cap are included).")
         print("  ⚠ quota exhausted during search — salvaging partial results", file=sys.stderr)
 
+    gone, roster_note = roster_report(missing, api_errors)
+    alert_unresolved(gone)  # pings only for real misses
+
     if not source:
         status = "partial-quota" if quota_note else "blocked-no-results"
         note = (quota_note or
                 "No videos found from the animated-finance peer channels in this "
                 "window. Widen --days, retune --channels, or add --keyword-search; "
                 "re-run next cycle.")
-        skeleton(out, status, note, args.days)
+        skeleton(out, status, with_roster_note(note, roster_note), args.days)
         print(f"\nℹ no results → wrote {status} skeleton: {out}")
         return
 
@@ -599,11 +652,12 @@ def main() -> None:
     if not rows:
         note = ("Sources returned only Shorts (filtered out — pass --include-shorts to "
                 "keep them) or statistics could not be fetched. Re-run next cycle.")
-        skeleton(out, "partial-no-stats", note, args.days)
+        skeleton(out, "partial-no-stats", with_roster_note(note, roster_note), args.days)
         print(f"\nℹ no long-form stats rows → wrote partial skeleton: {out}")
         return
 
-    write_report(out, build_body(rows, queries, args.days, quota_note, args.keyword_search))
+    write_report(out, build_body(rows, queries, args.days, quota_note, args.keyword_search,
+                                 roster_note))
     print(f"\n✅ wrote niche feed ({len(rows)} videos, top by views) → {out}")
     print("   Next: dispatch `youtube-researcher` to read this file for ranked intel.")
 

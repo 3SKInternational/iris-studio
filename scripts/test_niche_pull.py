@@ -75,8 +75,9 @@ class _FakeResource:
 
 
 class _FakeService:
-    def __init__(self, channels_resp=None, playlist_resp=None, playlist_raises=None):
-        self._channels = _FakeResource(channels_resp or {})
+    def __init__(self, channels_resp=None, playlist_resp=None, playlist_raises=None,
+                 channels_raises=None):
+        self._channels = _FakeResource(channels_resp or {}, raises=channels_raises)
         self._playlist = _FakeResource(playlist_resp or {}, raises=playlist_raises)
 
     def channels(self):
@@ -191,6 +192,75 @@ def test_quota_estimate():
     assert _quota_estimate(0, 0, keyword_search=False) == 0
     # Keyword search opted in adds 100/query on top of the channel path.
     assert _quota_estimate(9, 8, keyword_search=True) == 18 + 800
+
+
+
+def test_unresolved_note():
+    from niche_pull import unresolved_note
+    assert unresolved_note([]) == ""
+    note = unresolved_note(["BizLifePOV", "@other"])
+    assert "@BizLifePOV, @other" in note, note
+    assert "renamed or deleted" in note and "_Research_Channel_Roster.md" in note
+
+
+def test_build_body_shows_roster_note():
+    from niche_pull import build_body
+    row = {"views": 5, "title": "t", "url": "u", "channel": "c", "published": "2026-10-01T00:00:00Z",
+           "seconds": 900, "source": "creator:@x", "id": "x"}
+    body = build_body([row], [], 7, "", False, "Roster handle(s) did not resolve: @gone.")
+    assert "> ⚠️ Roster handle(s) did not resolve: @gone." in body
+    plain = build_body([row], [], 7, "", False)
+    assert "> ⚠️" not in plain, "no warning line at all when every handle resolved"
+
+
+def test_alert_unresolved_pings_only_when_needed():
+    import niche_pull
+    from unittest import mock
+    with mock.patch.object(niche_pull.subprocess, "run") as run:
+        niche_pull.alert_unresolved([])
+        assert not run.called
+        niche_pull.alert_unresolved(["gone"])
+        assert run.call_count == 1
+        args = run.call_args[0][0]
+        assert args[0].endswith("scripts/notify.sh") and "@gone" in args[1], args
+    with mock.patch.object(niche_pull.subprocess, "run", side_effect=OSError("boom")):
+        niche_pull.alert_unresolved(["gone"])  # must not raise
+
+
+
+def test_with_roster_note():
+    from niche_pull import with_roster_note
+    assert with_roster_note("No videos.", "") == "No videos."
+    assert with_roster_note("No videos.", "gone") == "No videos.\n\n> ⚠️ gone"
+
+
+def test_resolve_records_api_errors_not_misses():
+    # A transient HttpError is recorded as an API error; an empty answer is not.
+    svc = _FakeService(channels_raises=_soft_http_error())
+    errs = []
+    assert resolve_uploads_playlist(svc, "flaky", errs) is None
+    assert errs == ["flaky"], errs
+    svc = _FakeService(channels_resp={"items": []})
+    errs = []
+    assert resolve_uploads_playlist(svc, "gone", errs) is None
+    assert errs == [], errs
+
+
+
+def test_roster_report_separates_renames_from_api_errors():
+    from niche_pull import roster_report
+    assert roster_report([], []) == ([], "")
+    gone, note = roster_report(["gone", "flaky"], ["flaky"])
+    assert gone == ["gone"], gone
+    assert "@gone" in note and "renamed or deleted" in note, note
+    assert "Data API error while resolving @flaky (transient" in note, note
+    gone, note = roster_report(["flaky"], ["flaky"])
+    assert gone == [] and "renamed" not in note and note.startswith("Data API error"), note
+
+
+def test_resolve_soft_error_without_error_list():
+    svc = _FakeService(channels_raises=_soft_http_error())
+    assert resolve_uploads_playlist(svc, "flaky") is None
 
 
 if __name__ == "__main__":
