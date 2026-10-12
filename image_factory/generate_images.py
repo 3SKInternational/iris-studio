@@ -567,7 +567,7 @@ def parse_args() -> argparse.Namespace:
                         "also needs --force (or delete those PNGs first).")
     p.add_argument("--force", action="store_true", help="Re-render images whose PNG already exists.")
     p.add_argument("--dry-run", action="store_true", help="Plan + cost estimate; no API calls, no writes.")
-    # Runaway-spend guardrail. A real flagship batch is ~40-80 shots (~$8-9). A
+    # Runaway-spend guardrail. A real flagship batch is ~75-85 shots (~$10-11). A
     # malformed/duplicated manifest — or pointing the runner at the wrong file —
     # could silently bill hundreds. These caps abort BEFORE any API call when the
     # batch is implausibly large; raise them for a deliberate big run.
@@ -769,7 +769,7 @@ def main() -> None:
     # Count ONLY the images that would actually bill this run (skip those whose
     # PNG already exists unless --force), and sum their estimated cost. If either
     # the count or the estimate is implausibly large, abort before spending a cent.
-    # Conservative by design: a real flagship (~76 shots, ~$9) clears comfortably;
+    # Conservative by design: a real flagship (~75-85 shots, ~$10-11) clears comfortably;
     # a duplicated/wrong manifest (hundreds of shots / tens of dollars) is blocked.
     _mvideo = video_label(manifest_path.name)
     would_render, pre_est = 0, 0.0
@@ -833,7 +833,7 @@ def main() -> None:
         if would_render > args.max_images:
             die(f"spend guard: {would_render} images would bill this run, over the "
                 f"--max-images={args.max_images} cap. If this batch is intentional, "
-                f"re-run with --max-images {would_render}. (A real flagship is ~40-80 "
+                f"re-run with --max-images {would_render}. (A real flagship is ~75-85 "
                 f"shots — a count this high usually means a duplicated or wrong manifest.)")
         if pre_est > args.max_cost:
             die(f"spend guard: estimated ${pre_est:.2f} for {would_render} image(s) "

@@ -332,6 +332,18 @@ class TestPolicyCapGate(unittest.TestCase):
         self.assertNotIn("--over-cap-ok", p.stderr)
         self.assertIn("spend guard: OK", p.stdout)
 
+    def test_dry_run_after_smoke_test_labels_first_batch(self):
+        """A dry run must classify like the live gate: after a ~$0.10 smoke test the
+        real batch is still a first batch, not an over-limit REPRINT (it used to
+        label by `prior > 0`, while the live gate passed the same run)."""
+        self._seed_prior(0.10)
+        self._widen_manifest(20)                     # ~$2.00, over the $1 reprint limit
+        p = self._run("--dry-run", "--max-images", "150", "--max-cost", "99")
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("first batch", p.stdout)
+        self.assertNotIn("REPRINT", p.stdout)
+        self.assertNotIn("OVER", p.stdout)
+
     def test_dry_run_reports_but_never_blocks(self):
         self._seed_prior(gi.POLICY_CAP_USD + 5)  # far over
         p = self._run("--dry-run")
@@ -541,8 +553,8 @@ class TestFirstBatchVsReprint(unittest.TestCase):
         self.assertAlmostEqual(got["b.json"], 5.00)
         self.assertNotIn("Video_99", str(got), "must not bleed across videos")
 
-    def test_absolute_ceiling_is_unchanged(self):
-        """The fix must not raise the per-video ceiling — that is a locked value
+    def test_absolute_ceiling_is_locked_value(self):
+        """The per-video ceiling is a locked value; only a logged decision may move it
         ($12 since 2026-10-10: $11 first batch + $1 reprint)."""
         self.assertAlmostEqual(gi.POLICY_CAP_USD + gi.REPRINT_CAP_USD, 12.0)
 
