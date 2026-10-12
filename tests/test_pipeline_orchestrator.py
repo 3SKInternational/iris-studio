@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --- Import the orchestrator module from its path (no package assumption) ----
@@ -1069,6 +1070,251 @@ class TestScriptReviewGateFixes(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(calls["restore"], [])
         self.assertIn("removed `rate-wpm: 145`", msg)
+
+
+class TestAnalyzeWaitsForData(unittest.TestCase):
+    """11_analyze waits for an analytics pull that covers the video (publish + 72 h,
+    publish time from the upload receipt), and a producer's blocked skeleton never
+    reaches review (channel-analyst finding 1)."""
+
+    def _vault(self, d, receipt, pulls):
+        po.WORKSPACE_DIR = Path(d)
+        kits = po.vault_abs(f"{po.VAULT_REL}/Production_Kits")
+        kits.mkdir(parents=True)
+        if receipt is not None:
+            (kits / "Video_15_youtube_upload.json").write_text(json.dumps(receipt))
+        an = po.vault_abs(f"{po.VAULT_REL}/Channel_Intelligence/Analytics")
+        an.mkdir(parents=True, exist_ok=True)
+        for n in pulls:
+            (an / n).write_text("pull")
+
+    def _due(self, receipt, pulls, stages=None, now=None):
+        saved = (po.WORKSPACE_DIR, po.time.time)
+        with tempfile.TemporaryDirectory() as d:
+            self._vault(d, receipt, pulls)
+            if now is not None:
+                po.time.time = lambda: now
+            try:
+                return po._analytics_data_due(15, stages or {})
+            finally:
+                po.WORKSPACE_DIR, po.time.time = saved
+
+    T = "2026-08-22T22:07:00+00:00"           # V14's real upload time
+    T_EPOCH = datetime(2026, 8, 22, 22, 7, tzinfo=timezone.utc).timestamp()
+
+    def test_waits_for_a_pull_dated_after_the_lag(self):
+        # The 08-24 pull ran inside the lag and had no V14 row; 08-25 is the need date.
+        due, why, rel = self._due({"uploaded_at": self.T},
+                                  ["2026-08-24_api-pull.md"], now=self.T_EPOCH + 4 * 86400)
+        self.assertFalse(due)
+        self.assertIn("2026-08-25", why)
+        self.assertIsNone(rel)
+
+    def test_due_once_a_covering_pull_exists_and_names_the_newest(self):
+        due, why, rel = self._due({"uploaded_at": self.T},
+                                  ["2026-08-24_api-pull.md", "2026-08-31_api-pull.md",
+                                   "2026-09-07_api-pull.md", "2026-09-14_api-pull 2.md"])
+        self.assertTrue(due)
+        self.assertTrue(rel.endswith("2026-09-07_api-pull.md"), rel)
+
+    def test_pull_dated_exactly_the_need_date_counts(self):
+        due, _, rel = self._due({"uploaded_at": self.T}, ["2026-08-25_api-pull.md"])
+        self.assertTrue(due)
+
+    def test_scheduled_publish_time_wins_over_upload(self):
+        # Uploaded 08-22 but public 09-01: the 08-31 pull cannot cover it.
+        due, why, _ = self._due({"uploaded_at": self.T, "publish_at": "2026-09-01T14:30:00Z"},
+                                ["2026-08-31_api-pull.md"], now=self.T_EPOCH + 10 * 86400)
+        self.assertFalse(due)
+        self.assertIn("2026-09-04", why)
+
+    def test_ceiling_runs_anyway(self):
+        due, why, rel = self._due({"uploaded_at": self.T}, [],
+                                  now=self.T_EPOCH + 15 * 86400)
+        self.assertTrue(due)
+        self.assertIn("running anyway", why)
+
+    def test_unknown_publish_time_is_due(self):
+        self.assertTrue(self._due(None, [])[0])
+
+    def test_falls_back_to_state_completed_at(self):
+        st = {"10_publish": {"completed_at": self.T}}
+        due, why, _ = self._due(None, [], stages=st, now=self.T_EPOCH + 3600)
+        self.assertFalse(due)
+
+    def test_lag_boundary_in_hours(self):
+        # 23:59 + 72 h is still 08-25; 73 h, or 72 h of 3601 s, would land on 08-26.
+        t0 = datetime(2026, 8, 22, 23, 59, tzinfo=timezone.utc).timestamp()
+        due, _, _ = self._due({"uploaded_at": "2026-08-22T23:59:00Z"},
+                              ["2026-08-25_api-pull.md"], now=t0 + 4 * 86400)
+        self.assertTrue(due)                     # clock pinned well before the ceiling
+
+    def test_ceiling_boundary(self):
+        # 5 s past 14 days: due. 15 days, or days of 86401 s, would still wait.
+        due, why, _ = self._due({"uploaded_at": self.T}, [],
+                                now=self.T_EPOCH + 14 * 86400 + 5)
+        self.assertTrue(due)
+        self.assertIn("running anyway", why)
+
+    def test_non_object_receipt_falls_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            saved = (po.WORKSPACE_DIR, po.time.time)
+            self._vault(d, None, [])
+            (po.vault_abs(f"{po.VAULT_REL}/Production_Kits")
+             / "Video_15_youtube_upload.json").write_text("[]")
+            po.time.time = lambda: self.T_EPOCH + 3600
+            try:
+                due, _, _ = po._analytics_data_due(
+                    15, {"10_publish": {"completed_at": self.T}})
+            finally:
+                po.WORKSPACE_DIR, po.time.time = saved
+        self.assertFalse(due)
+
+    def test_prompt_names_the_pull_or_falls_back(self):
+        saved = po.WORKSPACE_DIR
+        with tempfile.TemporaryDirectory() as d:
+            self._vault(d, {"uploaded_at": self.T}, ["2026-08-31_api-pull.md"])
+            try:
+                named = po._stage_prompt("11_analyze", 15)
+            finally:
+                po.WORKSPACE_DIR = saved
+        with tempfile.TemporaryDirectory() as d:
+            self._vault(d, {"uploaded_at": datetime.now(timezone.utc).isoformat()}, [])
+            try:
+                fallback = po._stage_prompt("11_analyze", 15)
+            finally:
+                po.WORKSPACE_DIR = saved
+        self.assertIn("Analytics/2026-08-31_api-pull.md", named)
+        self.assertIn("newest *_api-pull.md", fallback)
+
+    def _run_advance(self, receipt, pulls, ready):
+        """advance_once + summary + --status with `ready` as the only runnable stage
+        besides 11_analyze's position; returns (result, dispatched, summary, status)."""
+        import contextlib, io
+        saved = (po.WORKSPACE_DIR, po.reconcile_orphans, po.promote_gate_exits,
+                 po.notify, po.run_agent_stage)
+        dispatched = []
+        with tempfile.TemporaryDirectory() as d:
+            self._vault(d, receipt, pulls)
+            po.reconcile_orphans = lambda s, v: []
+            po.promote_gate_exits = lambda s, v: ([], False)
+            po.notify = lambda *a, **k: None
+            po.run_agent_stage = lambda k, v, s: dispatched.append(k) or (False, "stub")
+            stages = _mark_done(_stages(), *[k for k in po.STAGE_ORDER if k not in ready])
+            try:
+                summary = po._video_summary_line({"video": 15, "stages": stages})[1]
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    po.cmd_status(_FakeSF(stages, video=15))
+                res = po.advance_once(_FakeSF(stages, video=15))
+            finally:
+                (po.WORKSPACE_DIR, po.reconcile_orphans, po.promote_gate_exits,
+                 po.notify, po.run_agent_stage) = saved
+        return res, dispatched, summary, buf.getvalue()
+
+    NOW_RECEIPT = property(lambda self: {"uploaded_at": datetime.now(timezone.utc).isoformat()})
+
+    def test_due_analyze_runs_everywhere(self):
+        res, dispatched, summary, status = self._run_advance(
+            {"uploaded_at": self.T}, ["2026-08-31_api-pull.md"], ["11_analyze"])
+        self.assertEqual(dispatched, ["11_analyze"])
+        self.assertIn("ready to advance", summary)
+        self.assertNotIn("analyze waiting", summary)
+        self.assertIn("Next auto-runnable: 11_analyze", status)
+
+    def test_waiting_analyze_does_not_hide_another_ready_stage(self):
+        res, dispatched, summary, status = self._run_advance(
+            self.NOW_RECEIPT, [], ["9_description", "11_analyze"])
+        self.assertEqual(dispatched, ["9_description"])
+        self.assertIn("ready to advance", summary)
+        self.assertIn("Next auto-runnable: 9_description", status)
+        self.assertNotIn("is waiting", status)
+
+    def test_waiting_status_line(self):
+        res, dispatched, summary, status = self._run_advance(
+            self.NOW_RECEIPT, [], ["11_analyze"])
+        self.assertEqual(dispatched, [])
+        self.assertIn("11_analyze is waiting: needs an analytics pull dated", status)
+        self.assertNotIn("Next auto-runnable", status)
+
+    def test_advance_reports_the_wait_instead_of_running(self):
+        saved = (po.WORKSPACE_DIR, po.reconcile_orphans, po.promote_gate_exits,
+                 po.notify, po._dispatch_stage_agent)
+        with tempfile.TemporaryDirectory() as d:
+            self._vault(d, {"uploaded_at": datetime.now(timezone.utc).isoformat()}, [])
+            po.reconcile_orphans = lambda s, v: []
+            po.promote_gate_exits = lambda s, v: ([], False)
+            po.notify = lambda *a, **k: None
+
+            def _boom(*a, **k):
+                raise AssertionError("analyze must not dispatch before data exists")
+            po._dispatch_stage_agent = _boom
+            stages = _mark_done(_stages(), *[k for k in po.STAGE_ORDER if k != "11_analyze"])
+            self.assertEqual(po.select_next(stages), "11_analyze")   # the fixture is live
+            try:
+                res = po.advance_once(_FakeSF(stages, video=15))
+                summary = po._video_summary_line({"video": 15, "stages": stages})[1]
+            finally:
+                (po.WORKSPACE_DIR, po.reconcile_orphans, po.promote_gate_exits,
+                 po.notify, po._dispatch_stage_agent) = saved
+        self.assertEqual(res.outcome, "idle")
+        self.assertIn("analyze waiting", res.line)
+        self.assertIn("analyze waiting for analytics data", summary)
+        self.assertNotIn("ready to advance", summary)
+
+    def _gate(self, body, also=None):
+        saved = (po.WORKSPACE_DIR, po._dispatch_stage_agent, po.run_stage_review_loop)
+        reviewed = []
+        with tempfile.TemporaryDirectory() as d:
+            po.WORKSPACE_DIR = Path(d)
+            out = po.vault_abs(po.stage_artifact_path("11_analyze", 15))
+            (out / "_REVIEW").mkdir(parents=True)
+            old = out / "2026-08-22_video14-analysis.md"       # an older blocked file
+            old.write_text("---\nstatus: blocked-missing-input\n---\n")
+            os.utime(old, (time.time() - 3600, time.time() - 3600))
+
+            def _produce(key, video):
+                (out / "2026-10-12_video15-analysis.md").write_text(body)
+                if also:                              # another run's blocked file
+                    (out / also).write_text("---\nstatus: blocked-x\n---\n")
+                return True, "ok"
+            po._dispatch_stage_agent = _produce
+            po.run_stage_review_loop = lambda k, v: (reviewed.append(k)
+                                                     or ("SHIP", "rev.md", "d"))
+            try:
+                return po.run_stage_review_gate("11_analyze", 15), reviewed
+            finally:
+                (po.WORKSPACE_DIR, po._dispatch_stage_agent,
+                 po.run_stage_review_loop) = saved
+
+    def test_blocked_analysis_is_not_reviewed(self):
+        (ok, msg), reviewed = self._gate("---\nstatus: blocked-missing-input\n---\nx")
+        self.assertFalse(ok)
+        self.assertEqual(reviewed, [])
+        self.assertIn("2026-10-12_video15-analysis.md", msg)
+        self.assertNotIn("video14", msg)
+
+    def test_stage_without_declared_artifact_still_reviews(self):
+        # 12_leadmagnet declares no artifact path; the blocked check must skip it.
+        saved = (po._dispatch_stage_agent, po.run_stage_review_loop)
+        po._dispatch_stage_agent = lambda k, v: (True, "ok")
+        po.run_stage_review_loop = lambda k, v: ("SHIP", "rev.md", "d")
+        try:
+            self.assertIsNone(po.stage_artifact_path("12_leadmagnet", 15))
+            ok, msg = po.run_stage_review_gate("12_leadmagnet", 15)
+        finally:
+            po._dispatch_stage_agent, po.run_stage_review_loop = saved
+        self.assertTrue(ok, msg)
+
+    def test_other_videos_blocked_file_is_not_blamed(self):
+        (ok, msg), reviewed = self._gate("---\nstatus: ok\n---\nCTR 4.1%",
+                                         also="2026-10-12_video16-analysis.md")
+        self.assertTrue(ok, msg)
+
+    def test_real_analysis_goes_to_review(self):
+        (ok, msg), reviewed = self._gate("---\nstatus: ok\n---\nCTR 4.1%")
+        self.assertTrue(ok, msg)
+        self.assertEqual(reviewed, ["11_analyze"])
 
 
 class TestSpendOkImageGate(unittest.TestCase):

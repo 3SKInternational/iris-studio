@@ -534,6 +534,62 @@ def effective_status(key: str, stages: dict) -> str:
     return "blocked"
 
 
+# The per-video analysis needs analytics that cover the video. YouTube data lags
+# 48-72 h after publish (analytics_pull.py), and channel-analyst can only READ the
+# weekly pull (Mon 05:30), so the stage waits for a pull dated on or after
+# publish + 72 h. V14's ran 85 minutes after upload, wrote `status:
+# blocked-missing-input`, and still closed (drift audit, channel-analyst finding 1).
+# After the ceiling it runs anyway, so a dead pull job shows up as a failed stage
+# instead of a silent wait.
+ANALYZE_DATA_LAG_HOURS = 72
+ANALYZE_WAIT_CEILING_DAYS = 14
+_PULL_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_api-pull\.md$")   # not iCloud "… 2.md" dupes
+
+
+def _publish_time(video: int, stages: dict) -> float | None:
+    """When the video went (or goes) public. The upload receipt is what the real
+    workflow writes: publish_at for a scheduled release, then last_published_at,
+    then uploaded_at. 10_publish.completed_at is a fallback only; it is null on
+    most hand-closed state files."""
+    receipt = vault_abs(f"{VAULT_REL}/Production_Kits/Video_{nn(video)}_youtube_upload.json")
+    try:
+        data = json.loads(receipt.read_text())
+    except (OSError, ValueError, AttributeError):
+        data = {}
+    if isinstance(data, dict):
+        for k in ("publish_at", "last_published_at", "uploaded_at"):
+            v = data.get(k)
+            t = parse_iso(v) if isinstance(v, str) else None
+            if t is not None:
+                return t
+    return parse_iso(stages.get("10_publish", {}).get("completed_at"))
+
+
+def _analytics_data_due(video: int, stages: dict) -> tuple[bool, str, str | None]:
+    """(due, why, pull_rel). Due once an Analytics/YYYY-MM-DD_api-pull.md exists
+    dated on or after publish + ANALYZE_DATA_LAG_HOURS (pull_rel names the newest
+    such pull), or once ANALYZE_WAIT_CEILING_DAYS have passed. An unknown publish
+    time is due (the old behaviour) rather than an endless wait."""
+    t = _publish_time(video, stages)
+    if t is None:
+        return True, "publish time unknown, not waiting for data", None
+    need = datetime.fromtimestamp(t + ANALYZE_DATA_LAG_HOURS * 3600, timezone.utc).date()
+    adir = vault_abs(f"{VAULT_REL}/Channel_Intelligence/Analytics")
+    try:
+        names = [f.name for f in adir.iterdir()]
+    except (OSError, AttributeError):
+        names = []
+    pulls = sorted(n for n in names
+                   if (m := _PULL_RE.match(n)) and m.group(1) >= need.isoformat())
+    if pulls:
+        rel = f"{VAULT_REL}/Channel_Intelligence/Analytics/{pulls[-1]}"
+        return True, f"analytics pull {pulls[-1]} covers it", rel
+    if time.time() >= t + ANALYZE_WAIT_CEILING_DAYS * 86400:
+        return True, (f"no analytics pull dated {need} or later after "
+                      f"{ANALYZE_WAIT_CEILING_DAYS} days, running anyway"), None
+    return False, f"needs an analytics pull dated {need} or later", None
+
+
 def deps_freshness_threshold(key: str, stages: dict) -> tuple[float | None, bool]:
     """Freshness threshold for an auto-promotion freshness check, plus a fail-closed
     flag. Returns (threshold, deps_incomplete):
@@ -1190,8 +1246,8 @@ def _stage_prompt(key: str, video: int) -> str:
         "9_description": f"Draft the YouTube upload pack for {v} from BRANDS/3SK_Finance/Scripts/"
                          f"{v}_Script.md: description, chapter timestamps, disclosure, hashtags, "
                          f"pinned comment. Write to BRANDS/3SK_Finance/Video_Descriptions/.",
-        "11_analyze": f"Analyze {v}'s YouTube performance from the analytics export referenced in "
-                      f"BRANDS/3SK_Finance/Channel_Intelligence/Analytics/ (manual CSV/paste mode). "
+        "11_analyze": f"Analyze {v}'s YouTube performance from the analytics pull "
+                      f"{_analytics_data_due(video, {})[2] or VAULT_REL + '/Channel_Intelligence/Analytics/ (newest *_api-pull.md)'}. "
                       f"Write routable fixes for scriptwriter + packaging.",
     }
     return prompts[key] + _context_clause(
@@ -2673,6 +2729,31 @@ def run_stage_review_loop(key: str, video: int) -> tuple[str, str, str]:
     return verdict, vrel, detail
 
 
+def _blocked_outputs(key: str, video: int, since: float) -> list[str]:
+    """Names of .md files under the stage's declared artifact, written during this
+    run (mtime >= since - 1 s), whose frontmatter says status: blocked-*. A producer
+    that could not do the work still exits 0 and writes a skeleton; reviewing that
+    skeleton let V14's no-data analysis SHIP (drift audit, channel-analyst finding 1).
+    Review verdicts under _REVIEW/ are not producer output and are skipped."""
+    p = vault_abs(stage_artifact_path(key, video))
+    if p is None or not p.exists():
+        return []
+    # A shared channel dir (Packaging/, Analytics/) also holds other videos' and the
+    # weekly read's files; count only this video's.
+    mine = re.compile(rf"video[_ ]?0*{video}(?!\d)", re.I)
+    files = [p] if p.is_file() else [f for f in p.rglob("*.md")
+                                     if "_REVIEW" not in f.parts and mine.search(f.name)]
+    out = []
+    for f in files:
+        try:
+            if (f.suffix.lower() == ".md" and f.stat().st_mtime >= since - 1  # mutequiv: 1 vs 2 s slack, no exact-value contract
+                    and _status_blocked(f.read_text(encoding="utf-8", errors="replace"))):
+                out.append(f.name)
+        except OSError:
+            continue
+    return sorted(out)
+
+
 def run_stage_review_gate(key: str, video: int,
                           stages: dict | None = None) -> tuple[bool, str]:
     """PRODUCE-THEN-REVIEW executor for a producer stage under the BINARY policy.
@@ -2713,9 +2794,15 @@ def run_stage_review_gate(key: str, video: int,
                                   f"(A-51).")
                 print(f"  {key}: review is resolution-stamped but {why} — ignoring "
                       f"the stamp and running the full gate.", file=sys.stderr)
+    started = time.time()
     ok, out = _dispatch_stage_agent(key, video)
     if not ok:
         return False, out
+    blocked = _blocked_outputs(key, video, started)
+    if blocked:
+        return False, (f"{RUN_TABLE[key]['agent']} exited 0 but wrote status: blocked-* "
+                       f"({', '.join(blocked)}); not sent to review. Supply the missing "
+                       f"input, then re-run /pipeline {video}.")
     verdict, vrel, detail = run_stage_review_loop(key, video)
     if verdict == "SHIP":
         return True, f"{STAGE_REVIEW[key]['reviewer']} SHIP ({vrel}). {detail}"
@@ -2902,6 +2989,11 @@ def advance_once(sf: StateFile, force: bool = False) -> AdvanceResult:
         sf.save()
 
     nxt = select_next(stages)
+    analyze_wait = ""
+    if nxt == "11_analyze":
+        due, why, _ = _analytics_data_due(video, stages)
+        if not due:
+            nxt, analyze_wait = None, why
     if nxt is None:
         gate = first_ready_gate(stages)
         if gate is not None:
@@ -2919,7 +3011,8 @@ def advance_once(sf: StateFile, force: bool = False) -> AdvanceResult:
             print(line)
             notify(line)
             return AdvanceResult(0, "parked_gate", gate, line)
-        line = f"🎬 Video {video}: nothing to advance — all stages done or blocked."
+        line = (f"🎬 Video {video}: analyze waiting — {analyze_wait}." if analyze_wait
+                else f"🎬 Video {video}: nothing to advance — all stages done or blocked.")
         print(line)
         notify(line)
         return AdvanceResult(0, "idle", None, line)
@@ -3040,6 +3133,11 @@ def cmd_status(sf: StateFile) -> int:
               f"{str(s.get('owner')):<12} {art}")
     nxt = select_next(stages)
     gate = first_ready_gate(stages)
+    if nxt == "11_analyze":
+        due, why, _ = _analytics_data_due(video, stages)
+        if not due:
+            print(f"\n11_analyze is waiting: {why}.")
+            nxt = None
     if nxt:
         print(f"\nNext auto-runnable: {nxt} ({STAGE_LABEL[nxt]}) — run --advance.")
     elif gate == "5_images":
@@ -3742,6 +3840,11 @@ def _video_summary_line(data: dict, ran: list[str] | None = None) -> tuple[str, 
                    and int(stages.get(k, {}).get("infra_count") or 0) > 0]
     gates = gates_awaiting_steve(stages)
     nxt = select_next(stages)
+    analyze_wait = ""
+    if nxt == "11_analyze":
+        due, why, _ = _analytics_data_due(video, stages)
+        if not due:
+            nxt, analyze_wait = None, why
 
     bits: list[str] = []
     if ran:
@@ -3782,6 +3885,8 @@ def _video_summary_line(data: dict, ran: list[str] | None = None) -> tuple[str, 
         bits.append("running: " + ", ".join(STAGE_LABEL.get(k, k) for k in live_run))
         if category == "ready":
             emoji, category = "🏃", "running"
+    if analyze_wait:
+        bits.append(f"analyze waiting for analytics data ({analyze_wait})")
     if not bits:
         emoji, category = "🚧", "blocked"
         bits.append("blocked (upstream stages not done)")
