@@ -530,13 +530,9 @@ DISPATCH_AGENTS: dict[str, dict] = {
     # channel-analyst: reads OUR own YouTube performance (CTR/retention/AVD/
     # traffic/subs) and turns it into routable fixes for scriptwriter +
     # packaging. Inward sibling to youtube-researcher (which reads the outside
-    # niche) — do not conflate. INPUT: until YouTube OAuth lands (Builds 3+4 of
-    # the YouTube Autonomy Roadmap) it has no live API; the dispatch prompt must
-    # carry a YouTube Studio analytics-export CSV path OR a pasted metrics block.
-    # That makes it most natural to invoke INTERACTIVELY / from Cowork with the
-    # export path in the prompt, not from a bare Telegram message — it's in the
-    # enum for completeness. Post-OAuth follow-on swaps the manual input for a
-    # live fetch; the analysis logic stays identical.
+    # niche) — do not conflate. INPUT must be in the dispatch prompt: the path to
+    # the newest Analytics/*_api-pull.md (scripts/analytics_pull.py), a Studio
+    # export CSV path, or a pasted metrics block. With none it stops blocked.
     "channel-analyst": {
         "timeout_seconds": 720,  # 12 min — read benchmarks + analyze one export + write
         "deliverable_dir": "BRANDS/3SK_Finance/Channel_Intelligence/Analytics",
@@ -616,11 +612,10 @@ DISPATCH_AGENTS: dict[str, dict] = {
         "timeout_seconds": 900,  # 15 min — Sonnet, reads script + asset_index, drafts 3-4 packs
         "deliverable_dir": "BRANDS/3SK_Finance/Shorts",
     },
-    # community-manager: triages INCOMING viewer comments (manual paste/export until
-    # a YouTube comment API lands — same posture as channel-analyst), drafts replies
-    # in Brand Bible voice, rolls recurring questions up to topic-scout, escalates
-    # compliance/abuse. DRAFT-ONLY. Interactive/enum (needs a comment source in the
-    # prompt) — no blind cron until a comment pull exists.
+    # community-manager: triages INCOMING viewer comments (from the comment-ingest
+    # job's fetch_comments.py export, or a paste), drafts replies in Brand Bible
+    # voice, rolls recurring questions up to topic-scout, escalates
+    # compliance/abuse. DRAFT-ONLY. Needs a comment source in the prompt.
     "community-manager": {
         "timeout_seconds": 600,  # 10 min — Sonnet, triage + draft replies, no web
         "deliverable_dir": "BRANDS/3SK_Finance/Community",
@@ -813,10 +808,10 @@ Available subagents (agent_name -> what it does):
   autonomously; dispatch ad-hoc for focused deep-dives. ~30 min.
 - `channel-analyst` — reads OUR OWN channel's analytics (CTR/retention/AVD/
   traffic/subs) and turns them into routable fixes for scriptwriter + packaging.
-  Inward sibling of youtube-researcher (which reads the outside niche). REQUIRES
-  a YouTube Studio analytics-export CSV path OR a pasted metrics block in the
-  prompt (no live API until YouTube OAuth lands) — best invoked interactively /
-  from Cowork with the export, not a bare Telegram message. ~12 min.
+  Inward sibling of youtube-researcher (which reads the outside niche). Put its
+  input IN the prompt: the path to the newest
+  Channel_Intelligence/Analytics/*_api-pull.md (written by analytics_pull.py,
+  say its date), a Studio CSV path, or a pasted metrics block. ~12 min.
 - `scriptwriter` — drafts a full 3SK Finance video script from a topic/format. Up to ~40 min.
 - `script-reviewer` — skeptical second pass on a drafted script before Steve reads
   it (voice, banned vocab, number-spine, hook, VO density, structure/CTA, moat,
