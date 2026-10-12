@@ -92,7 +92,9 @@ def _core(tok):
 
 def _is_card(prompt):
     u = prompt.upper()
-    return "NO CHARACTER" in u or "NO PEOPLE" in u
+    # The silhouette suppressor also says "NO PEOPLE" but marks a SCENE with figures,
+    # which must keep the text-bait and speech-act checks (2026-10-12).
+    return ("NO CHARACTER" in u or "NO PEOPLE" in u) and "FEATURELESS SILHOUETTES" not in u
 
 
 def script_figure_sets(script):

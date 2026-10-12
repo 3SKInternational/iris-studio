@@ -2994,11 +2994,22 @@ def cmd_status(sf: StateFile) -> int:
 # fix is always a single global manifest edit.
 NO_PEOPLE_SUPPRESSOR = ("ABSOLUTELY NO PEOPLE, NO CHARACTERS, NO FIGURES, "
                         "NO CHIBI, NO CARTOON HUMANS OF ANY KIND.")
+# The one accepted alternative (Steve, 2026-10-11, "Allow flat silhouettes"; logged
+# in 06_CEO/Decisions_Log/2026-10-10_agent_drift_audit_decisions.md, third round):
+# a no-Three shot may show featureless silhouettes, per the faceless-silhouettes
+# rule. V14 refused five such shots (05b_3, 06b_2, 08b_2, 10b_2, 11b_3) because each
+# improvised its own wording. Same exact-substring contract as above: the
+# scene-image-prompt-generator def must emit this string byte for byte. Data cards
+# (prompts that open "No character", as all 256 in the corpus do) still accept ONLY
+# the strict phrase: a silhouette allowance on a card is the V3 figure-on-card bug.
+SILHOUETTE_SUPPRESSOR = ("NO PEOPLE EXCEPT FLAT SOLID BLACK FEATURELESS SILHOUETTES: "
+                         "NO FACES, NO EYES, NO HAIR DETAIL, NO SKIN TONE, NO CHIBI CHARACTERS.")
+ACCEPTED_SUPPRESSORS = (NO_PEOPLE_SUPPRESSOR, SILHOUETTE_SUPPRESSOR)
 
 
 def manifest_suppressor_offenders(manifest_abs: Path) -> list[str]:
-    """Names of every `use_references: false` image whose billed prompt is MISSING
-    the verbatim no-people suppressor. Empty list == clean. Raises on
+    """Names of every `use_references: false` image whose billed prompt carries
+    NEITHER accepted suppressor (ACCEPTED_SUPPRESSORS) verbatim. Empty list == clean. Raises on
     unreadable/malformed JSON so the caller decides (we treat read errors as
     fail-open, mirroring the other best-effort pre-spend guards). A Three shot
     (use_references defaults True) legitimately depicts a figure and is skipped.
@@ -3028,7 +3039,9 @@ def manifest_suppressor_offenders(manifest_abs: Path) -> list[str]:
         prompt = img.get("prompt")
         if not isinstance(prompt, str):
             prompt = ""
-        if NO_PEOPLE_SUPPRESSOR not in prompt:
+        accepted = ((NO_PEOPLE_SUPPRESSOR,) if prompt.startswith("No character")
+                    else ACCEPTED_SUPPRESSORS)
+        if not any(s in prompt for s in accepted):
             # Coerce a non-string/empty name to "<unnamed>" — a truthy non-string
             # name (e.g. 0-typo'd to an int) would slip past `or` and put a
             # non-str in offenders, crashing the call-site `", ".join(...)`.
@@ -3314,7 +3327,8 @@ def cmd_spend_ok(sf: StateFile, force: bool = False) -> int:
                     f"are MISSING the verbatim no-people suppressor — refusing to spend "
                     f"(deterministic guard; this is the V3 re-spend bug). Offenders: {preview}. "
                     f"Fix: every use_references:false prompt must contain "
-                    f"\"{NO_PEOPLE_SUPPRESSOR}\" — then re-run spend-ok.")
+                    f"\"{NO_PEOPLE_SUPPRESSOR}\" or, for a shot with faceless "
+                    f"silhouettes, \"{SILHOUETTE_SUPPRESSOR}\" — then re-run spend-ok.")
             print(line)
             notify(line)
             return 2

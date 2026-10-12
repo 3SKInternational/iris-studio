@@ -779,6 +779,66 @@ class TestRunImageReviewMissingAgent(unittest.TestCase):
             po.AGENTS_DIR = old
 
 
+class TestSuppressorGuard(unittest.TestCase):
+    """manifest_suppressor_offenders: a no-Three shot passes only with one of the two
+    accepted suppressors, verbatim. The silhouette one is Steve's 2026-10-11 call."""
+
+    V14_SILHOUETTE_SHOTS = ("05b_3", "06b_2", "08b_2", "10b_2", "11b_3")
+    # V14's real improvised wording, which the guard refused and must keep refusing.
+    AD_HOC = ("The figure is a flat solid dark silhouette shape with NO facial features. "
+              "ABSOLUTELY NO PEOPLE with faces: Three does NOT appear in this frame.")
+
+    def _offenders(self, images):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"images": images}, f)
+        try:
+            return po.manifest_suppressor_offenders(Path(f.name))
+        finally:
+            os.unlink(f.name)
+
+    def _shots(self, text):
+        return [{"name": f"Video_14_Shot_{s}", "use_references": False,
+                 "prompt": "Flat 2D office scene. " + text}
+                for s in self.V14_SILHOUETTE_SHOTS]
+
+    def test_v14_silhouette_shots_pass_with_the_silhouette_phrase(self):
+        self.assertEqual(self._offenders(self._shots(po.SILHOUETTE_SUPPRESSOR)), [])
+
+    def test_v14_ad_hoc_wording_is_still_refused(self):
+        self.assertEqual(self._offenders(self._shots(self.AD_HOC)),
+                         [f"Video_14_Shot_{s}" for s in self.V14_SILHOUETTE_SHOTS])
+
+    def test_original_phrase_still_passes_and_nothing_else_does(self):
+        self.assertEqual(self._offenders(self._shots(po.NO_PEOPLE_SUPPRESSOR)), [])
+        near_miss = po.SILHOUETTE_SUPPRESSOR.replace("FEATURELESS", "Featureless")
+        self.assertEqual(len(self._offenders(self._shots(near_miss))), 5)
+        self.assertEqual(len(self._offenders(self._shots("no people please"))), 5)
+
+    def test_three_shots_are_not_checked(self):
+        self.assertEqual(self._offenders(
+            [{"name": "three", "use_references": True, "prompt": "Three at a desk."}]), [])
+
+    def test_exactly_two_phrases_are_accepted(self):
+        self.assertEqual(po.ACCEPTED_SUPPRESSORS,
+                         (po.NO_PEOPLE_SUPPRESSOR, po.SILHOUETTE_SUPPRESSOR))
+        # Pin the BYTES: the scene-image-prompt-generator def must emit these exactly,
+        # so an edit here without the def would refuse every shot.
+        self.assertEqual(po.NO_PEOPLE_SUPPRESSOR,
+                         "ABSOLUTELY NO PEOPLE, NO CHARACTERS, NO FIGURES, "
+                         "NO CHIBI, NO CARTOON HUMANS OF ANY KIND.")
+        self.assertEqual(po.SILHOUETTE_SUPPRESSOR,
+                         "NO PEOPLE EXCEPT FLAT SOLID BLACK FEATURELESS SILHOUETTES: "
+                         "NO FACES, NO EYES, NO HAIR DETAIL, NO SKIN TONE, NO CHIBI CHARACTERS.")
+
+    def test_data_cards_accept_only_the_strict_phrase(self):
+        card = {"name": "card", "use_references": False,
+                "prompt": "No character. Flat card with a bar chart. "}
+        self.assertEqual(self._offenders([dict(card, prompt=card["prompt"]
+                                               + po.SILHOUETTE_SUPPRESSOR)]), ["card"])
+        self.assertEqual(self._offenders([dict(card, prompt=card["prompt"]
+                                               + po.NO_PEOPLE_SUPPRESSOR)]), [])
+
+
 class TestSpendOkImageGate(unittest.TestCase):
     """Pass A: the pre-spend PROMPTS gate inside cmd_spend_ok."""
 
