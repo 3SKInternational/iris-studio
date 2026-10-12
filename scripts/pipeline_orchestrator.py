@@ -11,8 +11,9 @@ The 12_leadmagnet phase (added 2026-07-06) drafts the video's free lead-magnet
 companion (lead-magnet-writer) and clears it through its BINARY reviewer gate
 (lead-magnet-reviewer) as an ordinary $0 orchestrator-owned agent stage — the
 same produce→review→fix→re-review→advance-on-SHIP framework as 7_packaging. Only
-the DRAFT+review is automatable: the downstream PDF render → Drive host →
-[LEAD_MAGNET_URL] fill stays manual/out-of-pipeline, so 12_leadmagnet is
+the DRAFT+review is automatable: the PDF render and hosting it behind the
+3skfinance.co email gate (public Drive file + toolkit.html row; see
+Lead_Magnets/_Lead_Magnet_Index.md) stay manual/out-of-pipeline, so 12_leadmagnet is
 deliberately NOT a dep of 10_publish and a REVISE-park on the magnet never wedges
 publish. Only videos --init'd AFTER 2026-07-06 carry the stage; legacy state
 files (V1-V9) predate it and are tolerated-as-absent, never retro-added.
@@ -455,8 +456,8 @@ def default_stages() -> dict:
         # script's number-spine (2_review = the reviewed script) AND the packaging's
         # declared magnet name/archetype (7_packaging). It is deliberately NOT a dep
         # of 10_publish: only the DRAFT+review is automatable here — the downstream
-        # PDF render → Drive host → [LEAD_MAGNET_URL] fill stays manual/out-of-pipeline
-        # (Drive hosting isn't automatable in-pipeline). So a REVISE-park on the magnet
+        # PDF render → Drive file + toolkit.html row behind the 3skfinance.co gate stays
+        # manual/out-of-pipeline (_Lead_Magnet_Index.md). So a REVISE-park on the magnet
         # must never wedge publish. Only videos --init'd AFTER 2026-07-06 carry this
         # stage; legacy in-flight state files (V1-V9) predate it, already have magnets,
         # and are NOT retro-added — the STAGE_ORDER loops tolerate its absence (see
@@ -1181,8 +1182,9 @@ def _stage_prompt(key: str, video: int) -> str:
         "12_leadmagnet": f"Draft the free lead-magnet companion for {v} from its script "
                          f"(BRANDS/3SK_Finance/Scripts/{v}_Script.md) + packaging "
                          f"(BRANDS/3SK_Finance/Packaging/), per the lead-magnet-writer "
-                         f"instructions: RECONCILE to the outro/Scene-18 VO's verbatim magnet "
-                         f"promise, trace every dollar figure VERBATIM to the script's "
+                         f"instructions: RECONCILE to the verbatim magnet promise in the email-list "
+                         f"CTA scene's VO (near the end; a next-video tease may follow "
+                         f"it), trace every dollar figure VERBATIM to the script's "
                          f"number-spine (never invent), NO affiliate links. Write the DRAFT to "
                          f"BRANDS/3SK_Finance/Lead_Magnets/{v}_<Magnet_Name>_DRAFT.md.",
         "9_description": f"Draft the YouTube upload pack for {v} from BRANDS/3SK_Finance/Scripts/"
@@ -1214,9 +1216,10 @@ def run_script_stage(key: str, video: int, force: bool = False) -> tuple[bool, s
     # eventually parks for Steve. The render-fix LOOP closes through the human
     # money-gate, NOT here: regenerating renders is BILLED, so it must NOT auto-run
     # (no-autonomous-spend invariant). The fix path is the same closed loop as Pass
-    # A — correct the prompts per the verdict (free) then re-run `/pipeline N
-    # spend-ok`, which re-reviews + regenerates, and this gate re-checks the fresh
-    # renders.
+    # A — correct the prompts per the verdict (free), then re-roll only the failed
+    # shots with `generate_images.py <manifest> --only <shots> --force` (billed from
+    # the $1 reprint reserve). spend-ok can't do it: after the first batch it finds
+    # nothing to spend on and passes no --force. This gate re-checks the fresh renders.
     #
     # UNAVAILABLE used to be a fail-OPEN exception here ("assembly is free — warn
     # and assemble anyway"). That reasoning weighed the wrong cost: the risk is not
@@ -1287,8 +1290,10 @@ def run_script_stage(key: str, video: int, force: bool = False) -> tuple[bool, s
                            f"+ completed_at)")
         if verdict != "SHIP":
             return False, (f"image-reviewer {verdict} on the rendered images — refusing to "
-                           f"assemble. Fix prompts per {vrel}, then re-run /pipeline "
-                           f"{video} spend-ok to regenerate (BILLED — human-gated). To ship "
+                           f"assemble. Fix prompts per {vrel}, then re-roll only the failed "
+                           f"shots, from iris_studio: image_factory/generate_images.py "
+                           f"{vault_abs(canonical_manifest_rel(video))} --only <shot names> --force "
+                           f"(BILLED from the $1 reprint reserve, human-gated). To ship "
                            f"these renders AS-IS on a recorded human accept, run: "
                            f"pipeline_orchestrator.py --video {video} --advance --force ({detail}).")
     cfg = RUN_TABLE[key]
@@ -1381,8 +1386,8 @@ def run_thumbnail_overlay_stage(video: int) -> tuple[bool, str]:
     spec_rel = f"image_factory/thumb_overlay_v{nn(video)}.json"
     spec_abs = ROOT / spec_rel
     if not spec_abs.exists():
-        return False, (f"thumbnail overlay spec missing ({spec_rel}); thumbnail-coordinator "
-                       f"must emit it from the approved packaging title text.")
+        return False, (f"thumbnail overlay spec missing ({spec_rel}). "
+                       f"{_overlay_proposal_hint(video, spec_rel)}")
     try:
         spec_cards = set(json.loads(spec_abs.read_text()).get("cards", {}))
     except (json.JSONDecodeError, OSError) as e:
@@ -1476,6 +1481,26 @@ IMAGE_REVIEW_TIMEOUT = 900
 # free, so we iterate, but bounded: after this many fix dispatches still HOLD-
 # SPEND, we stop and park for a human rather than burning dispatches forever.
 IMAGE_REVIEW_MAX_FIX_ATTEMPTS = 2
+
+
+def _overlay_proposal_hint(video: int, spec_rel: str) -> str:
+    """What a human does when stage 8 parks for a missing live overlay spec.
+
+    thumbnail-coordinator never writes the live spec; it writes a proposal to
+    Thumbnails/Video_NN_thumb_overlay.proposed.json (a later one gets a _v2-style
+    suffix) and the human review is copying it into the spec stage 8 burns."""
+    thumbs = vault_abs(f"{VAULT_REL}/Thumbnails")
+    try:
+        props = sorted(thumbs.glob(f"Video_{nn(video)}_thumb_overlay*proposed*.json"),
+                       key=lambda f: f.stat().st_mtime)
+    except OSError:
+        props = []
+    if props:
+        return (f"Review the newest proposal {VAULT_REL}/Thumbnails/{props[-1].name} "
+                f"and copy it to {spec_rel}, then re-run stage 8.")
+    return (f"No proposal yet: thumbnail-coordinator writes one to {VAULT_REL}/Thumbnails/"
+            f"Video_{nn(video)}_thumb_overlay.proposed.json from the approved packaging "
+            f"title; review it and copy it to {spec_rel}.")
 
 
 def canonical_manifest_rel(video: int, stages: dict | None = None) -> str:
@@ -1693,7 +1718,8 @@ def run_prompt_fixer(video: int, verdict_rel: str,
         f"discipline, hero rule, banned vocab, the no-baked-text rule, the background "
         f"standard, beat alignment). PRESERVE the manifest JSON schema, the shot order, "
         f"every image `name`, and every already-passing shot UNCHANGED. Do not add or "
-        f"remove shots. Write the corrected manifest back to {manifest_rel}."
+        f"remove shots, except that you may append a missing {v}_Thumbnail_A/_B entry. "
+        f"Write the corrected manifest back to {manifest_rel}."
     )
     cmd = _build_agent_cmd(PROMPT_FIXER_AGENT, prompt)
     try:
@@ -2257,8 +2283,8 @@ STAGE_REVIEW: dict[str, dict] = {
             "packaging-reviewer flagged the {v} packaging as not yet shippable. Read its "
             "review at {verdict_rel} and FIX the packaging in BRANDS/3SK_Finance/Packaging/ "
             "IN PLACE: apply every fix it lists (title quality, hook strength, thumbnail "
-            "text, CTR rationale, moat alignment). PRESERVE the Discoverability_Playbook "
-            "format and every already-passing element UNCHANGED. Write the corrected "
+            "text, CTR rationale, moat alignment). PRESERVE the packaging-strategist "
+            "Output format and every already-passing element UNCHANGED. Write the corrected "
             "packaging back to the same path(s)."
         ),
     },
@@ -2270,8 +2296,9 @@ STAGE_REVIEW: dict[str, dict] = {
             "Review the lead-magnet draft for {v} (BRANDS/3SK_Finance/Lead_Magnets/"
             "{v}_*_DRAFT.md) against its video script "
             "(BRANDS/3SK_Finance/Scripts/{v}_Script.md) and packaging. Verify all six "
-            "dimensions: (1) the magnet's name AND form match the outro/Scene-18 VO's "
-            "verbatim promise, (2) every dollar figure traces VERBATIM to the script's "
+            "dimensions: (1) the magnet's name AND form match the verbatim promise in the "
+            "email-list CTA scene's VO (near the end; a next-video tease may follow "
+            "it), (2) every dollar figure traces VERBATIM to the script's "
             "number-spine — a single fabricated or mis-traced figure is an automatic "
             "REVISE, (3) NO affiliate links / product CTAs in the magnet, (4) Brand Bible "
             "voice, (5) print-and-write PDF format with the promised fill-in fields, (6) "

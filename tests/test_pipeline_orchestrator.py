@@ -839,6 +839,49 @@ class TestSuppressorGuard(unittest.TestCase):
                                                + po.NO_PEOPLE_SUPPRESSOR)]), [])
 
 
+class TestStage8ParkPointsAtProposal(unittest.TestCase):
+    """A stage-8 park for a missing live overlay spec names the proposal the human
+    reviews (thumbnail-coordinator never writes the live spec; 2026-10-11)."""
+
+    def _run(self, proposals):
+        saved = (po.ROOT, po.WORKSPACE_DIR)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            po.ROOT = d / "repo"            # no image_factory/thumb_overlay_v15.json
+            po.WORKSPACE_DIR = d / "vault"
+            thumbs = po.WORKSPACE_DIR / po.VAULT_REL / "Thumbnails"
+            thumbs.mkdir(parents=True)
+            for i, name in enumerate(proposals):
+                f = thumbs / name
+                f.write_text("{}")
+                os.utime(f, (1000 + i, 1000 + i))   # later in the list = newer
+            try:
+                return po.run_thumbnail_overlay_stage(15)
+            finally:
+                po.ROOT, po.WORKSPACE_DIR = saved
+
+    def test_names_the_newest_proposal(self):
+        ok, detail = self._run(["Video_15_thumb_overlay.proposed.json",
+                                "Video_15_thumb_overlay_v2.proposed.json",
+                                "Video_14_thumb_overlay.proposed.json"])
+        self.assertFalse(ok)
+        self.assertIn("Video_15_thumb_overlay_v2.proposed.json", detail)
+        self.assertIn("copy it to image_factory/thumb_overlay_v15.json", detail)
+        self.assertNotIn("Video_14", detail)
+
+    def test_newest_is_by_time_not_by_name(self):
+        # _v2 sorts after _v10 by name; the newer _v10 must still win.
+        ok, detail = self._run(["Video_15_thumb_overlay_v2.proposed.json",
+                                "Video_15_thumb_overlay_v10.proposed.json"])
+        self.assertIn("Video_15_thumb_overlay_v10.proposed.json", detail)
+
+    def test_no_proposal_says_where_one_will_appear(self):
+        ok, detail = self._run([])
+        self.assertFalse(ok)
+        self.assertIn("No proposal yet", detail)
+        self.assertIn("Thumbnails/Video_15_thumb_overlay.proposed.json", detail)
+
+
 class TestSpendOkImageGate(unittest.TestCase):
     """Pass A: the pre-spend PROMPTS gate inside cmd_spend_ok."""
 
