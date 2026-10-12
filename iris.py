@@ -138,6 +138,12 @@ _lint_spec = _importlib_util.spec_from_file_location(
 _agent_output_lint = _importlib_util.module_from_spec(_lint_spec)
 _lint_spec.loader.exec_module(_agent_output_lint)
 
+_imsg_spec = _importlib_util.spec_from_file_location(
+    "imessage_bridge", PROJECT_DIR / "imessage_bridge.py"
+)
+imessage_bridge = _importlib_util.module_from_spec(_imsg_spec)
+_imsg_spec.loader.exec_module(imessage_bridge)
+
 # scriptwriter post-dispatch docx hook helper. Same local-importlib pattern so
 # the scripts/ dir stays off sys.path. Best-effort: a load failure here must not
 # stop the daemon, so guard it and degrade to "no auto-docx" on any error.
@@ -342,6 +348,16 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 TELEGRAM_CAPTION_MAX = 1024  # Telegram caption hard limit
 # Local file queue the daemon watches (logs already live under this dir).
 OUTBOX_DIR = Path("/Users/steve/iris_studio/outbox")
+
+# iMessage chat surface (2026-10-11). Off unless IRIS_IMESSAGE_HANDLES lists the
+# phone numbers / emails Steve texts from (as chat.db stores them, e.g. +15551234567).
+IMESSAGE_HANDLES: set[str] = {
+    h.strip().lower()
+    for h in os.environ.get("IRIS_IMESSAGE_HANDLES", "").split(",")
+    if h.strip()
+}
+IMESSAGE_CURSOR_FILE = Path("/Users/steve/iris_studio/state/imessage_cursor")
+IMESSAGE_POLL_SECONDS = 3  # mutequiv: tuning value, no contract on 3 vs 4 s
 OUTBOX_DRAIN_INTERVAL_SECONDS = 10
 # Generic inbound media (non-RECEIPT photos + documents) land here, under the
 # daemon's own capture surface in _Iris_Memory — NOT under 02_Finance/Receipts/
@@ -4065,6 +4081,7 @@ async def _post_init(application) -> None:
             "Scheduler not starting — no authorized users. Morning briefing disabled."
         )
         return
+    _start_imessage_surface()
     # In private chats, chat_id == user_id. ALLOWED_USER_IDS is keyed by
     # Telegram user IDs; use the first authorized user as the briefing target.
     target_chat_id = next(iter(ALLOWED_USER_IDS))
@@ -4590,7 +4607,18 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
 # Orchestrator
 # ============================================================
 
+# One model turn at a time across Telegram + iMessage. PTB runs Telegram updates
+# one by one, but the iMessage loop is a second caller on the same chat, and two
+# concurrent mlx_generate threads on one local model are not documented as safe.
+_ASK_LOCK = asyncio.Lock()
+
+
 async def ask_iris(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
+    async with _ASK_LOCK:
+        return await _ask_iris_unlocked(prompt, chat_id, user_id)
+
+
+async def _ask_iris_unlocked(prompt: str, chat_id: str, user_id: int) -> tuple[str, str]:
     """Decide tier, fetch history, call model, save both sides of the exchange.
 
     Returns (response_text, tier_actually_used) where tier is 'local',
@@ -5146,6 +5174,140 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as exc:
             logger.warning(f"chat-tool SEND_FILE refused/failed for {src!r}: {exc}")
             await update.message.reply_text(f"⚠️ Couldn't send that file ({src}): {exc}")
+
+
+# ============================================================
+# iMessage chat surface
+# ============================================================
+# Polls chat.db for new 1:1 iMessages from IMESSAGE_HANDLES and answers them
+# through ask_iris. It shares the Telegram conversation (same chat_id), so
+# history is one thread and dispatch results / SEND_FILE attachments land in
+# Telegram. Slash commands stay Telegram-only: /pipeline spend-ok and /approve
+# move money and the bot allowlist is their audited gate.
+
+_imessage_task: asyncio.Task | None = None  # held so the loop isn't GC'd
+
+
+def _start_imessage_surface() -> None:
+    """Start the poll loop only when handles are configured, so a daemon
+    without IRIS_IMESSAGE_HANDLES never touches chat.db or raises FDA alerts."""
+    global _imessage_task
+    if IMESSAGE_HANDLES:
+        for h in sorted(IMESSAGE_HANDLES):
+            if "@" not in h and not re.fullmatch(r"\+\d{8,15}", h):
+                logger.warning(f"iMessage handle {h!r} is not +E.164 or an email; "
+                               "chat.db will likely never match it.")
+        _imessage_task = asyncio.create_task(_imessage_loop())
+        _imessage_task.add_done_callback(_on_imessage_task_done)
+        logger.info(f"iMessage surface on for {sorted(IMESSAGE_HANDLES)}.")
+
+
+def _on_imessage_task_done(task: asyncio.Task) -> None:
+    """The task is held in a global, so asyncio never reports its death. Do it here."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(f"iMessage loop died: {exc!r}")
+        _alert_steve(f"🔴 Iris's iMessage loop died: {exc!r}\n\nRestart the daemon "
+                     "after fixing; Telegram is unaffected.")
+
+
+def _save_imessage_cursor(cursor: int) -> None:
+    try:
+        imessage_bridge.save_cursor(IMESSAGE_CURSOR_FILE, cursor)
+    except OSError as exc:
+        logger.warning(f"iMessage: cursor save failed ({exc}); a restart may re-answer.")
+
+
+async def _answer_imessage(handle: str, text: str) -> str:
+    """Answer one text and return the reply sent (the loop uses it to spot echoes)."""
+    logger.info(f"iMessage from {handle}: {text[:80]!r}")  # mutequiv: log truncation only
+    tg_chat = next(iter(ALLOWED_USER_IDS))
+    chat_id, user_id, username = str(tg_chat), tg_chat, f"imessage:{handle}"
+    send_srcs: list[str] = []
+    if text.startswith(("/", "!")):
+        reply = "Commands only work in Telegram. Text me in plain words here."
+    else:
+        # Same capture side effects as handle_message, so the model's "captured"
+        # reply is true on this surface too.
+        brain_prefix = _detect_brain_capture(text)
+        if brain_prefix:
+            rel = await save_brain_capture(brain_prefix, text, user_id, username)
+            reply = (f"🧠 Captured to your second brain → {rel}." if rel else
+                     "🧠 Couldn't write that to the second-brain inbox (see daemon logs). Not filed.")
+        else:
+            qc_prefix = _detect_quick_capture(text)
+            if qc_prefix:
+                await save_quick_capture(qc_prefix, text, user_id, username)
+                await route_quick_capture(qc_prefix, text, user_id, username)
+            try:
+                reply, tier = await ask_iris(text, chat_id=chat_id, user_id=user_id)
+                if tier.startswith("cloud"):
+                    reply, send_srcs = _extract_send_file_directives(reply)
+            except Exception as exc:
+                logger.exception("iMessage: Iris call failed")
+                reply = f"Iris hit an error: {exc}"
+    if send_srcs:
+        reply = (reply + "\n\n(File sent to Telegram.)").strip()
+    reply = reply or "(no reply)"
+    try:
+        await asyncio.to_thread(imessage_bridge.send, handle, reply)
+        logger.info(f"iMessage to {handle}: {reply[:100]!r}")  # mutequiv: log truncation only
+    except Exception as exc:
+        logger.warning(f"iMessage send to {handle} failed: {exc}")
+        _alert_steve(f"🔴 iMessage reply to {handle} failed: {exc}\n\nReply was:\n{reply[:3000]}")  # mutequiv: alert truncation only
+    for src in send_srcs:
+        try:
+            await send_media_to_chat(_telegram_bot, tg_chat, _safe_vault_path(src))
+        except Exception as exc:
+            logger.warning(f"iMessage SEND_FILE to Telegram failed for {src!r}: {exc}")
+    return reply
+
+
+async def _imessage_loop() -> None:
+    """Poll chat.db forever. The cursor moves to each message's ROWID just
+    before answering it, so a crash mid-answer drops only that message rather
+    than answering (and spending) twice."""
+    cursor = imessage_bridge.load_cursor(IMESSAGE_CURSOR_FILE)
+    read_failing = False
+    last_reply: dict[str, str] = {}
+    while True:
+        await asyncio.sleep(IMESSAGE_POLL_SECONDS)
+        try:
+            if cursor is None:  # first run: start at now, don't replay history
+                top, msgs = await asyncio.to_thread(imessage_bridge.max_rowid), []
+            else:
+                top, msgs = await asyncio.to_thread(
+                    imessage_bridge.fetch_new, imessage_bridge.CHAT_DB, cursor, IMESSAGE_HANDLES)
+        except Exception as exc:
+            if not read_failing:
+                read_failing = True
+                logger.warning(f"iMessage: can't read chat.db: {exc}")
+                err = str(exc).lower()
+                if "authoriz" in err or "unable to open" in err:
+                    hint = (f"Grant Full Disk Access to {os.path.realpath(sys.executable)} "
+                            "(System Settings → Privacy & Security → Full Disk Access). "
+                            "It retries by itself every few seconds; texts older than "
+                            "10 minutes when it recovers are logged and skipped.")
+                else:
+                    hint = "chat.db may have changed shape (macOS update?); the bridge needs a look."
+                _alert_steve(f"🔴 Iris can't read iMessages: {exc}\n\n{hint}")
+            continue
+        read_failing = False
+        for rowid, handle, text in msgs:
+            _save_imessage_cursor(rowid)
+            # If Messages here is signed into Steve's own Apple ID, Iris's reply
+            # can come back as an incoming row. Answering it would loop forever.
+            if text == last_reply.get(handle):
+                logger.info(f"iMessage: skipped echo of our own reply to {handle}")
+                continue
+            try:
+                last_reply[handle] = await _answer_imessage(handle, text)
+            except Exception:
+                logger.exception(f"iMessage: answering {handle} failed")
+        cursor = top
+        _save_imessage_cursor(cursor)
 
 
 # ============================================================
