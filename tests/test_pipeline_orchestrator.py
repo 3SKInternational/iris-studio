@@ -1317,6 +1317,83 @@ class TestAnalyzeWaitsForData(unittest.TestCase):
         self.assertEqual(reviewed, ["11_analyze"])
 
 
+class TestReviewsRejectStaleVerdicts(unittest.TestCase):
+    """Script, VO and stage reviews each write one fixed per-video verdict path; a
+    reviewer that exits 0 without writing must not hand back the previous run's SHIP
+    (same guard as run_image_review, 2026-10-12)."""
+
+    STALE_SHIP = "---\nstatus: ok\n---\n## VERDICT: SHIP\n"
+
+    def _with_stale(self, agent, call):
+        saved = (po.AGENTS_DIR, po._run_agent, po.vault_abs, po.notify)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / f"{agent}.md").write_text("stub")
+            verdict = d / "verdict.md"
+            verdict.write_text(self.STALE_SHIP)
+            os.utime(verdict, (time.time() - 3600, time.time() - 3600))
+            kit = d / "kit.md"
+            kit.write_text("## Scene 1\nhello\n")
+            po.AGENTS_DIR = d
+            po._run_agent = lambda cmd, timeout, label: subprocess.CompletedProcess(
+                cmd, 0, stdout="VERDICT: SHIP", stderr="")   # wrote nothing
+            po.vault_abs = lambda rel: kit if rel and "Kit" in rel else verdict
+            po.notify = lambda *a, **k: None
+            try:
+                return call()
+            finally:
+                po.AGENTS_DIR, po._run_agent, po.vault_abs, po.notify = saved
+
+    def test_script_review(self):
+        v, _, detail = self._with_stale(po.SCRIPT_REVIEWER_AGENT,
+                                        lambda: po.run_script_review(15))
+        self.assertEqual(v, "UNAVAILABLE")
+        self.assertIn("not written by this run", detail)
+
+    def test_vo_review(self):
+        v, _, detail = self._with_stale(po.VO_REVIEWER_AGENT,
+                                        lambda: po.run_vo_review(15, "x_VO_Session_B_Kit.md"))
+        self.assertEqual(v, "UNAVAILABLE")
+
+    def test_stage_review(self):
+        v, _, detail = self._with_stale(po.STAGE_REVIEW["7_packaging"]["reviewer"],
+                                        lambda: po.run_stage_review("7_packaging", 15))
+        self.assertEqual(v, "UNAVAILABLE")
+
+    def test_edited_vo_kit_with_stale_ship_is_not_promoted(self):
+        # The money path: a new kit must not ride an old SHIP to "safe to render".
+        s = {"status": "needs-steve", "vo_review": {"kit_mtime": 1.0, "verdict": "SHIP"}}
+        out = self._with_stale(po.VO_REVIEWER_AGENT,
+                               lambda: po._maybe_promote_vo_expand(s, 15, None))
+        self.assertNotEqual(out, "promoted")
+        self.assertNotEqual(s["status"], "done")
+
+    def _fresh(self, agent, call):
+        saved = (po.AGENTS_DIR, po._run_agent, po.vault_abs)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / f"{agent}.md").write_text("stub")
+            verdict = d / "verdict.md"
+
+            def _agent(cmd, timeout, label):          # the reviewer writes this run
+                verdict.write_text(self.STALE_SHIP)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            po.AGENTS_DIR, po._run_agent = d, _agent
+            po.vault_abs = lambda rel: verdict
+            try:
+                return call()[0]
+            finally:
+                po.AGENTS_DIR, po._run_agent, po.vault_abs = saved
+
+    def test_fresh_verdict_still_parses(self):
+        self.assertEqual(self._fresh(po.VO_REVIEWER_AGENT,
+                                     lambda: po.run_vo_review(15, "kit.md")), "SHIP")
+        self.assertEqual(self._fresh(po.SCRIPT_REVIEWER_AGENT,
+                                     lambda: po.run_script_review(15)), "SHIP")
+        self.assertEqual(self._fresh(po.STAGE_REVIEW["7_packaging"]["reviewer"],
+                                     lambda: po.run_stage_review("7_packaging", 15)), "SHIP")
+
+
 class TestSpendOkImageGate(unittest.TestCase):
     """Pass A: the pre-spend PROMPTS gate inside cmd_spend_ok."""
 

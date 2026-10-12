@@ -1591,6 +1591,13 @@ _VERDICT_TOKEN_RE = re.compile(
 _VERDICT_LABEL_RE = re.compile(r"^\s*[*_#>\s]*verdict\b[*_:\s-]*", re.IGNORECASE)
 
 
+# A review's verdict file counts only if this run wrote it (mtime >= dispatch start
+# minus this slack, for clock and whole-second filesystem timestamps). Every review
+# writes one fixed per-video path, so without it an exit-0 run that wrote nothing
+# would hand back the previous verdict.
+VERDICT_MTIME_SLACK_S = 1  # mutequiv: 1 vs 2 s tolerance, no exact-value contract
+
+
 def _image_review_verdict_rel(video: int) -> str:
     return f"{VAULT_REL}/Raw_Assets/Image_Factory/_REVIEW/Video_{nn(video)}_Image_Review.md"
 
@@ -1753,7 +1760,7 @@ def run_image_review(mode: str, video: int,
         # Both modes share one verdict path, so a reviewer that exits 0 without
         # writing would otherwise hand back the LAST run's verdict (drift audit C11).
         # 1 s of slack for clock and filesystem timestamp granularity.
-        if verdict_abs.stat().st_mtime < started - 1:  # mutequiv: 1 vs 2 s slack, no exact-value contract
+        if verdict_abs.stat().st_mtime < started - VERDICT_MTIME_SLACK_S:
             return "UNAVAILABLE", verdict_rel, "verdict file was not written by this run"
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
     if _status_blocked(text):
@@ -1855,6 +1862,7 @@ def run_script_review(video: int) -> tuple[str, str, str]:
     except DispatchContextError as e:
         return "UNAVAILABLE", verdict_rel, f"dispatch context ambiguous: {e}"
     cmd = _build_agent_cmd(SCRIPT_REVIEWER_AGENT, prompt)
+    started = time.time()
     try:
         proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "review"))
     except subprocess.TimeoutExpired:
@@ -1867,6 +1875,11 @@ def run_script_review(video: int) -> tuple[str, str, str]:
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
+        # Each review writes one fixed per-video path, so a reviewer that exits 0
+        # without writing would hand back the LAST run's verdict, e.g. an old SHIP
+        # for an edited VO kit (same guard as run_image_review, 2026-10-12).
+        if verdict_abs.stat().st_mtime < started - VERDICT_MTIME_SLACK_S:
+            return "UNAVAILABLE", verdict_rel, "verdict file was not written by this run"
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
     verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
     if verdict is None:
@@ -2212,6 +2225,7 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
         f"fixes': if it is not all good to go, none of it goes to the billed render."
     )
     cmd = _build_agent_cmd(VO_REVIEWER_AGENT, prompt)
+    started = time.time()
     try:
         proc = _run_agent(cmd, VO_REVIEW_TIMEOUT, _agent_log_label(cmd, "review"))
     except subprocess.TimeoutExpired:
@@ -2224,6 +2238,11 @@ def run_vo_review(video: int, kit_rel: str) -> tuple[str, str, str]:
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
+        # Each review writes one fixed per-video path, so a reviewer that exits 0
+        # without writing would hand back the LAST run's verdict, e.g. an old SHIP
+        # for an edited VO kit (same guard as run_image_review, 2026-10-12).
+        if verdict_abs.stat().st_mtime < started - VERDICT_MTIME_SLACK_S:
+            return "UNAVAILABLE", verdict_rel, "verdict file was not written by this run"
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
     if _status_blocked(text):
         return "UNAVAILABLE", verdict_rel, "reviewer wrote status: blocked-* (no verdict)"
@@ -2661,6 +2680,7 @@ def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
     except DispatchContextError as e:
         return "UNAVAILABLE", verdict_rel, f"dispatch context ambiguous: {e}"
     cmd = _build_agent_cmd(reviewer, prompt)
+    started = time.time()
     try:
         proc = _run_agent(cmd, timeout, _agent_log_label(cmd, "review"))
     except subprocess.TimeoutExpired:
@@ -2673,6 +2693,11 @@ def run_stage_review(key: str, video: int) -> tuple[str, str, str]:
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
+        # Each review writes one fixed per-video path, so a reviewer that exits 0
+        # without writing would hand back the LAST run's verdict, e.g. an old SHIP
+        # for an edited VO kit (same guard as run_image_review, 2026-10-12).
+        if verdict_abs.stat().st_mtime < started - VERDICT_MTIME_SLACK_S:
+            return "UNAVAILABLE", verdict_rel, "verdict file was not written by this run"
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
     verdict = _parse_image_verdict(text) or _parse_image_verdict(proc.stdout or "")
     if verdict is None:
