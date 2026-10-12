@@ -1436,7 +1436,8 @@ def run_thumbnail_overlay_stage(video: int) -> tuple[bool, str]:
         notify(f"⚠️ Video {video} stage-8 thumbnail: burned {sorted(backplates)} but "
                f"spec variant(s) {dropped} had no rendered backplate — shipping "
                f"{len(finals)} of {len(spec_cards)} thumbnail variants. Re-render the "
-               f"missing variant if A/B coverage is needed.")
+               f"missing variant if A/B coverage is needed.",
+               force=True)  # the hourly sweep sets SUPPRESS_NOTIFY; a dropped A/B alt must still ping
     tail = (proc.stdout or "").strip()[-220:]
     note = f"burned {len(finals)}/{len(spec_cards)} variants" + (
         f"; DROPPED {dropped}" if dropped else "")
@@ -1678,6 +1679,7 @@ def run_image_review(mode: str, video: int,
         f"good to go, none of it goes."
     )
     cmd = _build_agent_cmd(IMAGE_REVIEWER_AGENT, prompt)
+    started = time.time()
     try:
         proc = _run_agent(cmd, IMAGE_REVIEW_TIMEOUT, _agent_log_label(cmd, f"{mode}"))
     except subprocess.TimeoutExpired:
@@ -1692,6 +1694,11 @@ def run_image_review(mode: str, video: int,
     verdict_abs = vault_abs(verdict_rel)
     text = ""
     if verdict_abs and verdict_abs.exists():
+        # Both modes share one verdict path, so a reviewer that exits 0 without
+        # writing would otherwise hand back the LAST run's verdict (drift audit C11).
+        # 1 s of slack for clock and filesystem timestamp granularity.
+        if verdict_abs.stat().st_mtime < started - 1:  # mutequiv: 1 vs 2 s slack, no exact-value contract
+            return "UNAVAILABLE", verdict_rel, "verdict file was not written by this run"
         text = verdict_abs.read_text(encoding="utf-8", errors="replace")
     if _status_blocked(text):
         return "UNAVAILABLE", verdict_rel, "reviewer wrote status: blocked-* (no verdict)"
@@ -2002,12 +2009,24 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
     surviving the fix budget) parks: returns False so the stage goes needs-steve.
     Returns the (ok, out) the dispatcher expects."""
     wc_state, wc_detail = run_script_wordcount_check(video)
+    notes = []
+    fixed = False
+    if wc_state == "mismatch":
+        # Counts and spans are derived from the VO text, so re-derive them first
+        # (vo_wordcount --fix, deterministic, the same step _respine runs after the
+        # loop) and refuse only if the spine still disagrees (drift audit C27).
+        fixed, _fix_detail = _respine(video)
+        # --fix writes what it can even when it exits 1 on a residual; re-check either
+        # way so a refusal lists only what is still wrong in the file.
+        wc_state, wc_detail = run_script_wordcount_check(video)
     if wc_state == "mismatch":
         return False, ("script word-count / timestamp spine is inconsistent "
                        "(deterministic vo_wordcount.py --check) — refusing to advance. "
                        "Correct the frontmatter word-count-vo-only/runtime-target, the "
                        "per-scene [mm:ss-mm:ss] headers, and the Timestamps chapter list, "
                        f"then re-run /pipeline {video}.\n{wc_detail}")
+    if fixed:
+        notes.append("spine re-derived before review (vo_wordcount --fix)")
     if wc_state == "error":
         # force=True: the hourly --advance-all sweep sets SUPPRESS_NOTIFY, so a
         # broken front-gate would degrade invisibly without it. A genuinely broken
@@ -2018,9 +2037,25 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
     # Snapshot the per-video VO rate override BEFORE the fix loop can clobber it.
     script_path, rate_before = _read_rate_wpm(video)
     verdict, vrel, detail = run_script_review_loop(video)
+    # 1) Did a scriptwriter fix silently reset the rate override? Put it back on
+    #    EVERY outcome, not just SHIP: a parked REVISE used to keep the fixer's rate,
+    #    and the human picking it up got the wrong spine (drift audit item 7).
+    if verdict != "SHIP" and script_path is not None and rate_before not in (
+            None, "UNPARSEABLE"):
+        _, rate_after = _read_rate_wpm(video)
+        if rate_after not in (None, "UNPARSEABLE") and rate_after != rate_before:
+            if _restore_rate_wpm(script_path, rate_before):
+                ok, _rdetail = _respine(video)
+                notes.append(f"restored rate-wpm {rate_after}->{rate_before}; spine "
+                             f"re-derived: {'ok' if ok else 'FAILED ' + _rdetail}")
+        elif rate_after is None:
+            notes.append(f"the auto-fix loop removed `rate-wpm: {rate_before}`; restore "
+                         f"it and run `vo_wordcount.py <script> --fix`")
+        elif rate_after == "UNPARSEABLE":
+            notes.append(f"the auto-fix loop left an unparseable `rate-wpm` (was "
+                         f"{rate_before}); write `rate-wpm: {rate_before}` and run "
+                         f"`vo_wordcount.py <script> --fix`")
     if verdict == "SHIP":
-        notes = []
-        # 1) Did a scriptwriter fix silently reset the rate override? Put it back.
         if script_path is not None and rate_before is not None:
             _, rate_after = _read_rate_wpm(video)
             if rate_before == "UNPARSEABLE" or rate_after == "UNPARSEABLE":
@@ -2076,11 +2111,13 @@ def run_script_review_gate(video: int) -> tuple[bool, str]:
                            + f"\n{post_detail}")
         suffix = (" " + "; ".join(notes)) if notes else ""
         return True, f"script-reviewer SHIP ({vrel}). {detail}{suffix}"
+    tail = (f" [{'; '.join(notes)}]" if notes else "")
     if verdict == "UNAVAILABLE":
         return False, (f"reviewer-unavailable: stage-2 script review could not run "
-                       f"({detail[:120]}) — left ready to retry, NOT advanced (binary gate).")
+                       f"({detail[:120]}) — left ready to retry, NOT advanced (binary gate)."  # mutequiv: message truncation cap only
+                       + tail)
     return False, (f"script-reviewer {verdict} on the script after auto-fix — refusing to "
-                   f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})")
+                   f"advance. Fix per {vrel}, then re-run /pipeline {video}. ({detail})" + tail)
 
 
 # === Stage-3 VO-kit review (vo-reviewer) — reviewed auto-promote, render manual ===
@@ -2733,6 +2770,16 @@ def _producer_artifact_ok(key: str, video: int) -> tuple[bool, str]:
     if p.is_file():
         if p.stat().st_size <= 0:
             return False, f"declared artifact is empty after exit 0: {rel}"
+        # An agent that could not do the work writes a skeleton with
+        # `status: blocked-*` frontmatter; that is not a deliverable (drift audit K2).
+        try:
+            # .md only: this helper also checks the stage-6 master mp4, which must
+            # never be read into memory.
+            if p.suffix.lower() == ".md" and _status_blocked(
+                    p.read_text(encoding="utf-8", errors="replace")):
+                return False, f"declared artifact says status: blocked-* after exit 0: {rel}"
+        except OSError:
+            pass
         return True, ""
     # Directory artifact: require at least one non-zero-byte file somewhere under it.
     total = 0

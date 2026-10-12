@@ -35,6 +35,16 @@ check("silhouette scene is NOT a card",
       not msl._is_card("A single figure across a desk. " + po.SILHOUETTE_SUPPRESSOR))
 check("plain Three scene is not a card", not msl._is_card("Three at a desk, smiling."))
 
+def _banned(prompt):
+    return [f for f in msl.lint({"images": [{"name": "s", "prompt": prompt}]}, "")
+            if f[1] == "banned-vocab"]
+
+
+check("'dramatic lighting' is banned", bool(_banned("Flat room, dramatic lighting.")))
+check("bare 'dramatic' is not (K3, 2026-10-12)", not _banned("A dramatic shadow falls."))
+check("'BANNED' holds the phrase, not the bare word",
+      "dramatic lighting" in msl.BANNED and "dramatic" not in msl.BANNED)
+
 if FAILS:
     print(f"test_manifest_spine_lint_card: FAIL ({len(FAILS)})")
     sys.exit(1)

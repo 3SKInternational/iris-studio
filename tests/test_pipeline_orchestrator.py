@@ -654,16 +654,39 @@ class TestImageGateStrictVerdict(unittest.TestCase):
             d = Path(d)
             (d / f"{po.IMAGE_REVIEWER_AGENT}.md").write_text("stub")
             verdict_file = d / "verdict.md"
-            if file_text is not None:
-                verdict_file.write_text(file_text)
             po.AGENTS_DIR = d
-            po._run_agent = lambda cmd, timeout, label: subprocess.CompletedProcess(
-                cmd, 0, stdout=stdout, stderr="")
+
+            def _agent(cmd, timeout, label):
+                if file_text is not None:      # the reviewer writes during its run
+                    verdict_file.write_text(file_text)
+                return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+            po._run_agent = _agent
             po.vault_abs = lambda rel: verdict_file
             try:
                 return po.run_image_review("prompts", 3)[0]
             finally:
                 po.AGENTS_DIR, po._run_agent, po.vault_abs = saved
+
+    def test_stale_verdict_file_is_unavailable(self):
+        """A reviewer that exits 0 without writing must not inherit the last verdict
+        at the shared path (drift audit C11)."""
+        saved = (po.AGENTS_DIR, po._run_agent, po.vault_abs)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / f"{po.IMAGE_REVIEWER_AGENT}.md").write_text("stub")
+            old = d / "verdict.md"
+            old.write_text("---\nstatus: ok\n---\n## VERDICT: SHIP\n")
+            os.utime(old, (time.time() - 3600, time.time() - 3600))
+            po.AGENTS_DIR = d
+            po._run_agent = lambda cmd, timeout, label: subprocess.CompletedProcess(
+                cmd, 0, stdout="", stderr="")
+            po.vault_abs = lambda rel: old
+            try:
+                verdict, _, detail = po.run_image_review("renders", 3)
+            finally:
+                po.AGENTS_DIR, po._run_agent, po.vault_abs = saved
+        self.assertEqual(verdict, "UNAVAILABLE")
+        self.assertIn("not written by this run", detail)
 
     def test_blocked_skeleton_is_unavailable(self):
         txt = ("---\nstatus: blocked-no-manifest\n---\n\n"
@@ -880,6 +903,172 @@ class TestStage8ParkPointsAtProposal(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("No proposal yet", detail)
         self.assertIn("Thumbnails/Video_15_thumb_overlay.proposed.json", detail)
+
+
+class TestProducerArtifactBlocked(unittest.TestCase):
+    """A deliverable whose frontmatter says status: blocked-* is not done (K2)."""
+
+    def _ok(self, text):
+        saved = po.WORKSPACE_DIR
+        with tempfile.TemporaryDirectory() as d:
+            po.WORKSPACE_DIR = Path(d)
+            try:
+                rel = po.stage_artifact_path("1_script", 15)
+                p = po.vault_abs(rel)
+                p.parent.mkdir(parents=True)
+                p.write_text(text)
+                return po._producer_artifact_ok("1_script", 15)
+            finally:
+                po.WORKSPACE_DIR = saved
+
+    def test_blocked_skeleton_is_not_done(self):
+        ok, why = self._ok("---\ndate: 2026-10-12\nstatus: blocked-no-topic\n---\nx\n")
+        self.assertFalse(ok)
+        self.assertIn("status: blocked-*", why)
+
+    def test_non_markdown_artifact_is_never_read(self):
+        # The stage-6 artifact is the master mp4; reading it would load the whole file.
+        saved = po.WORKSPACE_DIR
+        with tempfile.TemporaryDirectory() as d:
+            po.WORKSPACE_DIR = Path(d)
+            try:
+                rel = po.stage_artifact_path("6_assemble", 15)
+                self.assertTrue(rel.endswith(".mp4"), rel)
+                p = po.vault_abs(rel)
+                p.parent.mkdir(parents=True)
+                p.write_text("---\nstatus: blocked-x\n---\n")
+                self.assertEqual(po._producer_artifact_ok("6_assemble", 15), (True, ""))
+            finally:
+                po.WORKSPACE_DIR = saved
+
+    def test_real_deliverable_is_done(self):
+        self.assertEqual(self._ok("---\nstatus: ok\n---\n# Script\n"), (True, ""))
+        # "blocked" in the body, not the frontmatter, does not count.
+        self.assertEqual(self._ok("# Script\nstatus: blocked-x\n"), (True, ""))
+
+
+class TestStage8DroppedVariantPings(unittest.TestCase):
+    """A dropped A/B variant must ping even on the hourly sweep (C16)."""
+
+    def test_dropped_variant_notify_is_forced(self):
+        saved = (po.ROOT, po.WORKSPACE_DIR, po.subprocess.run, po.notify,
+                 po.SUPPRESS_NOTIFY)
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            po.ROOT, po.WORKSPACE_DIR = d / "repo", d / "vault"
+            spec = po.ROOT / "image_factory" / "thumb_overlay_v15.json"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(json.dumps({"cards": {"Video_15_Thumbnail_A": [],
+                                                  "Video_15_Thumbnail_B": []}}))
+            art = po.vault_abs(f"{po.VAULT_REL}/Raw_Assets/Video_15_HD")
+            art.mkdir(parents=True)
+            (art / "Video_15_Thumbnail_A.png").write_bytes(b"png")   # B never rendered
+            out = po.vault_abs(f"{po.VAULT_REL}/Thumbnails/Video_15_gen")
+
+            def _burn(cmd, **k):
+                (out / "Video_15_Thumbnail_A_FINAL.png").write_bytes(b"png")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            po.subprocess.run = _burn
+            po.notify = lambda msg, force=False: sent.append((msg, force))
+            po.SUPPRESS_NOTIFY = True
+            try:
+                ok, detail = po.run_thumbnail_overlay_stage(15)
+            finally:
+                (po.ROOT, po.WORKSPACE_DIR, po.subprocess.run, po.notify,
+                 po.SUPPRESS_NOTIFY) = saved
+        self.assertTrue(ok, detail)
+        self.assertIn("DROPPED", detail)
+        self.assertEqual([f for _, f in sent], [True], sent)
+        self.assertIn("Video_15_Thumbnail_B", sent[0][0])
+
+
+class TestScriptReviewGateFixes(unittest.TestCase):
+    """Stage-2 gate: re-derive the spine before refusing (C27), and restore a
+    clobbered rate-wpm on every outcome, not just SHIP (item 7)."""
+
+    def _gate(self, checks, verdict, rates, respine_ok=True):
+        names = ("run_script_wordcount_check", "_respine", "run_script_review_loop",
+                 "_read_rate_wpm", "_restore_rate_wpm", "notify")
+        saved = {n: getattr(po, n) for n in names}
+        calls = {"respine": 0, "restore": []}
+        checks, rates = list(checks), list(rates)
+
+        def _respine(v):
+            calls["respine"] += 1
+            return respine_ok, "fixed"
+        po.run_script_wordcount_check = lambda v: checks.pop(0)
+        po._respine = _respine
+        po.run_script_review_loop = lambda v: (verdict, "rev.md", "detail")
+        po._read_rate_wpm = lambda v: (Path("/x/Video_15_Script.md"), rates.pop(0))
+        po._restore_rate_wpm = lambda p, want: calls["restore"].append(want) or True
+        po.notify = lambda *a, **k: None
+        try:
+            return po.run_script_review_gate(15), calls
+        finally:
+            for n, f in saved.items():
+                setattr(po, n, f)
+
+    def test_mismatch_is_fixed_before_review(self):
+        (ok, msg), calls = self._gate(
+            [("mismatch", "bad"), ("pass", ""), ("pass", "")], "SHIP", [None, None])
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls["respine"], 1)
+        self.assertIn("spine re-derived before review", msg)
+
+    def test_mismatch_that_survives_the_fix_still_refuses(self):
+        (ok, msg), calls = self._gate(
+            [("mismatch", "bad"), ("mismatch", "still bad")], "SHIP", [None])
+        self.assertFalse(ok)
+        self.assertIn("refusing to advance", msg)
+
+    def test_rate_restored_on_revise(self):
+        (ok, msg), calls = self._gate([("pass", "")], "REVISE", ["145", "180"])
+        self.assertFalse(ok)
+        self.assertEqual(calls["restore"], ["145"])
+        self.assertEqual(calls["respine"], 1)
+        self.assertIn("restored rate-wpm 180->145", msg)
+
+    def test_partial_fix_refuses_with_the_fresh_residual(self):
+        # --fix exits 1 on a residual but still rewrites what it can; the refusal must
+        # list what is still wrong, not the pre-fix mismatches.
+        (ok, msg), calls = self._gate([("mismatch", "PRE-FIX"), ("mismatch", "RESIDUAL-ONLY")],
+                                      "SHIP", [None], respine_ok=False)
+        self.assertFalse(ok)
+        self.assertEqual(calls["respine"], 1)
+        self.assertIn("RESIDUAL-ONLY", msg)
+        self.assertNotIn("PRE-FIX", msg)
+        self.assertNotIn("re-derived before review", msg)
+
+    def test_clean_script_gets_no_fix_and_no_note(self):
+        (ok, msg), calls = self._gate([("pass", ""), ("pass", "")], "SHIP", [None, None])
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls["respine"], 0)
+        self.assertNotIn("re-derived before review", msg)
+
+    def test_rate_restored_once_on_ship(self):
+        # rate read before the loop, then once in the SHIP branch: exactly two reads.
+        (ok, msg), calls = self._gate([("pass", ""), ("pass", "")], "SHIP", ["145", "180"])
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls["restore"], ["145"])
+
+    def test_unchanged_rate_on_revise_is_left_alone(self):
+        (ok, msg), calls = self._gate([("pass", "")], "REVISE", ["145", "145"])
+        self.assertFalse(ok)
+        self.assertEqual(calls["restore"], [])
+        self.assertNotIn("rate-wpm", msg)
+
+    def test_unparseable_rate_on_revise_is_reported(self):
+        (ok, msg), calls = self._gate([("pass", "")], "REVISE", ["145", "UNPARSEABLE"])
+        self.assertFalse(ok)
+        self.assertEqual(calls["restore"], [])
+        self.assertIn("unparseable `rate-wpm` (was 145)", msg)
+
+    def test_rate_removed_on_revise_is_reported(self):
+        (ok, msg), calls = self._gate([("pass", "")], "UNAVAILABLE", ["145", None])
+        self.assertFalse(ok)
+        self.assertEqual(calls["restore"], [])
+        self.assertIn("removed `rate-wpm: 145`", msg)
 
 
 class TestSpendOkImageGate(unittest.TestCase):

@@ -60,14 +60,11 @@ PCT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
 PCT_WORD_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*percent\b", re.IGNORECASE)
 
 # banned image vocab (class 6) — flagged only when NOT negated within the lookback window
-# NOTE (open, 2026-07-22): canon bans "dramatic lighting", not bare "dramatic" —
-# Master_Character_Prompt.md:174 and the sibling agent_output_lint.py BANNED_STRICT
-# both say "dramatic lighting"; bare "dramatic" here dates to the original commit
-# and looks like a truncation. Narrowing it would kill this false-positive class at
-# the root but stops catching "dramatic shadows"/"dramatic contrast" — a coverage
-# call for Steve, deliberately NOT bundled into the 7/22 negation fix. Live blast
-# radius today is one false positive (Video_05_Shot_11a, already-published video).
-BANNED = ("cinematic", "realistic", "soft lighting", "dramatic", "noir")
+# "dramatic lighting", not bare "dramatic" (2026-10-12, drift audit K3, one of the
+# defaults Steve accepted): canon bans the phrase (Master_Character_Prompt.md:174,
+# and agent_output_lint.py BANNED_STRICT), and bare "dramatic" false-flagged calm
+# prompts. Known cost: "dramatic shadows" / "dramatic contrast" no longer flag here.
+BANNED = ("cinematic", "realistic", "soft lighting", "dramatic lighting", "noir")
 NEGATION_WINDOW = 30
 NEGATION_RE = re.compile(r"\b(no|not|never|avoid|without|non)\b", re.IGNORECASE)
 
@@ -367,13 +364,13 @@ def selftest():
     # manifest that had already passed its PROMPTS review.
     cases.append(("prefix-negation", _m([
         {"name": "V_Shot_06a", "prompt": "Three at a window. Flat 2D. His expression is calm "
-         "and entirely undramatic. Stylized flat lighting only."}]),
+         "and entirely undramatic lighting. Stylized flat lighting only."}]),
         _SCRIPT, set(), set()))
 
     # ...but a prefix negation must NOT license a genuinely un-negated later use
     cases.append(("prefix-negation-does-not-leak", _m([
-        {"name": "V_Shot_06b", "prompt": "Calm and undramatic throughout. Then a dramatic "
-         "push-in on the ladder."}]),
+        {"name": "V_Shot_06b", "prompt": "Calm and undramatic lighting throughout. Then a dramatic "
+         "lighting push-in on the ladder."}]),
         _SCRIPT, {"banned-vocab"}, set()))
 
     # A hard wrap must not turn the anchor into a negation. The second clause
@@ -385,7 +382,7 @@ def selftest():
     # alternation change rather than the anchor it claimed to.) 14 of 1,608
     # corpus prompts contain literal newlines, so the shape is real.
     cases.append(("prefix-negation-newline-not-a-prefix", _m([
-        {"name": "V_Shot_06c", "prompt": "Calm and undramatic.\nFlat, un\ndramatic push-in."}]),
+        {"name": "V_Shot_06c", "prompt": "Calm and undramatic lighting.\nFlat, un\ndramatic lighting push-in."}]),
         _SCRIPT, {"banned-vocab"}, set()))
 
     # spaced acronym in a card → WARN (tts-spacing)
