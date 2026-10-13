@@ -49,6 +49,26 @@ if [ "${#markers[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# Replay the markers whose last attempt is OLDEST first, and at most
+# RQ_REPLAYS_PER_TICK per sweep. After an outage, a recovery un-pauses every
+# paused claude marker at once (A-82); without the cap that is a dozen heavy
+# routines back to back. Oldest-first means a job that keeps failing (its
+# last_attempt moves forward each time) can't hold a slot ahead of the rest.
+# ISO-8601 UTC stamps sort as text; a marker with no stamp sorts first.
+# Trade: after a dozen are un-paused, a fresh failure can wait ~3 h behind them.
+# A replay that exits at once (its job's lock is held) still uses a slot.
+RQ_REPLAYS_PER_TICK="${RQ_REPLAYS_PER_TICK:-2}"
+case "$RQ_REPLAYS_PER_TICK" in (*[!0-9]*|'') RQ_REPLAYS_PER_TICK=2 ;; esac
+tab=$'\t'
+sorted=()
+while IFS= read -r line; do
+    sorted+=( "${line#*"$tab"}" )
+done < <(for m in "${markers[@]}"; do
+    printf '%s\t%s\n' "$(grep -E '^last_attempt=' "$m" 2>/dev/null | head -1 | cut -d= -f2-)" "$m"
+done | sort)
+markers=( "${sorted[@]}" )
+replayed=0
+
 echo "$(date '+%F %T') retry_runner: ${#markers[@]} job(s) queued for retry" >> "$LOG"
 
 ALLOWED_WRAPPERS="run_claude_job.sh run_job.sh"
@@ -110,6 +130,12 @@ for marker in "${markers[@]}"; do
         echo "$(date '+%F %T') retry_runner: '${job}' marker cleared before replay — skipping" >> "$LOG"
         continue
     fi
+
+    if [ "$replayed" -ge "$RQ_REPLAYS_PER_TICK" ]; then
+        echo "$(date '+%F %T') retry_runner: per-tick cap (${RQ_REPLAYS_PER_TICK}) reached — rest wait for the next sweep" >> "$LOG"
+        break
+    fi
+    replayed=$(( replayed + 1 ))
 
     echo "$(date '+%F %T') retry_runner: replaying '${job}' → ${argv[*]}" >> "$LOG"
     IRIS_RETRY=1 "${argv[@]}" >> "$LOG" 2>&1

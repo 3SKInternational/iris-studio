@@ -208,7 +208,7 @@ rq_drop_marker() {
 # failing) this emits a one-time RECOVERED ping and removes the marker. On a
 # normal healthy run with no marker it is a silent no-op.
 rq_clear_on_success() {
-    local job="$1" file attempts first_epoch elapsed reason
+    local job="$1" file attempts first_epoch elapsed reason kind win_from win_to
     file="$(_rq_marker "$job")"
     [ -f "$file" ] || return 0
     attempts="$(_rq_get "$file" attempts)"; attempts="${attempts:-0}"
@@ -216,12 +216,66 @@ rq_clear_on_success() {
     attempts=$(( 10#$attempts ))   # base-10 normalize so -ge below can't hit an octal error
     first_epoch="$(_rq_get "$file" first_failed_epoch)"; first_epoch="${first_epoch:-$(_rq_now_epoch)}"
     reason="$(_rq_get "$file" last_reason)"
+    kind="$(_rq_get "$file" kind)"
+    win_from="$(_rq_get "$file" first_failed)"
+    win_to="$(_rq_get "$file" last_attempt)"
     rm -f "$file" 2>/dev/null || true
     if [ "$attempts" -ge 1 ]; then
         elapsed=$(( $(_rq_now_epoch) - first_epoch ))
         _rq_alert "✅ Job '${job}' RECOVERED — ran successfully after ${attempts} failed attempt(s) (~$(_rq_human_dur "$elapsed") of auto-retries).
 Was failing: ${reason:-(unknown)}
 Time: $(_rq_now_et)"
+        # A claude job just recovered, so whatever broke it is fixed. Jobs paused
+        # by the same outage would otherwise wait for their own next schedule
+        # (a month for the monthly jobs, A-82). Give them one more replay.
+        # No first_failed = no lower bound, which would re-arm every older
+        # paused job. (A missing last_attempt needs no guard: every stamp sorts
+        # after "", so the window matches nothing.)
+        if [ "$kind" = "claude" ] && [ -n "$win_from" ]; then
+            rq_unpause_kind claude "$win_from" "$win_to"
+        fi
     fi
+    return 0
+}
+
+# ---- un-pause paused markers that failed during another job's outage --------
+# Usage: rq_unpause_kind <kind> <from_iso> <to_iso>
+# Flips paused=1 → paused=0 (so the 30-min runner replays the job) on each
+# marker of <kind> whose last failure falls inside [from, to] — the recovering
+# job's own failure window. That ties the un-pause to the outage being
+# recovered from: a job that was already broken before an unrelated transient
+# started, or that was replayed after it ended, stays paused, so a permanently
+# broken job is not re-armed by every routine recovery. attempts is left as-is
+# (>= RQ_MAX_ATTEMPTS), so a re-armed job that still fails re-pauses at once.
+# Each marker is edited under its job's lock (the same mkdir lock the wrappers
+# hold), so a concurrent clear or failure write can't be undone; a held lock
+# means skip. Only kind=claude callers today; "infra" markers mix fleet-wide
+# and job-specific causes, so they are left alone.
+# ISO-8601 UTC stamps compare correctly as strings.
+rq_unpause_kind() {
+    local want="$1" from="$2" to="$3" f j at lock tmp
+    for f in "$(_rq_queue_dir)"/*.retry; do
+        [ -f "$f" ] || continue
+        [ "$(_rq_get "$f" kind)" = "$want" ] || continue
+        [ "$(_rq_get "$f" paused)" = "1" ] || continue  # mutequiv: content-equivalent (the sed only flips paused=1); this keeps lock-taking and rewrites to paused markers
+        j="$(_rq_get "$f" job)"; j="${j:-$(basename "$f" .retry)}"
+        lock="$(_rq_lock_dir)/${j}.lock"
+        mkdir -p "$(_rq_lock_dir)" 2>/dev/null || continue
+        mkdir "$lock" 2>/dev/null || continue
+        at="$(_rq_get "$f" last_attempt)"
+        # Re-read under the lock: the marker may have been cleared (reads as
+        # not paused) or re-stamped since the check above. An empty stamp sorts
+        # before any $from, so it is skipped too.
+        # mutequiv: the paused re-check is content-equivalent even under a race
+        # (a cleared marker makes sed fail, so mv never runs); kept as a cheap
+        # guard. Reviewer-verified 2026-10-13.
+        if [ "$(_rq_get "$f" paused)" = "1" ] \
+                && ! [[ "$at" < "$from" ]] && ! [[ "$at" > "$to" ]]; then
+            tmp="$(mktemp "${f}.XXXXXX" 2>/dev/null)" \
+                && { sed 's/^paused=1$/paused=0/' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null; }
+            chmod 0644 "$f" 2>/dev/null || true
+        fi
+        rmdir "$lock" 2>/dev/null || true
+    done
     return 0
 }
