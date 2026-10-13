@@ -44,6 +44,12 @@ check("'dramatic lighting' is banned", bool(_banned("Flat room, dramatic lightin
 check("bare 'dramatic' is not (K3, 2026-10-12)", not _banned("A dramatic shadow falls."))
 check("'BANNED' holds the phrase, not the bare word",
       "dramatic lighting" in msl.BANNED and "dramatic" not in msl.BANNED)
+for term in ("dramatic lighting", "soft lighting"):
+    a, b = term.split()
+    check(f"'{a}\\n{b}' hard wrap is banned (A-84)", bool(_banned(f"Flat room, {a}\n{b}.")))
+    check(f"'{a}  {b}' double space is banned (A-84)", bool(_banned(f"Flat room, {a}  {b}.")))
+check("negated hard-wrapped phrase still passes",
+      not _banned("Flat room, no dramatic\nlighting."))
 
 if FAILS:
     print(f"test_manifest_spine_lint_card: FAIL ({len(FAILS)})")

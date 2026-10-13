@@ -152,7 +152,9 @@ def check_banned_vocab(text: str) -> list[dict]:
     seen: set[tuple[str, int]] = set()  # dedupe identical (word, line) hits
 
     for word in BANNED_STRICT:
-        pat = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
+        # \s+ between words: a wrapped "dramatic\nlighting" still matches (A-84).
+        pat = re.compile(r"\b" + r"\s+".join(map(re.escape, word.split())) + r"\b",
+                         re.IGNORECASE)
         for m in pat.finditer(text):
             if _is_negated(text, m.start()):
                 continue

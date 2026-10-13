@@ -157,8 +157,11 @@ def lint(manifest, script):
                                  "percent figure %s not found in the script (verify spelled-out form)" % p.strip()))
 
         # 6 structural — banned vocab outside a negation
+        # Any run of whitespace between a phrase's words matches, so a hard
+        # wrap ("dramatic\nlighting") or a double space can't slip past (A-84).
         for term in BANNED:
-            for mt in re.finditer(re.escape(term), prompt, re.IGNORECASE):
+            pat = r"\s+".join(map(re.escape, term.split()))
+            for mt in re.finditer(pat, prompt, re.IGNORECASE):
                 if not _negated(prompt, mt.start()):
                     findings.append(("FAIL", "banned-vocab", nm,
                                      "banned image vocab '%s' used without a negation" % term))
