@@ -1054,14 +1054,16 @@ def _read_file(path: Path) -> str:
 
 def _read_bridge_latest_entry(path: Path) -> str:
     """Read the CLAUDE_CODE_HANDOFF.md bridge file and return only the latest
-    session entry (from the last "## [...] Session N" header to EOF). Past
-    sessions are historical; the latest is what Iris needs to be clued in to.
+    session entry (from the last "## " header to EOF). Past sessions are
+    historical; the latest is what Iris needs to be clued in to.
     Returns empty string if file missing or no session headers found."""
     full = _read_file(path)
     if not full:
         return ""
-    # Find the LAST occurrence of a "## [" session header.
-    last_header_idx = full.rfind("\n## [")
+    # Find the LAST "## " header. It used to look for "## [", but entries have
+    # been "## Session — ..." since the summer, so it matched nothing and loaded
+    # the whole 250 KB bridge into every cloud prompt (2026-10-13).
+    last_header_idx = full.rfind("\n## ")
     if last_header_idx == -1:
         # No session headers — return the whole file (it's just header/intro).
         return full
@@ -1423,6 +1425,24 @@ def _ceo_brief_age_label(brief_date: str, today_iso: str) -> str:
     return "today's" if brief_date == today_iso else f"dated {brief_date}"
 
 
+# Per-section ceiling for the vault files loaded into the cloud system prompt.
+# Uncapped, Vault_MOC (230 KB) plus the full bridge pushed the prompt past the
+# model's window: every 08:00 brief from ~09-13 to 10-12 came back
+# "Prompt is too long" (HTTP 400). Each file keeps its head, where the newest or
+# most important part lives (STEVE_CONTEXT's date-bump entries, the MOC's boot
+# sequence). ~40K chars is ~10K tokens; with 9 capped sections plus history the
+# prompt stays well under the window.
+CONTEXT_SECTION_MAX_CHARS = 40_000  # mutequiv: tuning value; tests pin the total ceiling and the cap boundary via this name, not the number
+
+
+def _cap_section(text: str, label: str) -> str:
+    if len(text) <= CONTEXT_SECTION_MAX_CHARS:
+        return text
+    cut = len(text) - CONTEXT_SECTION_MAX_CHARS
+    return (text[:CONTEXT_SECTION_MAX_CHARS]
+            + f"\n\n[… {label} truncated: {cut} more chars on disk — read the file for the rest]")
+
+
 def load_system_prompt_cloud(history: list[dict]) -> str:
     """Compose the cloud-tier system prompt with full workspace awareness.
 
@@ -1441,14 +1461,15 @@ def load_system_prompt_cloud(history: list[dict]) -> str:
      12. Last 3 Session digests (by mtime — most recent first)
      13. Recent conversation history (last 20 messages)
     """
-    blueprint = _read_file(BLUEPRINT_FILE)
-    addendum = _read_file(CONTEXT_FILE)
-    vault_moc = _read_file(VAULT_MOC_FILE)
+    blueprint = _cap_section(_read_file(BLUEPRINT_FILE), "Operator Blueprint")
+    addendum = _cap_section(_read_file(CONTEXT_FILE), "STEVE_CONTEXT.md")
+    vault_moc = _cap_section(_read_file(VAULT_MOC_FILE), "Vault_MOC.md")
     ceo_brief, ceo_brief_date = _read_latest_ceo_brief()
-    inbox = _read_file(INBOX_FILE)
-    briefing = _read_file(DAILY_BRIEFING_FILE)
-    build_queue = _read_file(BUILD_QUEUE_FILE)
-    bridge_latest = _read_bridge_latest_entry(BRIDGE_FILE)
+    ceo_brief = _cap_section(ceo_brief, "CEO brief")
+    inbox = _cap_section(_read_file(INBOX_FILE), "INBOX.md")
+    briefing = _cap_section(_read_file(DAILY_BRIEFING_FILE), "DAILY_BRIEFING.md")
+    build_queue = _cap_section(_read_file(BUILD_QUEUE_FILE), "Build Queue")
+    bridge_latest = _cap_section(_read_bridge_latest_entry(BRIDGE_FILE), "bridge entry")
     recent_decisions = _read_recent_markdown_files(DECISIONS_DIR, RECENT_DECISIONS_LIMIT, max_lines_per_file=40)
     recent_sessions = _read_recent_markdown_files(SESSIONS_DIR, RECENT_SESSIONS_LIMIT, max_lines_per_file=30)
     date_block = _runtime_date_block()
@@ -4538,9 +4559,14 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
     parts: list[str] = []
     result_was_error = False
     result_summary: str | None = None
+    # Set when the API itself rejected the call (e.g. 400 "Prompt is too long").
+    # The CLI then emits the error as if it were reply text; returning it would
+    # send Steve an 18-char "Prompt is too long" as Iris's answer, and the
+    # morning brief logged that as "sent" for a month. Raise instead.
+    api_error: str | None = None
 
     async def _collect() -> None:
-        nonlocal result_was_error, result_summary
+        nonlocal result_was_error, result_summary, api_error
         async for msg in query(prompt=prompt, options=options):
             mtype = type(msg).__name__
             if mtype == "AssistantMessage":
@@ -4552,6 +4578,9 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
                 if getattr(msg, "is_error", False):
                     result_was_error = True
                     result_summary = repr(msg)
+                    status = getattr(msg, "api_error_status", None)
+                    if status:
+                        api_error = f"{status}: {getattr(msg, 'result', None)}"
                 else:
                     dur = getattr(msg, "duration_ms", None)
                     usage = getattr(msg, "model_usage", None)
@@ -4582,6 +4611,9 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
         # return the text instead of crashing the briefing/chat turn. A raise with
         # no result message (genuine mid-stream transport failure) still propagates.
         collected = "".join(parts).strip()
+        if api_error:
+            logger.error(f"Cloud API rejected the call ({api_error}); suppressed: {exc}")
+            raise RuntimeError(f"Cloud API error {api_error}") from exc
         if result_was_error and collected:
             logger.warning(
                 f"Cloud query raised after a completed turn ({len(collected)} chars "
@@ -4592,6 +4624,9 @@ async def query_cloud(prompt: str, history: list[dict], timeout: float | None = 
         logger.error(f"Cloud query failed before producing output: {type(exc).__name__}: {exc}")
         raise
 
+    if api_error:
+        logger.error(f"Cloud API rejected the call ({api_error})")
+        raise RuntimeError(f"Cloud API error {api_error}")
     if result_was_error:
         logger.warning(f"Cloud result indicated error: {result_summary}")
 
