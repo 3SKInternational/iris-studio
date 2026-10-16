@@ -44,9 +44,21 @@ from pathlib import Path
 
 DB_PATH = "/Volumes/AI_Workspace/iris_studio/iris.db"
 LOGS_DIR = Path("/Users/steve/iris_studio/logs")
-DAILY_BRIEFING_PATH = Path(
-    "/Users/steve/Documents/3SK/outputs/DAILY_BRIEFING.md"
-)
+# A-87: the morning brief is judged by the daemon's own receipt line, not by
+# DAILY_BRIEFING.md mtime — the Cowork nightly pulse also writes that file, so
+# its mtime stayed fresh while a 154-char stub went out 9/13→10/12.
+IRIS_LOG = LOGS_DIR / "iris.err.log"
+MIN_BRIEF_CHARS = 500
+# Anchored to the iris logger prefix: the same log echoes Telegram text
+# (`From @user: ...`, reply previews, BLOCKED unauthorized ...), so an
+# unanchored search could be faked into a pass or a false alarm by a message.
+_IRIS_LINE = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} - iris - "
+_BRIEF_SENT = re.compile(_IRIS_LINE + r"INFO - Morning briefing sent \((\d+) chars\)\s*$")
+_BRIEF_BAD = re.compile(
+    _IRIS_LINE + r"ERROR - (Morning briefing failed|Combined briefing has no PART 2 boundary)")
+# The job may start as late as expected + misfire grace (2h, iris.py) and then
+# spend up to its 180 s generation timeout before logging the sent line.
+BRIEF_RUN_SLACK = timedelta(minutes=4)
 DB_BACKUP_DIR = Path("/Volumes/AI_Workspace/iris_studio")
 
 # How wide a window is acceptable for "the fire fired near its expected time."
@@ -580,9 +592,9 @@ def collect_expected(now: datetime) -> list[Expected]:
 
     # === iris.py daemon (APScheduler) ===
     # MUST match iris.py MORNING_BRIEFING_HOUR (currently 8 — moved 06:00→08:00
-    # ET on 2026-06-16). This is the ONLY scheduled writer of DAILY_BRIEFING.md;
-    # overnight rewrites (Claude Code sessions / manual /briefing) only ever make
-    # it fresher, and _check_morning_brief treats fresher-than-expected as OK.
+    # ET on 2026-06-16). Checked against the daemon's "Morning briefing sent"
+    # log line (see _check_morning_brief), not DAILY_BRIEFING.md, which has a
+    # second writer (the Cowork nightly pulse).
     if (t := _last_fire_daily(now, MORNING_BRIEFING_HOUR, 0)):
         expected.append(Expected(
             "morning_briefing", t, "morning_brief",
@@ -631,24 +643,52 @@ def _check_db_backup_file(exp: Expected, now: datetime) -> tuple[bool, str]:
     return _check_launchd_log(exp, now)
 
 
+def _brief_log_lines(lo: datetime, hi: datetime):
+    """Yield daemon log lines stamped inside [lo, hi]. Reads the live log plus the
+    newest rotated .gz: the Sunday 03:10 rotation moves Saturday's 08:00 lines
+    out of iris.err.log before the 05:00 pre-brief reads them. Lines start with
+    `YYYY-MM-DD HH:MM:SS`, so a string compare on that prefix is a time compare
+    (traceback lines fall outside the range and are skipped)."""
+    import gzip
+    lo_s, hi_s = f"{lo:%Y-%m-%d %H:%M:%S}", f"{hi:%Y-%m-%d %H:%M:%S}"
+    rotated = sorted(LOGS_DIR.glob("iris.err.log.*.gz"))[-1:]  # names sort by date
+    for p in rotated + [IRIS_LOG]:  # oldest first, so "last seen" is latest
+        opener = gzip.open if p.suffix == ".gz" else open
+        try:
+            with opener(p, "rt", errors="replace") as f:
+                for line in f:
+                    if lo_s <= line[:19] <= hi_s:
+                        yield line
+        except (OSError, EOFError):  # EOFError: truncated .gz
+            continue
+
+
 def _check_morning_brief(exp: Expected, now: datetime) -> tuple[bool, str]:
-    # Freshness is DIRECTIONAL: a briefing NEWER than the expected 08:00 fire is
-    # never a skip. Overnight Claude Code sessions and manual /briefing regens
-    # legitimately rewrite DAILY_BRIEFING.md before 08:00 (e.g. 03:26), which
-    # only makes it MORE current — the old symmetric abs() window wrongly flagged
-    # those fresher files as anomalies EVERY such night (A-22 false-flag). Only a
-    # STALE file (older than expected minus grace) signals the brief silently
-    # didn't happen — the 2026-06-01 App Nap class this check exists for.
-    if not DAILY_BRIEFING_PATH.exists():
-        return False, f"DAILY_BRIEFING.md missing at {DAILY_BRIEFING_PATH}"
-    mtime = datetime.fromtimestamp(DAILY_BRIEFING_PATH.stat().st_mtime)
-    floor = exp.expected_at - ACCEPTABLE_LATENESS
-    if mtime >= floor:
-        return True, f"DAILY_BRIEFING.md mtime {mtime:%Y-%m-%d %H:%M} (fresh; ≥ {floor:%H:%M} floor)"
-    return False, (
-        f"DAILY_BRIEFING.md mtime {mtime:%Y-%m-%d %H:%M} is stale — older than "
-        f"expected fire {exp.expected_at:%Y-%m-%d %H:%M} minus grace — brief may have skipped"
-    )
+    # Only send_morning_briefing logs these lines, so a manual /briefing or a
+    # Cowork rewrite of DAILY_BRIEFING.md can neither mask nor fake a skip.
+    lo = exp.expected_at - ACCEPTABLE_LATENESS
+    hi = exp.expected_at + ACCEPTABLE_LATENESS + BRIEF_RUN_SLACK
+    sent: list[int] = []
+    bad: list[str] = []
+    for line in _brief_log_lines(lo, hi):
+        if m := _BRIEF_SENT.match(line):
+            sent.append(int(m.group(1)))
+        elif _BRIEF_BAD.match(line):
+            bad.append(line.split(" - ", 3)[-1].strip()[:160])
+    if bad:
+        return False, f"daemon logged a brief error: {bad[0]}"
+    if not sent:
+        return False, (
+            f"no 'Morning briefing sent' line in iris.err.log between "
+            f"{lo:%Y-%m-%d %H:%M} and {hi:%H:%M} — brief did not fire"
+        )
+    n = sent[-1]
+    if n < MIN_BRIEF_CHARS:
+        return False, (
+            f"brief sent only {n} chars (< {MIN_BRIEF_CHARS}) — a stub or "
+            f"fallback notice, not a real brief"
+        )
+    return True, f"brief sent ({n} chars)"
 
 
 def _check_dispatch(exp: Expected, now: datetime) -> tuple[bool, str]:
@@ -954,56 +994,13 @@ def _selftest_dispatch_coverage() -> int:
 
 
 def _selftest() -> int:
-    """Hermetic check of the directional morning-brief freshness rule (A-22 fix).
-    Sets DAILY_BRIEFING.md mtime to controlled values and asserts fresh≥floor is
-    OK while stale is an anomaly. No network/db; temp file only."""
-    import os
-    import tempfile
-
-    global DAILY_BRIEFING_PATH
-    real = DAILY_BRIEFING_PATH
-    now = datetime(2026, 7, 5, 5, 0, 0)  # a 05:00 pre-brief run
-    exp = Expected("morning_briefing", datetime(2026, 7, 4, 8, 0, 0), "morning_brief")
-    # floor = expected_at − 2h grace = 2026-07-04 06:00 (cases below straddle it)
-    fd, tmp = tempfile.mkstemp(suffix="_DAILY_BRIEFING.md")
-    os.close(fd)
-    try:
-        DAILY_BRIEFING_PATH = Path(tmp)
-        cases = [
-            # (label, mtime, expect_ok)
-            ("at-expected 08:01", datetime(2026, 7, 4, 8, 1), True),
-            ("overnight regen 03:26 (the false-flag case)", datetime(2026, 7, 5, 3, 26), True),
-            ("at floor 06:00", datetime(2026, 7, 4, 6, 0), True),
-            ("one sec below floor 05:59", datetime(2026, 7, 4, 5, 59), False),
-            ("two-days stale (real skip)", datetime(2026, 7, 3, 8, 1), False),
-        ]
-        failures = 0
-        for label, mtime, want in cases:
-            ts = mtime.timestamp()
-            os.utime(tmp, (ts, ts))
-            ok, msg = _check_morning_brief(exp, now)
-            status = "PASS" if ok == want else "FAIL"
-            if ok != want:
-                failures += 1
-            print(f"  [{status}] {label}: ok={ok} (want {want}) — {msg}")
-        # missing-file case
-        DAILY_BRIEFING_PATH = Path(tmp + ".nope")
-        ok, msg = _check_morning_brief(exp, now)
-        status = "PASS" if not ok else "FAIL"
-        if ok:
-            failures += 1
-        print(f"  [{status}] missing file: ok={ok} (want False) — {msg}")
-        failures += _selftest_youtube_coverage()
-        failures += _selftest_dispatch_coverage()
-        failures += _selftest_interval_liveness()
-        print("SELFTEST OK" if failures == 0 else f"SELFTEST FAILED ({failures})")
-        return 1 if failures else 0
-    finally:
-        DAILY_BRIEFING_PATH = real
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    """Coverage self-checks. The morning-brief check is pinned in
+    tests/test_prebrief_morning_brief.py, which precheck runs."""
+    failures = _selftest_youtube_coverage()
+    failures += _selftest_dispatch_coverage()
+    failures += _selftest_interval_liveness()
+    print("SELFTEST OK" if failures == 0 else f"SELFTEST FAILED ({failures})")
+    return 1 if failures else 0
 
 
 def main(argv: list[str]) -> int:
