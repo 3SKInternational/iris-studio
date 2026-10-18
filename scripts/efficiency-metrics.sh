@@ -52,7 +52,8 @@ write "_Zero-token shell pre-pass for the token-efficiency steward (Fri 03:30 ET
 section "1 · LaunchD job state (iris / claude-code only)"
 write "_Registered iris jobs + their last-exit status. Middle column = last exit code; non-zero = the most-recent invocation failed (necessary-but-not-sufficient signal; pair with log mtimes for the authoritative view). The unfiltered list is ~150 macOS-system jobs; intentionally omitted to keep this file lean — the steward audits iris cadences, not Apple's._"
 fence_begin
-MAX_LINES=40 safe sh -c '/bin/launchctl list | /usr/bin/awk "NR==1 || /com\\.iris\\./"'
+# ponytail: default 100-line cap; 53 jobs loaded 2026-10-18 (the old 40 hid 14). Raise if the fleet nears 100.
+safe sh -c '/bin/launchctl list | /usr/bin/awk "NR==1 || /com\\.iris\\./"'
 fence_end
 
 # ----------------------------------------------------------------------
