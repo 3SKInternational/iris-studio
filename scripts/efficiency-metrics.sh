@@ -31,11 +31,17 @@ section() { printf '\n## %s\n\n' "$1" >>"$OUT"; }
 sub() { printf '\n### %s\n\n' "$1" >>"$OUT"; }
 fence_begin() { printf '```\n' >>"$OUT"; }
 fence_end() { printf '```\n' >>"$OUT"; }
+cap() {
+  # head -n "$1" that says when it cuts: the steward reads these lists as
+  # complete, so a silent cut reads as "absent".
+  /usr/bin/awk -v max="$1" 'NR <= max { print } END { if (NR > max) printf "[truncated at %d of %d lines]\n", max, NR }'
+}
+
 safe() {
   # Run a command; capture stdout+stderr; truncate at MAX_LINES so a
   # runaway log can't blow up the metrics file.
   local max="${MAX_LINES:-100}"
-  "$@" 2>&1 | /usr/bin/head -n "$max" >>"$OUT" || true
+  "$@" 2>&1 | cap "$max" >>"$OUT" || true
 }
 
 : >"$OUT"
@@ -77,7 +83,7 @@ if [ -f "$DB" ]; then
      FROM daily_stats
      WHERE date >= date('now', '-7 days')
      GROUP BY date, tier
-     ORDER BY date DESC, tier;" 2>&1 | /usr/bin/head -n 40 >>"$OUT" || \
+     ORDER BY date DESC, tier;" 2>&1 | cap 40 >>"$OUT" || \
     write "(sqlite3 query failed)"
 else
   write "(iris.db missing — X9 unmounted?)"
@@ -104,7 +110,7 @@ if [ -f "$DB" ]; then
      WHERE started_epoch IS NOT NULL
        AND started_epoch >= strftime('%s', 'now', '-7 days')
      GROUP BY agent_name
-     ORDER BY n DESC;" 2>&1 | /usr/bin/head -n 40 >>"$OUT" || \
+     ORDER BY n DESC;" 2>&1 | cap 40 >>"$OUT" || \
     write "(sqlite3 dispatches query failed)"
 else
   write "(iris.db missing — X9 unmounted?)"
@@ -178,7 +184,7 @@ fence_end
 section "10 · Listening ports (Rule 1 enforcement)"
 write "_Defense-in-depth on Hard Rule #1 (never expose the Mac to the public internet without explicit go-ahead). Filter keeps only listeners NOT bound to loopback — \`127.0.0.1\`, \`::1\`, \`[::1]\`, \`[::ffff:127.*]\` (IPv4-mapped IPv6 loopback). NOTE: \`*:port\` means \"bound to all interfaces\" (external-facing) — it is the OPPOSITE of loopback, so it must NOT be filtered out. Anything below should be reviewed against the iris allowlist (Telegram bot, playpen at 127.0.0.1:8080, claude-remote tunnel). Pre-brief Pass 7 enforces this daily; surfaced here so the steward can flag a Tier-4-class \"open to internet\" line in the ledger if a new non-loopback bind appears._"
 fence_begin
-MAX_LINES=20 safe sh -c "/usr/sbin/lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | /usr/bin/awk '\$9 !~ /^(127\\.0\\.0\\.1|::1):/ && \$9 !~ /^\\[::1\\]:/ && \$9 !~ /^\\[::ffff:127\\./' | /usr/bin/head -20"
+MAX_LINES=20 safe sh -c "/usr/sbin/lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | /usr/bin/awk '\$9 !~ /^(127\\.0\\.0\\.1|::1):/ && \$9 !~ /^\\[::1\\]:/ && \$9 !~ /^\\[::ffff:127\\./'"
 fence_end
 
 # ----------------------------------------------------------------------
