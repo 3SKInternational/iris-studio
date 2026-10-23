@@ -66,10 +66,13 @@ PASS 2.5 — SURFACE ADAPTATIONS DUE FOR AN OUTCOME CALL (close the learning loo
       cd /Volumes/AI_Workspace/iris_studio && python3 scripts/adaptation.py --review-due
   Branch:
     • None due → nothing to surface (note "0 due" for the daily-note line).
-    • ≥1 due → fold a short "outcome review due" block into the SAME Telegram push as PASS 2 (do not send a second message). If PASS 2 sent nothing (no pending proposals) but reviews ARE due, send ONE push for these alone:
-          cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "🔎 Adaptation outcome review due (<M>):
+    • ≥1 due → fold a short "outcome review due" block into the SAME Telegram push as PASS 2 (do not send a second message). If PASS 2 sent nothing (no pending proposals) but reviews ARE due, send ONE push for these alone. Repeat check (A-96): the same due list already pushed in the last 7 days must not go out again, so key it on the sorted due ids, IN THE SAME Bash call as notify.sh (shell state does not carry between calls). This standalone push only; the combined PASS 2 push carries HOLDs and never sets NOTIFY_ONCE:
+          cd /Volumes/AI_Workspace/iris_studio && DUE=$(python3 scripts/adaptation.py --review-due --json | python3 -c 'import json,sys; print("\n".join(sorted(a["id"] for a in json.load(sys.stdin))))')
+          KEY=$([ -n "$DUE" ] && printf '%s\n' "$DUE" | shasum -a 256 | cut -c1-16)
+          NOTIFY_ONCE="${KEY:+adapt-due-$KEY}" ./scripts/notify.sh "🔎 Adaptation outcome review due (<M>):
       <for each due: • <id> (applied, due <date>) → <target-basename>: <metric>>
       Record: /adapt outcome <id> <improved|no-change|regressed|inconclusive> [note]  ·  Scoreboard: /adapt score"
+      An empty DUE (command failed) gives an empty NOTIFY_ONCE, so the push still goes. If notify.sh prints "skipped, key ... already delivered", the due list is unchanged since that push: note "outcome push skipped (same due list)" for the daily-note line; it is not a failed push.
       Cap at 5 lines; if more, list 5 and say "…and the rest via /adapt due". Do NOT tag any outcome yourself — surfacing only; the verdict is Steve's (or a future eval agent's) call.
 
 PASS 3 — LOG (always, exactly one short section):

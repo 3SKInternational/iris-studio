@@ -25,10 +25,15 @@ PASS 2 — DISPATCH community-manager (one per video that has comments):
 
 PASS 3 — SURFACE ESCALATIONS TO TELEGRAM (only what needs Steve):
   Build ONE consolidated push from the dispatched deliverables. Send it ONLY if there is ≥1 escalation OR ≥1 reply-worthy draft awaiting Steve across all videos; if every video was all-low-effort-praise with nothing to act on, skip the push (the wrapper's ✅ is enough) and note that.
-      cd /Volumes/AI_Workspace/iris_studio && ./scripts/notify.sh "💬 Comment-ingest: <total> incoming comment(s) across <V> video(s).
+  Repeat check (A-96): the same comment set already pushed in the last 7 days must not go out again. Build the key from every fetched comment (video, author, text) and send with NOTIFY_ONCE, IN THE SAME Bash call as notify.sh (shell state does not carry between calls):
+      cd /Volumes/AI_Workspace/iris_studio && E=/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Channel_Intelligence/Engagement
+      KEYSRC=$(grep -H -E '^ *- (↳ )?\*\*@' "$E"/*_comments_latest.md | sed -E 's/ \([0-9]+ likes\)//' | LC_ALL=C sort)
+      KEY=$([ -n "$KEYSRC" ] && printf '%s\n' "$KEYSRC" | shasum -a 256 | cut -c1-16)
+      NOTIFY_ONCE="${KEY:+comments-$KEY}" ./scripts/notify.sh "💬 Comment-ingest: <total> incoming comment(s) across <V> video(s).
   <for each video with action: • <label>: <N> triaged — <R> reply draft(s), <E> escalation(s)>
   <if any escalations, list the most urgent (advice-request / correction / abuse-legal) one per line>
   Replies + escalations: BRANDS/3SK_Finance/Community/  ·  Topic signal → topic-scout (weekly)"
+  An empty KEYSRC gives an empty NOTIFY_ONCE, so the push still goes. If notify.sh prints "skipped, key ... already delivered", nothing new arrived since that push: the run is complete, and the daily-note line says "push skipped (same comments as an earlier push)".
   Cap at 10 lines; if more, surface the videos with escalations first and say "…rest in Community/". Recommend, don't act — Steve posts the replies.
 
 PASS 4 — LOG (always, exactly one short section):

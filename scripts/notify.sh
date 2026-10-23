@@ -24,8 +24,15 @@
 # Reads TELEGRAM_BOT_TOKEN + IRIS_TELEGRAM_USER_IDS (first id = chat target) from
 # the gitignored .env next to iris.py. No secrets live in this file.
 #
-# Exit codes: 0 = delivered (Telegram ok:true), 1 = config/usage error,
-#             2 = Telegram API rejected the send.
+# Repeat check (opt-in, A-96): NOTIFY_ONCE=<key> ./notify.sh "..." skips the
+# send when the same key was delivered in the last 7 days. The key is recorded
+# only after Telegram returns ok:true, so a failed send is never suppressed.
+# State: ~/iris_studio/state/notify_once.tsv (epoch<TAB>key). Unset = unchanged.
+# Content pushes only — never set it on a failure or job-health alert.
+#
+# Exit codes: 0 = delivered (Telegram ok:true), or skipped because NOTIFY_ONCE's
+#             key was already delivered in the last 7 days,
+#             1 = config/usage error, 2 = Telegram API rejected the send.
 
 set -euo pipefail
 
@@ -47,6 +54,23 @@ if [ -z "${TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
     echo "notify.sh ERROR: TELEGRAM_BOT_TOKEN or IRIS_TELEGRAM_USER_IDS missing in .env" >&2
     exit 1
 fi
+
+# --- NOTIFY_ONCE repeat check (see header) ----------------------------------
+ONCE_KEY=$(printf '%s' "${NOTIFY_ONCE:-}" | tr -d '\t\n\r')
+ONCE_FILE="$HOME/iris_studio/state/notify_once.tsv"
+ONCE_CUTOFF=$(( $(date +%s) - 7*86400 ))
+if [ -n "$ONCE_KEY" ] && [ -f "$ONCE_FILE" ] && \
+   ONCE_KEY="$ONCE_KEY" awk -F'\t' -v c="$ONCE_CUTOFF" '$2==ENVIRON["ONCE_KEY"] && $1>=c {f=1} END {exit !f}' "$ONCE_FILE"; then
+    echo "notify.sh: skipped, key '$ONCE_KEY' already delivered in the last 7 days"
+    exit 0
+fi
+# Called only after ok:true. Drops entries older than 7 days so the file stays small.
+record_once() {
+    [ -n "$ONCE_KEY" ] || return 0
+    mkdir -p "$(dirname "$ONCE_FILE")"
+    { [ -f "$ONCE_FILE" ] && awk -F'\t' -v c="$ONCE_CUTOFF" '$1>=c' "$ONCE_FILE"
+      printf '%s\t%s\n' "$(date +%s)" "$ONCE_KEY"; } > "$ONCE_FILE.tmp" && mv "$ONCE_FILE.tmp" "$ONCE_FILE"
+}
 
 # --- Photo mode: notify.sh --photo /path/to.png "optional caption" -----------
 if [ "${1:-}" = "--photo" ]; then
@@ -73,6 +97,7 @@ if [ "${1:-}" = "--photo" ]; then
 
     if printf '%s' "$RESP" | grep -q '"ok":true'; then
         echo "notify.sh: photo delivered to chat ${CHAT_ID}"
+        record_once || echo "notify.sh WARN: delivered, but could not record NOTIFY_ONCE key" >&2
         exit 0
     else
         echo "notify.sh ERROR: Telegram API rejected the photo send: $RESP" >&2
@@ -103,6 +128,7 @@ RESP=$(curl -s --max-time 20 \
 
 if printf '%s' "$RESP" | grep -q '"ok":true'; then
     echo "notify.sh: delivered to chat ${CHAT_ID}"
+    record_once || echo "notify.sh WARN: delivered, but could not record NOTIFY_ONCE key" >&2
     exit 0
 else
     echo "notify.sh ERROR: Telegram API rejected the send: $RESP" >&2
