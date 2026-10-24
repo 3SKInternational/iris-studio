@@ -67,7 +67,7 @@ section "2 · Log sizes (last 24h of growth)"
 write "_Log size + mtime of every routine + daemon log. A log that hasn't been touched in >7 days for a daily/weekly cadence is a cold-cadence signal; a log >50 MB without recent rotation is a Pass-5 concern; per-job stderr.log presence is the silent-failure surface._"
 fence_begin
 if [ -d "$LOGS" ]; then
-  MAX_LINES=80 safe /bin/ls -lhT "$LOGS"
+  MAX_LINES=300 safe /bin/ls -lhT "$LOGS"  # ~200 files today; the cap note fires if it outgrows this
 else
   write "(logs dir missing: $LOGS)"
 fi
