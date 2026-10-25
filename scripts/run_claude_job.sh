@@ -203,8 +203,50 @@ trap 'rm -f "$RUN_OUT"; rq_release_lock' EXIT
 # Wall-clock start for the duration-watch below (the on-demand performance-optimizer's trigger).
 JOB_START=$(date +%s)
 
-"$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG" | tee "$RUN_OUT" >/dev/null
+# Wall-clock cap. A hung CLI never exits, so no branch below ever runs and nothing
+# alerts: the 2026-10-18 security-audit sat 7 days on CLOSED sockets holding its
+# lock, and only SIGKILL ended it (it ignores ALRM and TERM). So at the cap: TERM
+# the CLI's process tree, wait up to 30 s, KILL that same tree, exit 124. The tree
+# is listed once before TERM because children of a dead CLI reparent to launchd
+# and drop out of a pgrep -P walk. The CLI stays in the job's process group, so a
+# stopped or killed wrapper still takes it down via launchd's group cleanup.
+# Default 8 h; the longest good run is topic-scout at 5.4 h. A job that needs
+# longer sets CLAUDE_JOB_TIMEOUT_SEC in its plist.
+JOB_TIMEOUT="${CLAUDE_JOB_TIMEOUT_SEC:-28800}"
+KILL_GRACE="${CLAUDE_JOB_KILL_GRACE_SEC:-30}"  # overridable for self-tests
+# A typo like "2h" would reach perl as 2 and kill every run; refuse it.
+case "$JOB_TIMEOUT" in ''|*[!0-9]*|0)
+    echo "run_claude_job: bad CLAUDE_JOB_TIMEOUT_SEC '${JOB_TIMEOUT}', using 28800" >> "$LOG"; JOB_TIMEOUT=28800 ;; esac
+case "$KILL_GRACE" in ''|*[!0-9]*)
+    echo "run_claude_job: bad CLAUDE_JOB_KILL_GRACE_SEC '${KILL_GRACE}', using 30" >> "$LOG"; KILL_GRACE=30 ;; esac
+/usr/bin/perl -e '
+    my ($t, $g, @cmd) = @ARGV;
+    my $pid = fork // exit 127;
+    if (!$pid) { exec @cmd or exit 127 }
+    sub tree {
+        my @todo = @_; my @all;
+        while (@todo) { my $p = shift @todo; push @all, $p; push @todo, split " ", `pgrep -P $p`; }
+        return @all;
+    }
+    $SIG{ALRM} = sub {
+        my @t = tree($pid);
+        kill "TERM", @t;
+        for (1 .. $g) { last if waitpid($pid, 1) > 0; sleep 1 }  # 1 = WNOHANG
+        kill "KILL", @t;
+        waitpid $pid, 0;
+        exit 124;
+    };
+    alarm $t;
+    waitpid $pid, 0;
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+' -- "$JOB_TIMEOUT" "$KILL_GRACE" "$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG" | tee "$RUN_OUT" >/dev/null
 rc=${PIPESTATUS[0]}
+
+# 124 from a CLI that exited on its own before the cap is not a timeout.
+if [ "$rc" -eq 124 ] && [ $(( $(date +%s) - JOB_START )) -ge "$JOB_TIMEOUT" ]; then
+    echo "run_claude_job: '${JOB}' TIMED OUT after ${JOB_TIMEOUT}s at $(date '+%Y-%m-%d %H:%M %Z') — killed" >> "$LOG"
+    fail 124 "timed out after ${JOB_TIMEOUT}s (CLI hung, killed)"
+fi
 
 # 1) Process died / non-zero exit → hard failure — with ONE carve-out: the Claude
 #    CLI's transient STARTUP abort ("...low max file descriptors (Unexpected)")
