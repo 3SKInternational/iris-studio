@@ -1,8 +1,8 @@
-Sunday engineering hygiene at 09:00 AM ET. Weekly multi-pass grooming sweep.
+Sunday engineering hygiene at 04:30 AM ET. Weekly multi-pass grooming sweep.
 
 Read `_Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md` for context. Hard rules from `06_CEO/Designs/2026-05-26_Claude_Code_Engineering_Handoff.md` apply.
 
-Perform these 9 grooming passes. Write all findings into a single new design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` (date-prefixed). Cross-reference from INBOX.md by appending a one-line link under "🧍 THIS WEEK".
+Perform these 10 grooming passes. Write all findings into a single new design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` (date-prefixed). Cross-reference from INBOX.md by appending a one-line link under "🧍 THIS WEEK".
 
 1. **iris.py type check.** Run: `cd /Volumes/AI_Workspace/iris_studio && .venv/bin/pyright iris.py > ~/iris_studio/logs/pyright-latest.txt 2>&1; grep -E '^[0-9]+ errors?, ' ~/iris_studio/logs/pyright-latest.txt; grep -oE '\(report[A-Za-z]+\)' ~/iris_studio/logs/pyright-latest.txt | sort | uniq -c | sort -rn`. Put pyright's summary line and the count per rule in the hygiene doc, and point to `~/iris_studio/logs/pyright-latest.txt` for the full list (do not paste a cut-down list; the reader can't tell what was left out). If the summary grep prints nothing, pyright did not run: if `.venv/bin/pyright` is missing, suggest `.venv/bin/pip install pyright` and skip this pass; otherwise quote the last lines of the file. Flag any reported type errors but do NOT auto-fix (Steve approves changes).
 
@@ -24,6 +24,8 @@ Perform these 9 grooming passes. Write all findings into a single new design doc
    - **If output is non-empty (outdated):** this is exactly the silent-routine-degradation failure mode, so surface it loudly, NOT just as a passive doc line. (a) Fire a Telegram push via the canonical channel: `/Volumes/AI_Workspace/iris_studio/scripts/notify.sh "⚠️ Claude Code Homebrew cask is OUTDATED — every launchd routine runs this binary. Installed: $(/opt/homebrew/bin/claude --version 2>&1). Latest available: $(brew info --cask claude-code 2>/dev/null | head -1). Fix: brew upgrade --cask claude-code — your call whether to upgrade."`. (b) Also flag it as a TOP-line item in the hygiene doc. **Do NOT auto-`brew upgrade`** — it replaces the shared binary every routine depends on, so Steve signs off on the upgrade interactively. Alert only.
 
 9. **Sync-conflict copies (A-89 detector, added 2026-10-23).** Run: `cd /Volumes/AI_Workspace/iris_studio && python3 scripts/conflict_copies.py`. It is read-only and lists each ` 2.*` / ` 3.*` … copy from the last 7 days with how it compares to its canonical file. Paste the summary line into the hygiene doc. List every `copy-newer`, `dataless`, `unreadable`, `unreadable-dir` and `no-canonical` row by path at the top of the doc: each may hold the only good version, or was not checked, so Steve looks at it by hand. `identical` and `copy-older` rows are counts only. Do NOT move or delete any copy.
+
+10. **Prompt run times (A-101 check, added 2026-10-27).** Run: `cd /Volumes/AI_Workspace/iris_studio && python3 scripts/prompt_time_check.py`. It is read-only and lists each `routines/*.prompt` whose line-1 time disagrees with its plist's `StartCalendarInterval`. Paste the summary line into the hygiene doc and list every `MISMATCH`, `UNREADABLE` and `MISSING-PROMPT` row. Do NOT edit the prompts here; a wrong time is a backlog row for the automation scan.
 
 **Output expectations:**
 - New design doc at `06_CEO/Designs/YYYY-MM-DD_Sunday_Hygiene.md` with frontmatter (`date`, `type: hygiene-report`, `status: complete`, `related: [[Pitch_Log]] [[2026-05-26_Phase_4_and_5_Build_Queue]]`, `tags: [hygiene/weekly]`).

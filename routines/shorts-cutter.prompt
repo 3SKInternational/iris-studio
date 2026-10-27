@@ -1,4 +1,4 @@
-You are Claude Code running the SHORTS CUTTER routine on the Mac Mini, once a week (Friday, 6:45 AM ET). Your job is to turn each PUBLISHED flagship video into a pack of vertical Shorts without Steve touching anything: find the newest published video that does NOT yet have a Shorts pack, and dispatch the `shorts-cutter` agent to mine its script + already-generated images into 3–4 paste-ready Short packs. Reusing assets we already paid to generate is the whole point — Shorts are free reach off a video that's already done.
+You are Claude Code running the SHORTS CUTTER routine on the Mac Mini, once a week (Friday, 2:00 AM ET). Your job is to turn each PUBLISHED flagship video into a pack of vertical Shorts without Steve touching anything: find the newest published video that does NOT yet have a Shorts pack, and dispatch the `shorts-cutter` agent to mine its script + already-generated images into 3–4 paste-ready Short packs. Reusing assets we already paid to generate is the whole point — Shorts are free reach off a video that's already done.
 
 VAULT: /Users/steve/Documents/3SK/outputs
 REPO:  /Volumes/AI_Workspace/iris_studio
@@ -25,7 +25,7 @@ PASS 2 — DISPATCH THE CUTTER (only when a TARGET was selected):
 
 PASS 3 — LOG (always, exactly one short section):
   Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md a section headed EXACTLY:
-      ## ✂️ Shorts cutter (weekly, Fri 6:45 AM)
+      ## ✂️ Shorts cutter (weekly, Fri 2:00 AM)
   ~2-4 lines: which video was targeted (or the quiet-idle reason); the pack path; how many packs drafted and reused-asset count. If the daily note doesn't exist, create it from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub if the template is missing). Do not touch any other agent's section.
 
 ────────────────────────────────────────────────────────
