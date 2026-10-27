@@ -84,12 +84,24 @@ rq_acquire_lock() {
     ld="$(_rq_lock_dir)"
     mkdir -p "$ld" 2>/dev/null || { _RQ_LOCK=""; return 0; }
     lock="$ld/${job}.lock"
-    # Steal a stale lock (>180 min) — a previous run that was killed mid-flight
-    # (panic, SIGKILL) could leave the dir behind; don't wedge the job forever.
-    if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +180 2>/dev/null)" ]; then
-        rm -rf "$lock" 2>/dev/null || true
+    # Steal a lock only when its holder is gone (A-99). The holder writes its PID
+    # into the dir; a dead PID means a run killed mid-flight (panic, SIGKILL).
+    # No PID file = the gap between mkdir and the write, a pre-A-99 lock, or the
+    # brief un-pause lock: treat as live until 180 min old. Before A-99 any lock
+    # over 180 min was stolen, so a 5 h run could be doubled.
+    # ponytail: a reused PID keeps a dead lock alive until that process exits;
+    # the 24 h ceiling (3x the 8 h job cap) bounds it.
+    if [ -d "$lock" ]; then
+        local holder
+        holder="$(cat "$lock/pid" 2>/dev/null)"
+        if { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } \
+           || [ -n "$(find "$lock" -maxdepth 0 -mmin +1440 2>/dev/null)" ] \
+           || { [ -z "$holder" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +180 2>/dev/null)" ]; }; then
+            rm -rf "$lock" 2>/dev/null || true
+        fi
     fi
     if mkdir "$lock" 2>/dev/null; then
+        echo "$$" > "$lock/pid" 2>/dev/null || true
         _RQ_LOCK="$lock"
         return 0
     fi
@@ -98,7 +110,15 @@ rq_acquire_lock() {
 }
 
 rq_release_lock() {
-    [ -n "${_RQ_LOCK:-}" ] && rmdir "$_RQ_LOCK" 2>/dev/null
+    # Remove only our own lock: if it was taken from us, the dir is someone else's.
+    if [ -n "${_RQ_LOCK:-}" ]; then
+        local holder
+        holder="$(cat "$_RQ_LOCK/pid" 2>/dev/null)"
+        if [ -z "$holder" ] || [ "$holder" = "$$" ]; then
+            rm -f "$_RQ_LOCK/pid" 2>/dev/null
+            rmdir "$_RQ_LOCK" 2>/dev/null
+        fi
+    fi
     _RQ_LOCK=""
     return 0
 }

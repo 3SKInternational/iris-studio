@@ -15,11 +15,13 @@ precheck.sh never discovered (it only globs tests/test_*.py).
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-QUEUE = REPO / "scripts" / "retry_queue.sh"
+# RQ_UNDER_TEST points at a copy for mutation runs; live wrappers source the real one.
+QUEUE = Path(os.environ.get("RQ_UNDER_TEST") or REPO / "scripts" / "retry_queue.sh")
 RUNNER = REPO / "scripts" / "retry_runner.sh"
 
 
@@ -201,6 +203,78 @@ class TestRunnerCapAndOrder(unittest.TestCase):
         write_marker(self.base, "c", paused=0,
                      last_attempt="2026-10-02T00:00:00Z", argv0=self.wrapper)
         self.assertEqual(self.run_runner(cap=1), ["b"])
+
+
+class TestLockSteal(unittest.TestCase):
+    """A-99: steal a job lock only when its holder PID is dead, not after 180 min.
+
+    Jobs may now run 8 h (e5c3ccc); the old age-only steal let a replay and a
+    scheduled fire of the same long job run at once."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = self.tmp.name
+        self.lock = Path(self.base) / "locks" / "job.lock"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def make_lock(self, pid=None, age_min=0):
+        self.lock.mkdir(parents=True)
+        if pid is not None:
+            (self.lock / "pid").write_text(f"{pid}\n")
+        t = time.time() - age_min * 60
+        os.utime(self.lock, (t, t))
+
+    def acquire(self):
+        r = source_and_run(self.base, 'if rq_acquire_lock job; then echo GOT $$; else echo BUSY; fi')
+        return r.stdout.split()
+
+    def dead_pid(self):
+        p = subprocess.Popen(["/usr/bin/true"])
+        p.wait()
+        return p.pid
+
+    def test_live_holder_at_4h_is_kept(self):
+        self.make_lock(os.getpid(), age_min=240)
+        self.assertEqual(self.acquire(), ["BUSY"])
+        self.assertEqual((self.lock / "pid").read_text().strip(), str(os.getpid()))
+
+    def test_dead_holder_is_taken_at_once(self):
+        self.make_lock(self.dead_pid(), age_min=1)
+        out = self.acquire()
+        self.assertEqual(out[0], "GOT")
+        self.assertEqual((self.lock / "pid").read_text().strip(), out[1])
+
+    def test_dir_without_pid_younger_than_floor_is_kept(self):
+        self.make_lock(None, age_min=170)
+        self.assertEqual(self.acquire(), ["BUSY"])
+
+    def test_dir_without_pid_older_than_floor_is_taken(self):
+        self.make_lock(None, age_min=190)
+        self.assertEqual(self.acquire()[0], "GOT")
+
+    def test_live_holder_just_under_24h_ceiling_is_kept(self):
+        # Pins the ceiling from below: any value under ~1430 min would steal a
+        # live long run again (the A-99 bug).
+        self.make_lock(os.getpid(), age_min=1430)
+        self.assertEqual(self.acquire(), ["BUSY"])
+
+    def test_live_holder_past_24h_ceiling_is_taken(self):
+        self.make_lock(os.getpid(), age_min=1450)
+        self.assertEqual(self.acquire()[0], "GOT")
+
+    def test_release_removes_own_lock(self):
+        source_and_run(self.base, "rq_acquire_lock job && rq_release_lock")
+        self.assertFalse(self.lock.exists())
+
+    def test_release_leaves_a_lock_taken_from_us(self):
+        source_and_run(self.base, f'rq_acquire_lock job; echo {os.getpid()} > "$_RQ_LOCK/pid"; rq_release_lock')
+        self.assertEqual((self.lock / "pid").read_text().strip(), str(os.getpid()))
+
+    def test_release_removes_lock_with_no_pid_file(self):
+        source_and_run(self.base, 'rq_acquire_lock job; rm -f "$_RQ_LOCK/pid"; rq_release_lock')
+        self.assertFalse(self.lock.exists())
 
 
 class TestLegacyShellSelfcheck(unittest.TestCase):
