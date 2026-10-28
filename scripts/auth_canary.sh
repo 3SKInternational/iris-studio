@@ -218,7 +218,10 @@ prev_bad=""
 # contaminate the auth result. A real auth/credit failure ALWAYS prints the CLI's
 # error string → "bad". Sentinel present → "ok" (a full authenticated round-trip).
 # Anything else (timeout, network blip, the transient "low max file descriptors"
-# startup abort) → "inconclusive", deliberately NOT alerted. The perl alarm is a
+# startup abort) → "inconclusive", deliberately NOT alerted. The account-level
+# refusal ("Your organization has disabled Claude subscription access") is bad
+# too: on 2026-10-26/27 it was logged INCONCLUSIVE seven times and never paged.
+# The perl alarm is a
 # portable timeout (macOS has no `timeout`); on timeout the child is SIGALRM-killed
 # with empty output → inconclusive (never misclassified as bad).
 AUTH_OUT="$(cd /tmp && perl -e 'my $t=shift; alarm $t; exec @ARGV or die "exec failed\n"' \
@@ -226,7 +229,7 @@ AUTH_OUT="$(cd /tmp && perl -e 'my $t=shift; alarm $t; exec @ARGV or die "exec f
     'Reply with exactly this token and nothing else: CANARY_OK' 2>&1)"
 
 auth_state="inconclusive"
-if printf '%s' "$AUTH_OUT" | grep -qiE 'Failed to authenticate|API Error: 40[0-9]|Invalid authentication|out of usage credits|[Cc]redit balance is too low'; then
+if printf '%s' "$AUTH_OUT" | grep -qiE 'Failed to authenticate|API Error: 40[0-9]|Invalid authentication|out of usage credits|[Cc]redit balance is too low|disabled Claude subscription access'; then
     auth_state="bad"
 elif printf '%s' "$AUTH_OUT" | grep -q 'CANARY_OK'; then
     auth_state="ok"
@@ -302,6 +305,9 @@ if [ -n "$effective_bad" ]; then
     # token), so following the alert looked like it silently did nothing.
     # Verified against `claude auth --help` on 2.1.176.
     _has "$effective_bad" "auth"  && body="${body}• AUTH (credential: ${IRIS_CLAUDE_AUTH_SOURCE}): ${IRIS_CLAUDE_REAUTH}. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
+    # A re-login does not lift an account-level refusal; say so up front.
+    _has "$effective_bad" "auth" && printf '%s' "$AUTH_OUT" | grep -q 'disabled Claude subscription access' \
+        && body="${body}• The CLI says: \"$(printf '%s' "$AUTH_OUT" | tr '\n' ' ' | cut -c1-160)\" This is an account/plan refusal, not a dead token: check the Claude account's plan and org settings first."$'\n'
     _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't READ the vault. Two known causes: (a) Full Disk Access revoked for the background job's binary → re-grant in System Settings ▸ Privacy & Security; (b) iCloud evicted the vault to dataless stubs and on-read materialization deadlocks (\"Error reading\" / EDEADLK) → System Settings ▸ [Apple ID] ▸ iCloud, turn OFF \"Optimize Mac Storage\" (or move the vault off iCloud Desktop & Documents), then re-materialize with \`brctl download\`. See DQ-52."$'\n'
     _has "$effective_bad" "mount" && body="${body}• AI_WORKSPACE MOUNT: scheduled jobs can't READ /Volumes/AI_Workspace (EPERM) — the iris_studio repo + every job script live there, so the WHOLE fleet is down. Fix (~2 min): System Settings ▸ Privacy & Security ▸ Full Disk Access ▸ remove + re-add /opt/homebrew/bin/claude. A \`brew upgrade claude-code\` revokes it. Durable fix: relocate iris_studio to the internal disk (DQ-17)."$'\n'
 

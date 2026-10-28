@@ -28,13 +28,13 @@ def _write_exec(path, body):
     os.chmod(path, 0o755)
 
 
-def _run(vault_probe, mount_probe):
+def _run(vault_probe, mount_probe, claude_out="CANARY_OK", tmp=None):
     """Run auth_canary.sh with auth stubbed OK and notify captured.
     Returns (exit_code, log_text, notify_text)."""
-    tmp = tempfile.mkdtemp()
+    tmp = tmp or tempfile.mkdtemp()
     # Fake claude: prints the auth sentinel so auth_state=ok deterministically.
     claude = os.path.join(tmp, "fake_claude")
-    _write_exec(claude, "#!/bin/bash\necho CANARY_OK\n")
+    _write_exec(claude, "#!/bin/bash\necho '%s'\n" % claude_out)
     # Fake notify: appends its argument (the alert body) to notify.log.
     notify_log = os.path.join(tmp, "notify.log")
     notify = os.path.join(tmp, "fake_notify")
@@ -73,6 +73,25 @@ class TestCanaryProbes(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertIn("healthy (auth=ok vault=ok mount=ok)", log)
         self.assertEqual(notify.strip(), "", "no alert on a healthy run")
+
+    def test_subscription_refusal_pages_then_recovers(self):
+        # 2026-10-26/27: this reply was logged INCONCLUSIVE seven times, no page.
+        refusal = ("Your organization has disabled Claude subscription access for Claude Code"
+                   " · Use an Anthropic API key instead, or ask your admin to enable access")
+        tmp = tempfile.mkdtemp()
+        rc, log, notify = _run(self.good, self.good, refusal, tmp)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("FAILED (auth)", notify)
+        self.assertIn("account/plan refusal", notify)
+        rc, log, notify = _run(self.good, self.good, "CANARY_OK", tmp)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("RECOVERED", notify)
+
+    def test_token_401_alert_has_no_refusal_line(self):
+        rc, log, notify = _run(self.good, self.good, "API Error: 401 Invalid authentication credentials")
+        self.assertEqual(rc, 1, log)
+        self.assertIn("FAILED (auth)", notify)
+        self.assertNotIn("account/plan refusal", notify)
 
     def test_vault_read_error_non_eperm_is_detected(self):
         # The core regression: a read error whose text is NOT an EPERM string
