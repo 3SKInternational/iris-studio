@@ -130,6 +130,26 @@ class TestClaudeJobTimeout(unittest.TestCase):
         self.assertIn("bad CLAUDE_JOB_TIMEOUT_SEC '2h'", log)
         self.assertIn("bad CLAUDE_JOB_KILL_GRACE_SEC 'abc'", log)
 
+    # --- A-110: background-wait ceiling reaches the CLI ---------------------
+    def bg_wait_seen(self, **env):
+        seen = self.tmp / "bgwait"
+        self.env.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
+        self.env.update(env)
+        rc, _ = self.run_with(
+            f'printf "%s" "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-unset}}" > {seen}; echo ROUTINE_COMPLETE')
+        self.assertEqual(rc, 0)
+        return seen.read_text()
+
+    def test_bg_wait_default_is_45_min(self):
+        self.assertEqual(self.bg_wait_seen(), "2700000")
+
+    def test_bg_wait_plist_override_kept(self):
+        self.assertEqual(self.bg_wait_seen(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="0"), "0")
+
+    def test_bg_wait_bad_value_falls_back(self):
+        self.assertEqual(self.bg_wait_seen(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="45m"), "2700000")
+        self.assertIn("bad CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS '45m'", self.new_log())
+
     def test_cli_exit_124_before_cap_is_not_a_timeout(self):
         rc, _ = self.run_with("exit 124")
         self.assertEqual(rc, 124)

@@ -4,6 +4,10 @@ Read /Users/steve/Documents/3SK/outputs/06_CEO/Designs/2026-05-26_Claude_Code_En
 
 Before picking the freshest signal, check `06_CEO/Automation_Backlog.md` for rows still tagged `auto-build-eligible: true` (not yet 🟢 SHIPPED). If any exist, build the **oldest** one FIRST (by its seed/NEW date), ahead of any newer follow-up — a `auto-build-eligible` tag is a permission, not a scheduler, and newest-wins selection silently starves tagged items (A-32 starved ~12 nights, A-35 ~4). Only after the oldest eligible row is shipped (or genuinely blocked) do you move to fresher work. If a row is blocked, say why in the bridge and take the next-oldest. This rule exists so this starvation class cannot recur.
 
+## Reviews run in the foreground; never commit before SHIP (A-110)
+
+Dispatch reviewer agents in the foreground (`run_in_background: false`). The CLI can end a print-mode run while a background task is still going (10-27: review round 3 was lost, with no bridge entry). If a reviewer must run in the background, append a provisional bridge entry first. Never commit before the review returns SHIP: a commit in `iris_studio` is also a push.
+
 ---
 
 ## ⛳ Completion signal — REQUIRED LAST LINE (run_claude_job.sh reads this for Steve's Telegram alert)

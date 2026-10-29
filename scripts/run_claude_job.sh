@@ -219,6 +219,15 @@ case "$JOB_TIMEOUT" in ''|*[!0-9]*|0)
     echo "run_claude_job: bad CLAUDE_JOB_TIMEOUT_SEC '${JOB_TIMEOUT}', using 28800" >> "$LOG"; JOB_TIMEOUT=28800 ;; esac
 case "$KILL_GRACE" in ''|*[!0-9]*)
     echo "run_claude_job: bad CLAUDE_JOB_KILL_GRACE_SEC '${KILL_GRACE}', using 30" >> "$LOG"; KILL_GRACE=30 ;; esac
+# Background-wait ceiling (A-110). In print mode the CLI ends the run 600 s after
+# its last turn if background tasks are still running; on 10-27 that killed the
+# nightly mid-review, with no sentinel and no bridge entry. 45 min covers a
+# review round. Not 0 (wait forever): that would leave the 8 h cap as the only
+# bound on a hung background agent. A plist may set its own value (0 allowed).
+BG_WAIT="${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-2700000}"
+case "$BG_WAIT" in ''|*[!0-9]*)
+    echo "run_claude_job: bad CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS '${BG_WAIT}', using 2700000" >> "$LOG"; BG_WAIT=2700000 ;; esac
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$BG_WAIT"
 /usr/bin/perl -e '
     my ($t, $g, @cmd) = @ARGV;
     my $pid = fork // exit 127;
