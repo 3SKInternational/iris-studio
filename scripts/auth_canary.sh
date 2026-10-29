@@ -78,7 +78,8 @@
 #   STATE_FILE   path to state file  (default: ~/iris_studio/state/auth_canary.state)
 #   VAULT_PROBE  internal vault file  | MOUNT_PROBE  AI_Workspace file
 #
-# Exit codes: 0 = healthy, 1 = a definite failure is active (auth/vault/mount),
+# Exit codes: 0 = healthy, 1 = a definite failure is active (auth/vault/mount;
+#             includes INC_PAGE_RUNS unrecognised auth replies in a row),
 #             2 = inconclusive this run (network/transient — NOT alerted).
 
 set -uo pipefail
@@ -119,6 +120,13 @@ LOCK_DIR="$(dirname "$STATE_FILE")/auth_canary.lock"
 
 AUTH_TIMEOUT=60                          # seconds to allow the claude probe
 RE_ALERT_THROTTLE_SECS=$((6 * 3600))     # while broken, re-ping at most every 6h
+# An auth reply that is neither the sentinel nor a known failure is "inconclusive".
+# A session-limit notice ("resets 6am") clears within one 5 h window, so at the
+# 3 h interval it usually covers one run, rarely two (RunAtLoad and kickstarts
+# add runs; worst case is one false page, then RECOVERED). An unknown refusal
+# wording repeats until fixed. Page once this many runs with unrecognised text
+# have come back with no known answer between them (A-108).
+INC_PAGE_RUNS=3
 TS="$(date '+%Y-%m-%d %H:%M %Z')"
 NOW_EPOCH="$(date +%s)"
 
@@ -151,9 +159,13 @@ alert() {
     fi
 }
 write_state() {
-    printf '%s|%s|%s\n' "$1" "$2" "$3" > "$STATE_FILE" \
+    printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$inc_streak" > "$STATE_FILE" \
         || log "WARN: could not write state file $STATE_FILE (a silent re-alert loop is possible)"
 }
+# One line of CLI output, at most 160 chars, safe to send: under launchd's C locale
+# `cut` counts bytes and can split a multi-byte char (the CLI's "·"); iconv -c
+# drops the broken tail so Telegram never gets invalid UTF-8.
+_snip() { printf '%s' "$1" | tr '\n' ' ' | cut -c1-160 | iconv -c -f UTF-8 -t UTF-8 2>/dev/null; }
 # Space-delimited set membership: _has "<set>" "<member>".
 _has() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac ; }
 
@@ -200,15 +212,21 @@ if [ "$SELF" != "$REPO_SRC" ] && [ -r "$REPO_SRC" ]; then
     fi
 fi
 
-# --- State file format: STATUS|LAST_ALERT_EPOCH|REASON ----------------------
+# --- State file format: STATUS|LAST_ALERT_EPOCH|REASON|INC_STREAK -----------
 # STATUS = ok|bad. LAST_ALERT_EPOCH = epoch of the last Telegram ping about the
 # current outage (0 if none). REASON = '+'-joined set of currently-broken
 # dimensions (auth / vault / mount), e.g. "auth", "mount", "auth+mount".
-prev_status="ok"; prev_alert_epoch=0; prev_reason=""
+# INC_STREAK = auth runs in a row with unrecognised reply text (absent in
+# pre-A-108 state files, read as 0).
+prev_status="ok"; prev_alert_epoch=0; prev_reason=""; inc_streak=0
 if [ -f "$STATE_FILE" ]; then
-    IFS='|' read -r prev_status prev_alert_epoch prev_reason < "$STATE_FILE" || true
+    IFS='|' read -r prev_status prev_alert_epoch prev_reason inc_streak < "$STATE_FILE" || true
     prev_status="${prev_status:-ok}"
+    # 10# so a leading zero ("08") is not read as bad octal; >9 digits in the
+    # streak can only be a hand edit and would overflow, so read it as 0.
     case "$prev_alert_epoch" in (*[!0-9]*|'') prev_alert_epoch=0 ;; esac
+    case "$inc_streak" in (*[!0-9]*|''|??????????*) inc_streak=0 ;; esac
+    prev_alert_epoch=$((10#$prev_alert_epoch)); inc_streak=$((10#$inc_streak))
 fi
 prev_bad=""
 [ "$prev_status" = "bad" ] && prev_bad="$(printf '%s' "$prev_reason" | tr '+' ' ')"
@@ -234,6 +252,20 @@ if printf '%s' "$AUTH_OUT" | grep -qiE 'Failed to authenticate|API Error: 40[0-9
 elif printf '%s' "$AUTH_OUT" | grep -q 'CANARY_OK'; then
     auth_state="ok"
 fi
+# Unrecognised text counts toward the streak; empty output (timeout, killed
+# start) neither counts nor resets it; a known answer either way resets it.
+# auth_unknown keys off the stored streak, not this run's reply, so an empty run
+# during a streak outage still alerts as "unrecognised", never as a dead token.
+if [ "$auth_state" = "inconclusive" ]; then
+    if [ -n "$(printf '%s' "$AUTH_OUT" | tr -d '[:space:]')" ]; then
+        inc_streak=$((inc_streak + 1))
+        [ "$inc_streak" -ge "$INC_PAGE_RUNS" ] && auth_state="bad"
+    fi
+else
+    inc_streak=0
+fi
+auth_unknown="no"
+[ "$inc_streak" -ge "$INC_PAGE_RUNS" ] && auth_unknown="yes"
 
 # --- Probe 2: VAULT readability (internal Data volume) ----------------------
 # CONFIRM A SUCCESSFUL READ of one byte of a known vault file, rather than
@@ -304,10 +336,17 @@ if [ -n "$effective_bad" ]; then
     # PROMPT (it answers the word "login" as a question, then 401s on the dead
     # token), so following the alert looked like it silently did nothing.
     # Verified against `claude auth --help` on 2.1.176.
-    _has "$effective_bad" "auth"  && body="${body}• AUTH (credential: ${IRIS_CLAUDE_AUTH_SOURCE}): ${IRIS_CLAUDE_REAUTH}. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
+    # An unrecognised reply is no proof of a dead token, so it gets its own
+    # bullet instead of the re-login steps.
+    _has "$effective_bad" "auth" && [ "$auth_unknown" = "no" ] && body="${body}• AUTH (credential: ${IRIS_CLAUDE_AUTH_SOURCE}): ${IRIS_CLAUDE_REAUTH}. A 401 = expired OAuth token (or out of Max credits). \`claude auth status\` reports loggedIn:true off a merely-present credential and does NOT validate expiry, so it is not proof. Blocks EVERY headless claude job until cleared."$'\n'
     # A re-login does not lift an account-level refusal; say so up front.
     _has "$effective_bad" "auth" && printf '%s' "$AUTH_OUT" | grep -q 'disabled Claude subscription access' \
-        && body="${body}• The CLI says: \"$(printf '%s' "$AUTH_OUT" | tr '\n' ' ' | cut -c1-160)\" This is an account/plan refusal, not a dead token: check the Claude account's plan and org settings first."$'\n'
+        && body="${body}• The CLI says: \"$(_snip "$AUTH_OUT")\" This is an account/plan refusal, not a dead token: check the Claude account's plan and org settings first."$'\n'
+    if [ "$auth_unknown" = "yes" ]; then
+        _latest="$(_snip "$AUTH_OUT")"
+        [ -n "$(printf '%s' "$_latest" | tr -d '[:space:]')" ] || _latest="(no output this run)"
+        body="${body}• AUTH: ${inc_streak} auth probes, with no known answer between them, got a reply the canary does not recognise (not the sentinel, not a known failure). This is NOT proof of a dead token: read the reply before rotating anything. Latest: \"${_latest}\" If it is a real refusal, add its wording to the bad-auth regex in auth_canary.sh."$'\n'
+    fi
     _has "$effective_bad" "vault" && body="${body}• VAULT (internal disk): a scheduled job can't READ the vault. Two known causes: (a) Full Disk Access revoked for the background job's binary → re-grant in System Settings ▸ Privacy & Security; (b) iCloud evicted the vault to dataless stubs and on-read materialization deadlocks (\"Error reading\" / EDEADLK) → System Settings ▸ [Apple ID] ▸ iCloud, turn OFF \"Optimize Mac Storage\" (or move the vault off iCloud Desktop & Documents), then re-materialize with \`brctl download\`. See DQ-52."$'\n'
     _has "$effective_bad" "mount" && body="${body}• AI_WORKSPACE MOUNT: scheduled jobs can't READ /Volumes/AI_Workspace (EPERM) — the iris_studio repo + every job script live there, so the WHOLE fleet is down. Fix (~2 min): System Settings ▸ Privacy & Security ▸ Full Disk Access ▸ remove + re-add /opt/homebrew/bin/claude. A \`brew upgrade claude-code\` revokes it. Durable fix: relocate iris_studio to the internal disk (DQ-17)."$'\n'
 
@@ -352,5 +391,5 @@ fi
 # Healthy history, nothing bad, but a probe was inconclusive — a transient blip.
 # Stay healthy + silent (a real failure prints its error → classified "bad").
 write_state "ok" "0" ""
-log "INCONCLUSIVE while healthy — auth=$auth_state vault=$vault_state mount=$mount_state (no alert). auth_out=$(printf '%s' "$AUTH_OUT" | tr '\n' ' ' | cut -c1-160)"
+log "INCONCLUSIVE while healthy — auth=$auth_state vault=$vault_state mount=$mount_state (no alert). unknown_streak=${inc_streak}/${INC_PAGE_RUNS} auth_out=$(_snip "$AUTH_OUT")"
 exit 2
