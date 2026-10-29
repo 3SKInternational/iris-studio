@@ -61,7 +61,8 @@ PASS 3 — SHIP (only if editor verdict = SHIP and redact exited 0):
       git rev-parse --is-inside-work-tree 2>/dev/null
     • If that errors (current reality — not a repo): the saved book IS the ship. Keep a DATED insurance snapshot of the pre-edit state (revenue artifact; cheap rollback insurance), and prune dated snapshots older than ~7 days across the whole ebook dir:
         mv "$BOOK.bak-pre-writer" "$BOOK.$(date +%Y-%m-%d).bak"
-        find /Users/steve/Documents/3SK/outputs/iris-studio-ebook -name '*.md.20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].bak' -mtime +7 -delete
+        find /Users/steve/Documents/3SK/outputs/iris-studio-ebook \( -name '*.md.20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].bak' -o -name '*.md.20[0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9].bak' \) -mtime +7 -delete
+      (The second pattern catches sync conflict copies like `*.md.2026-10-20 2.bak` so they age out with their originals. Keep both patterns exact: a trailing `*` would also delete the undated `*-pending-redact.bak` files.)
     • If it ever prints "true" (the vault was later made a repo): commit locally; do NOT push unless `git remote -v` shows a remote AND pushing is this machine's established convention:
         git add "$BOOK"
         git commit -m "book: nightly update to <id> <new version> (auto: writer+editor pipeline)"
