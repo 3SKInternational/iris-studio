@@ -20,6 +20,8 @@
 #   <command>…  the program to run and its arguments
 #
 # Env:
+#   JOB_TIMEOUT_SEC  wall-clock cap in seconds (default 21600 = 6 h); at the cap
+#                    the job's tree is killed, exit 124, red alert + retry.
 #   JOB_QUIET_OK=1   suppress the ✅ success ping for this job (failures still
 #                    alert). A per-job noise knob — set it in the job's plist
 #                    EnvironmentVariables if a daily ✅ becomes noise.
@@ -159,10 +161,73 @@ fi
 LOG_OFF_BEFORE="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
 LOG_OFF_BEFORE="${LOG_OFF_BEFORE//[^0-9]/}"; LOG_OFF_BEFORE="${LOG_OFF_BEFORE:-0}"
 
-"$@" >> "$LOG" 2>&1
+# Wall-clock cap (A-104), same shape as run_claude_job.sh (e5c3ccc). Since A-99 a
+# job lock is stolen only from a dead PID or after 24 h, so a hung job (it still
+# answers kill -0) made every later fire log "already running" for a day with no
+# alert. At the cap: TERM the job's process tree, wait up to KILL_GRACE s, KILL
+# that same tree, exit 124. The tree is listed once before TERM because children
+# of a dead job reparent to launchd and drop out of a pgrep -P walk. The job stays
+# in the wrapper's process group, so launchd's group cleanup still takes it down.
+# Default 6 h; the longest good runs (logs to 2026-10-30) are pipeline-sweep 229
+# min and drive-sync 211 min. A job that needs longer sets JOB_TIMEOUT_SEC in its
+# plist, but a retry replays only the command line, so a retried run gets 6 h
+# (JOB_QUIET_OK has the same gap). Keep any cap under 86400: past that, A-99's
+# 24 h lock steal can start a second copy beside the first.
+JOB_TIMEOUT="${JOB_TIMEOUT_SEC:-21600}"
+KILL_GRACE="${JOB_KILL_GRACE_SEC:-30}"  # overridable for self-tests
+# A typo like "2h" would reach perl as 2 and kill every run; refuse it.
+case "$JOB_TIMEOUT" in ''|*[!0-9]*)
+    echo "run_job: bad JOB_TIMEOUT_SEC '${JOB_TIMEOUT}', using 21600" >> "$LOG"; JOB_TIMEOUT=21600 ;; esac
+JOB_TIMEOUT=$((10#$JOB_TIMEOUT))  # "08" is bad octal to bash; read it as decimal
+if [ "$JOB_TIMEOUT" -eq 0 ]; then
+    echo "run_job: bad JOB_TIMEOUT_SEC '${JOB_TIMEOUT_SEC}', using 21600" >> "$LOG"; JOB_TIMEOUT=21600
+fi
+case "$KILL_GRACE" in ''|*[!0-9]*)
+    echo "run_job: bad JOB_KILL_GRACE_SEC '${KILL_GRACE}', using 30" >> "$LOG"; KILL_GRACE=30 ;; esac
+KILL_GRACE=$((10#$KILL_GRACE))
+JOB_START=$(date +%s)
+/usr/bin/perl -e '
+    my ($t, $g, @cmd) = @ARGV;
+    my $pid = fork // exit 127;
+    # block form: no shell, no word split, and say why exec failed (perl -e has no warnings)
+    if (!$pid) { exec { $cmd[0] } @cmd or do { print STDERR "run_job: cannot exec $cmd[0]: $!\n"; exit 127 } }
+    sub tree {
+        my @todo = @_; my @all;
+        while (@todo) { my $p = shift @todo; push @all, $p; push @todo, split " ", `pgrep -P $p`; }
+        return @all;
+    }
+    $SIG{ALRM} = sub {
+        my @t = tree($pid);
+        kill "TERM", @t;
+        for (1 .. $g) { last if waitpid($pid, 1) > 0; sleep 1 }  # 1 = WNOHANG
+        kill "KILL", @t;
+        # bounded: a child stuck in kernel I/O (a detaching volume) ignores KILL until
+        # the I/O returns, and a blocking wait here would hold the job lock again
+        for (1 .. 10) { last if waitpid($pid, 1) != 0; sleep 1 }
+        exit 124;
+    };
+    alarm $t;
+    waitpid $pid, 0;
+    alarm 0;  # a job that finished at the cap is not a timeout
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+' -- "$JOB_TIMEOUT" "$KILL_GRACE" "$@" >> "$LOG" 2>&1
 rc=$?
 
 TS="$(date '+%Y-%m-%d %H:%M %Z')"
+
+# 124 from a job that exited on its own before the cap is not a timeout.
+if [ "$rc" -eq 124 ] && [ $(( $(date +%s) - JOB_START )) -ge "$JOB_TIMEOUT" ]; then
+    if [ "${IRIS_RETRY:-0}" != "1" ]; then
+        sched_alert "🔴 launchd job '${JOB}' timed out after ${JOB_TIMEOUT}s (job hung, killed).
+Time: ${TS}
+Log tail:
+$(tail -n 4 "$LOG" 2>/dev/null || echo '(no log)')" \
+            "timed out after ${JOB_TIMEOUT}s"
+    fi
+    rq_record_failure "$JOB" "infra" "timed out after ${JOB_TIMEOUT}s" -- "${ORIG_ARGV[@]}"
+    echo "run_job: '${JOB}' TIMED OUT after ${JOB_TIMEOUT}s at ${TS} — killed" >> "$LOG"
+    exit 124
+fi
 
 # Known infra condition, NOT a job bug: launchd cannot exec a venv interpreter that
 # lives on the external AI_Workspace volume — a claude-code cask auto-upgrade silently
