@@ -174,7 +174,10 @@ for a, b in ordered:
 
 # 2) Case-INSENSITIVE pattern replacements (catch capitalized / relocated forms future
 #    content may introduce). Email replaced as a whole token so the domain can't survive.
-s = re.sub(r"\bmainfolder\b", "[USER]", s, flags=re.IGNORECASE)
+# Identity tokens use letter boundaries, not \b: `_` is a word character, so \b...\b
+# let a name inside a snake_case identifier (`parse_inbox_steve_items`) past both the
+# sub and the check below. Found 2026-11-01 by the P14 editor, not this gate.
+s = re.sub(r"(?<![A-Za-z])mainfolder(?![A-Za-z])", "[USER]", s, flags=re.IGNORECASE)
 s = re.sub(r"studio@[A-Za-z0-9._%+-]+\.[A-Za-z]{2,}", "[EMAIL]", s, flags=re.IGNORECASE)
 s = re.sub(r"\b5582798766\b", "[USER_ID]", s)
 s = re.sub(r"3SK", "[COMPANY]", s, flags=re.IGNORECASE)
@@ -189,14 +192,14 @@ s = re.sub(r"ai_workspace", "[SSD]", s, flags=re.IGNORECASE)
 s = re.sub(r"steve_context", "[AUTHOR]_CONTEXT", s, flags=re.IGNORECASE)
 # Identity words: lowercase standalone "steve" = the macOS username -> [USER]; every other
 # case form of Steve/Steven = the person -> [AUTHOR]. Lowercase first to keep the distinction.
-s = re.sub(r"\bsteve\b", "[USER]", s)
-s = re.sub(r"\bste(?:ven?s?|phens?)\b", "[AUTHOR]", s, flags=re.IGNORECASE)
+s = re.sub(r"(?<![A-Za-z])steve(?![A-Za-z])", "[USER]", s)
+s = re.sub(r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)
 # "iris" as a compound-token prefix (iris_X / iris.X) has NO leading word boundary when it
-# follows a word char (e.g. "_Iris_Memory"), so \biris\b below would miss it while the
+# follows a word char (e.g. "_Iris_Memory"), so the standalone pattern below would miss it while the
 # residual check `iris[_.]\w` flags it -> the redaction would fail-closed on a path the
 # scrub never rewrote. Mirror the check exactly so replace-set and check-set can't drift.
 s = re.sub(r"iris(?=[_.]\w)", "[ASSISTANT]", s, flags=re.IGNORECASE)
-s = re.sub(r"\biris\b", "[ASSISTANT]", s, flags=re.IGNORECASE)
+s = re.sub(r"(?<![A-Za-z])iris(?![A-Za-z])", "[ASSISTANT]", s, flags=re.IGNORECASE)
 
 # Video ids: exact-substring scrub (also kills every URL form — youtu.be/<id>, watch?v=<id>,
 # youtube.com/embed/<id> — since the id substring itself is replaced). Case-SENSITIVE, since a
@@ -213,13 +216,16 @@ except OSError as e:
 
 # 3) Residual check, fail-closed. Identity tokens + every credential shape from the same
 #    CRED_PATTERNS list, so a surviving secret can never pass as "REDACTION OK".
+# The identity checks keep the letter boundary too: a later rewrite (3SK, iris_, a video
+# id) can turn a letter next to a skipped token into `[`, and only this check sees it then
+# (test case 9). camelCase (`alertSteve`) still passes both sub and check.
 checks = [
-    r"\bste(?:ven?s?|phens?)\b",
-    r"\biris\b",
+    r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])",
+    r"(?<![A-Za-z])iris(?![A-Za-z])",
     r"iris[_.]\w",
     r"3sk",
     r"ai_workspace",
-    r"\bmainfolder\b",
+    r"(?<![A-Za-z])mainfolder(?![A-Za-z])",
     r"studio@",
     r"5582798766",
     r"steve_context",

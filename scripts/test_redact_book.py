@@ -135,7 +135,44 @@ def main():
     assert ids_from({}) == set()
     assert ids_from({"deleted_video_id": [None, "", "  ", "REAL1"]}) == {"REAL1"}
 
-    print("test_redact_book: 10/10 pass")
+    # 8) Identity token inside a snake_case identifier (2026-11-01). `_` is a word character,
+    #    so the old \b...\b patterns matched neither the sub nor the check: P14 shipped
+    #    `parse_inbox_steve_items()` past a "REDACTION OK". Assert the name is gone, not rc.
+    for text, token in (("calls parse_inbox_steve_items() daily", "steve"),
+                        ("calls _alert_Steve() on crash", "steve"),
+                        ("see notify_steven_now", "steven"),
+                        ("load_iris_state and parse_iris", "iris"),
+                        ("rsync to air_mainfolder_copy", "mainfolder")):
+        code, out, msg = run(text)
+        assert code == 0 and token not in out.lower(), \
+            f"fail-OPEN: {token} survived inside an identifier: {code} {out!r} {msg!r}"
+    # Lowercase = the macOS username -> [USER], even inside an identifier (the [AUTHOR]
+    # pattern would also catch it, so pin the token, not just the absence).
+    code, out, _ = run("calls parse_inbox_steve_items() daily")
+    assert out == "calls parse_inbox_[USER]_items() daily", f"wrong token: {out!r}"
+    # A digit or a trailing `_` after the token (the iris[_.]\w prefix rule does not reach these).
+    code, out, msg = run("see iris2 and iris_ and steve2 here")
+    assert code == 0 and "iris" not in out.lower() and "steve" not in out.lower(), \
+        f"fail-OPEN: token before digit/underscore survived: {out!r} {msg!r}"
+    # Letter boundaries still hold: a longer word that merely contains a token is not touched.
+    code, out, _ = run("Stevenson read the iridescent irises.")
+    assert code == 0 and out == "Stevenson read the iridescent irises.", f"over-redacted: {out!r}"
+
+    # 9) The residual check needs letter boundaries too (review r1, 2026-11-01). A token glued
+    #    to a letter is skipped by its sub; a LATER rewrite (video id, iris_ prefix, 3SK) turns
+    #    that letter into `[`, leaving `_`/digit on the other side. A \b check misses that and
+    #    prints OK with the name on disk. These must fail closed: rc 1, name still visible.
+    #    FJljsipxTkA is in VIDEO_ID_SUPPLEMENT. If the video-id replace ever moves ahead of the
+    #    identity subs, the first two cases redact cleanly instead; swap in new inputs then.
+    for text, token in (("FJljsipxTkASteve9", "steve"), ("9SteveFJljsipxTkA", "steve"),
+                        ("FJljsipxTkAIris_ x", "iris"), ("_IrisFJljsipxTkA", "iris"),
+                        ("3SKmainfolder_x", "mainfolder"), ("9mainfolderFJljsipxTkA", "mainfolder"),
+                        ("9Steveiris_x", "steve")):
+        code, out, msg = run(text)
+        assert code == 1 and token in out.lower(), \
+            f"fail-OPEN: {text!r} should fail closed, got rc={code} {out!r} {msg!r}"
+
+    print("test_redact_book: 15/15 pass")
 
 
 if __name__ == "__main__":
