@@ -83,7 +83,39 @@ def main():
             f"fail-OPEN: {_name} value survived the scrub: {code} {out!r} {msg!r}"
         assert "[REDACTED]" in out, f"{_name} not redacted: {code} {out!r}"
 
-    print("test_redact_buildlog: 3/3 pass")
+    # 4) Identity token inside a snake_case identifier (A-114, 2026-11-02). `_` is a word
+    #    character, so the old \b...\b sub AND check both missed these: the reviewer repro
+    #    printed "REDACTION OK", rc 0, text unchanged. Assert the name is gone and rc 0.
+    for text, token in (("rsync to air_mainfolder_copy", "mainfolder"),
+                        ("see x_stephens_y", "stephen"),
+                        ("call _arias_z now", "arias"),
+                        ("load_Steve_prefs", "steve"),
+                        ("calls parse_inbox_steve_items()", "steve"),
+                        ("user id_5582798766_x", "5582798766"),
+                        ("mainfolder2 and arias9 and steven_", "arias")):
+        code, out, msg = run(text)
+        assert code == 0 and token not in out.lower(), \
+            f"{token} not redacted inside an identifier: {code} {out!r} {msg!r}"
+    code, out, _ = run("mainfolder2 and arias9 and steven_")
+    assert out == "[USER]2 and [AUTHOR]9 and [AUTHOR]_", f"wrong tokens: {out!r}"
+    code, out, _ = run("calls parse_inbox_steve_items()")
+    assert out == "calls parse_inbox_[USER]_items()", f"lowercase steve must be [USER]: {out!r}"
+    code, out, _ = run("load_Steve_prefs")
+    assert out == "load_[AUTHOR]_prefs", f"capitalised Steve must be [AUTHOR]: {out!r}"
+    # Capitalised forms (review 2026-11-02: dropping IGNORECASE on these subs stayed green).
+    code, out, _ = run("Steve Arias, MAINFOLDER")
+    assert code == 0 and out == "[AUTHOR] [AUTHOR], [USER]", f"case forms: {code} {out!r}"
+    # Letter boundaries still hold: a longer word that merely contains a token is untouched.
+    code, out, _ = run("Stephenson met Zacharias, Ariasson and Xstephens.")
+    assert code == 0 and out == "Stephenson met Zacharias, Ariasson and Xstephens.", \
+        f"over-redacted: {code} {out!r}"
+    # Glued to letters/digits on both sides: the sub skips it, the bare check fails closed.
+    for text in ("xmainfoldery", "xmainfolder.", "mainfoldery", "xsteve.",
+                 "x15582798766", "55827987660y"):
+        code, out, _ = run(text)
+        assert code == 1 and out == text, f"bare check must fail closed: {text!r} -> {code} {out!r}"
+
+    print("test_redact_buildlog: 4/4 pass")
 
 
 if __name__ == "__main__":

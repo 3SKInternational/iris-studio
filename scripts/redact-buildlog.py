@@ -140,11 +140,14 @@ for pat, repl in CRED_PATTERNS:
 #    (drop-if-unsure, per the spec). This backstop guarantees the mechanical classes:
 #    paths, IPs, hosts, credentials, the company, and the known author/operator identity.
 s = re.sub(r"3SK", "[COMPANY]", s, flags=re.IGNORECASE)   # plain substr: also kills 3SK_Finance
-s = re.sub(r"\bmainfolder\b", "[USER]", s, flags=re.IGNORECASE)
-s = re.sub(r"\b5582798766\b", "[USER_ID]", s)
-s = re.sub(r"\bsteve\b", "[USER]", s)                      # macOS username (lowercase form)
-s = re.sub(r"\bste(?:ven?s?|phens?)\b", "[AUTHOR]", s, flags=re.IGNORECASE)  # the person
-s = re.sub(r"\barias\b", "[AUTHOR]", s, flags=re.IGNORECASE)                 # surname
+# Letter (digit) boundaries, not \b: `_` is a word character, so \b...\b let a name inside
+# a snake_case identifier (`air_mainfolder_copy`, `x_stephens_y`, `id_5582798766`) past
+# both the sub and the check. Same fix as redact-book.py 6bad448; backlog A-114.
+s = re.sub(r"(?<![A-Za-z])mainfolder(?![A-Za-z])", "[USER]", s, flags=re.IGNORECASE)
+s = re.sub(r"(?<!\d)5582798766(?!\d)", "[USER_ID]", s)
+s = re.sub(r"(?<![A-Za-z])steve(?![A-Za-z])", "[USER]", s)  # macOS username (lowercase form)
+s = re.sub(r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)  # the person
+s = re.sub(r"(?<![A-Za-z])arias(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)                 # surname
 
 try:
     with open(P, "w", encoding="utf-8") as fh:
@@ -164,8 +167,12 @@ checks = [
     r"\bport[\s:]*\d", r"(?:\[IP\]|\[HOST\]|localhost):\d",     # ports (same forms as the scrub)
     r"iris[_\-]\w", r"iris\.(?:py|db|err|out|sh)", r"com\.iris", r"@iris",  # infra forms ONLY
     r"3sk",                                                     # company
-    r"steve", r"\bste(?:ven?s?|phens?)\b", r"\barias\b",       # person (catches steve_* compounds)
-    r"\bmainfolder\b", r"\b5582798766\b",
+    # Bare where no real word contains the token; letter-bounded where one does
+    # (Stephenson, Zacharias). No rewrite runs after step 5, so a bounded check sees
+    # exactly what the bounded sub left; add redact-book.py case-9 fixtures if one ever does.
+    r"steve", r"mainfolder", r"5582798766",
+    r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])",  # mutequiv: same bounds as its sub, nothing rewrites after it
+    r"(?<![A-Za-z])arias(?![A-Za-z])",                  # mutequiv: same bounds as its sub, nothing rewrites after it
 ] + [pat for pat, _ in CRED_PATTERNS]
 bad = []
 for c in checks:
