@@ -25,11 +25,13 @@
 # Regression test: scripts/test_redact_book.py.
 import re, sys, json, glob
 
-# Target book path: first CLI arg if given, else the flagship (backward compatible with
-# any caller that runs this bare). The nightly multi-book pipeline passes each maintained
-# book's path explicitly so every sellable book gets the same fail-closed scrub.
-DEFAULT_P = "/Users/steve/Documents/3SK/outputs/iris-studio-ebook/iris-studio-ebook.md"
-P = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_P
+# Target book path: the first CLI arg, required. This script rewrites its target in place,
+# and a no-arg fallback to the flagship meant `redact-book.py < book` (a would-be dry run)
+# rewrote the flagship (2026-11-02, A-115). Callers: book-update.prompt, book-editor def.
+if len(sys.argv) < 2:
+    print("REDACTION FAIL — usage: redact-book.py <book.md>  (rewrites the file in place)")
+    sys.exit(2)
+P = sys.argv[1]
 try:
     with open(P, encoding="utf-8") as fh:
         s = fh.read()
@@ -43,9 +45,9 @@ except OSError as e:
 #    YouTube video id ties the build story to the real channel, and this class is mechanically
 #    detectable, so a deterministic gate must own it (not the LLM editor).
 #    ponytail: Mini-coupled — RECEIPTS_GLOB is an absolute vault path; this gate is Mini-bound
-#    (matches DEFAULT_P). Missing receipts fail LOUD by design — an empty set would silently
+#    (like the book paths). Missing receipts fail LOUD by design — an empty set would silently
 #    stop scrubbing ids, the exact leak class this closes. Upgrade path if it ever runs
-#    elsewhere: derive the vault root from DEFAULT_P / an env var.
+#    elsewhere: derive the vault root from the book path / an env var.
 RECEIPTS_GLOB = "/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/Production_Kits/*_youtube_upload.json"
 VIDEO_ID_SUPPLEMENT = ["FJljsipxTkA", "n8l84_UBLUc"]  # dead re-upload ids no receipt records
 

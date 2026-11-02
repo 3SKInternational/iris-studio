@@ -27,6 +27,16 @@ def run(text):
 
 
 def main():
+    # 0) No path argument: usage + exit 2 before reading or writing anything (A-115). The old
+    #    fallback rewrote the flagship when a writer tried `redact-book.py < book` as a dry run.
+    #    Never name the flagship here: under a guard mutant this must not touch the real book.
+    with tempfile.TemporaryDirectory() as d:
+        r = subprocess.run([sys.executable, SCRIPT], cwd=d, input="steve\n",
+                           capture_output=True, text=True)
+        assert r.returncode == 2 and "usage: redact-book.py <book.md>" in r.stdout, \
+            f"no-arg run must refuse: rc={r.returncode} {r.stdout!r} {r.stderr!r}"
+        assert os.listdir(d) == [], f"no-arg run wrote files: {os.listdir(d)}"
+
     if not RECEIPTS:
         print("test_redact_book: SKIP — no upload receipts on this machine (redact gate is Mini-bound)")
         return
@@ -172,7 +182,7 @@ def main():
         assert code == 1 and token in out.lower(), \
             f"fail-OPEN: {text!r} should fail closed, got rc={code} {out!r} {msg!r}"
 
-    print("test_redact_book: 15/15 pass")
+    print("test_redact_book: 16/16 pass")
 
 
 if __name__ == "__main__":
