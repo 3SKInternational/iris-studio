@@ -7,9 +7,17 @@ FLAGSHIP: /Users/steve/Documents/3SK/outputs/iris-studio-ebook/iris-studio-ebook
 
 PASS M — LOAD THE MANIFEST (do this once, first):
   - Read the MANIFEST. Parse the "## Maintained books" markdown table into a list of books, each with: `id`, `file` (resolve relative to EBOOK DIR → absolute path), `source_model` (`vault` or `flagship+vault`), `redact_gated` (yes/no).
-  - Maintain ONLY the books in that table. NEVER touch the excluded strategy docs the manifest lists (Knowledge_Product_Catalog.md, Series_00_Architecture.md, _chapters_22_25_addendum.md) or any other file.
+  - Maintain ONLY the books in that table. NEVER touch the excluded strategy docs the manifest lists (Knowledge_Product_Catalog.md, Series_00_Architecture.md, _chapters_22_25_addendum.md) or any other file (the only exceptions: the daily note, the bridge, and closing PASS P pickups).
   - If the manifest is missing or the table can't be parsed, do NOT guess — log it and emit ROUTINE_INCOMPLETE (see end). A malformed manifest is a real failure, not a no-op.
   - Keep a per-book status tally as you go: each book ends as one of `shipped`, `noop`, `held` (editor HOLD, a correct outcome), or `broke` (a real failure).
+
+PASS P — PICKUPS ADDRESSED TO THIS ROUTINE (once, after PASS M; A-116):
+  - Other lanes hand this routine work as code pickups (first one: the DQ-62 time-zone pickup, 2026-11-02). List the open ones:
+      cd /Users/steve/Documents/3SK/outputs
+      for f in 06_CEO/Code_Pickups/*.md; do fm=$(awk '/^---[[:space:]]*$/{n++; next} n==1' "$f"); if printf '%s\n' "$fm" | grep -qiE '^owner:.*book-update' && printf '%s\n' "$fm" | grep -qiE '^status:[[:space:]]*"?(open|ready)'; then echo "$f"; fi; done
+  - Read each listed pickup. It NAMES a maintained book when its body contains that book's manifest `file` name (e.g. `Series_Level_3_Claude_Build_Pack.md`). Note which books each pickup names.
+  - A pickup that names no maintained book cannot be acted on here: put it in "Open for human" and leave it alone.
+  - A pickup is never a reason to skip a gate: its edits go through the same writer → editor → redact → ship passes as any other new material.
 
 Then LOOP the books below. **Each book is independent: a failure or HOLD on one book must NOT stop the others.** Run every book to its own outcome, then emit ONE aggregate completion signal at the very end.
 
@@ -38,13 +46,14 @@ PASS 0 — CHEAP NO-OP GUARD (before spending any writing effort on this book):
           find STEVE_CONTEXT.md _Iris_Memory/Sessions _Iris_Memory/Daily 06_CEO/Decisions_Log 06_CEO/Designs iris-studio-ebook/iris-studio-ebook.md -name '*.md' -newermt "$LAST_BOOK_DATE"
     For the vault scan, ALSO read STEVE_CONTEXT.md for "Date bump" entries dated after LAST_BOOK_DATE.
   - If the find errors (e.g. "Invalid timestamp") instead of returning a file list, do NOT treat the error as "no new material" — re-extract the date and retry once; if it still errors, mark this book `broke` and move to the next book.
-  - If there is genuinely NO new material for this book: tally it `noop` and move to the next book. (Write the per-book skip into the aggregate daily-note line at the end; do not invoke the agents, do not back up, do not commit.)
+  - A pickup from PASS P that names THIS book counts as new material, even if the find returned nothing; add the pickup's path to this book's new source files.
+  - If there is genuinely NO new material for this book (no find hits AND no pickup naming it): tally it `noop` and move to the next book. (Write the per-book skip into the aggregate daily-note line at the end; do not invoke the agents, do not back up, do not commit.)
 
 PASS 1 — WRITE (only if PASS 0 found new material):
   - Clear any stale backup, then back up THIS book fresh so the editor can diff against a clean baseline (the vault is NOT a git repo). Verify the copy succeeded before invoking the writer — if it didn't, mark this book `broke` and move on (a missing/stale backup makes the editor's diff meaningless):
       rm -f "$BOOK.bak-pre-writer"
       cp "$BOOK" "$BOOK.bak-pre-writer" && test -f "$BOOK.bak-pre-writer" || { echo "book-update: backup failed for $BOOK"; }   # on failure: tally broke, next book
-  - Invoke the book-writer subagent. Brief it explicitly with: TARGET_BOOK=$BOOK, SOURCE_MODEL, LAST_BOOK_DATE, whether this is a FIRST TOUCH (no Changelog yet), and the list of new source files from Pass 0. On a first touch, tell it to do a FULL derivation/fill pass (not just a delta) and to ADD a `## Changelog` section. On a normal run it focuses only on the delta. Either way it grounds truth per SOURCE_MODEL. (The writer bumps BOTH the title-block "Draft vX.Y — date" line AND the Changelog top entry in lockstep, in the canonical `- **vX.Y (YYYY-MM-DD — summary):**` format, so Pass 0's date anchor stays valid next run.)
+  - Invoke the book-writer subagent. Brief it explicitly with: TARGET_BOOK=$BOOK, SOURCE_MODEL, LAST_BOOK_DATE, whether this is a FIRST TOUCH (no Changelog yet), and the list of new source files from Pass 0 (if a pickup is among them, tell the writer to apply that pickup's edits for this book). On a first touch, tell it to do a FULL derivation/fill pass (not just a delta) and to ADD a `## Changelog` section. On a normal run it focuses only on the delta. Either way it grounds truth per SOURCE_MODEL. (The writer bumps BOTH the title-block "Draft vX.Y — date" line AND the Changelog top entry in lockstep, in the canonical `- **vX.Y (YYYY-MM-DD — summary):**` format, so Pass 0's date anchor stays valid next run.)
   - If the writer errors out, tally this book `broke`, clean up its backup (`rm -f "$BOOK.bak-pre-writer"`), and move to the next book.
 
 PASS 2 — EDIT:
@@ -53,7 +62,7 @@ PASS 2 — EDIT:
 
 PASS 2.5 — REDACT (deterministic gate; run only if REDACT_GATED = yes — all sellable books are):
   - Run: python3 /Volumes/AI_Workspace/iris_studio/scripts/redact-book.py "$BOOK"
-  - Exit 0 = clean → proceed to SHIP. Exit 1 = a known identifier/credential survived the auto-fix (should never reach here): tally this book `broke`, surface it (bridge file + aggregate daily-note line), clean up the backup, and move to the next book. NEVER ship a book the redact gate rejected.
+  - Exit 0 = clean → proceed to SHIP. Any non-zero exit (1 = a known identifier/credential survived the auto-fix, should never reach here; 2 = no path argument was passed): tally this book `broke`, surface it (bridge file + aggregate daily-note line), clean up the backup, and move to the next book. NEVER ship a book the redact gate rejected.
 
 PASS 3 — SHIP (only if editor verdict = SHIP and redact exited 0):
   - The book lives in the vault. The vault is NOT a git repository (confirmed 2026-06-15), so the durable artifact is the saved file on disk — nothing to commit, nothing to push (Syncthing is stopped; cross-Mac sync is manual). Re-confirm before assuming:
@@ -71,6 +80,7 @@ PASS 3 — SHIP (only if editor verdict = SHIP and redact exited 0):
 ────────────────────────────────────────────────────────
 AFTER THE LOOP — aggregate logging (once):
 ────────────────────────────────────────────────────────
+  - Close the PASS P pickups: a pickup is done only when EVERY book it names was tallied `shipped` this run AND its own `**Verify:**` step (if it has one) passes when you run it now. A shipped book proves the edit was safe, not that it was complete. Then set its frontmatter `status: done` and add `resolution: closed-fix-applied-YYYY-MM-DD` (today). If any named book was held or broke, or the Verify step fails, leave the pickup open and list it in "Open for human" with the reason (include the Verify output).
   - Append ONE summary line per run to today's daily note (_Iris_Memory/Daily/YYYY-MM-DD.md) under "## 🤖 Claude Code intra-day log", listing each book's outcome, e.g.:
       `HH:MM — book-update: flagship shipped v0.6; p1_l3 noop; <id> held (reason)`
   - Append a session entry to _Iris_Memory/Sessions/CLAUDE_CODE_HANDOFF.md summarizing what shipped / was held / broke and any "Open for human" items the editor surfaced.
@@ -83,6 +93,6 @@ NEVER fabricate book content. The agents enforce source-grounding; you enforce t
 
 After all other work and logging, the VERY LAST line of your output MUST be exactly one of:
 - `ROUTINE_COMPLETE` — every maintained book reached a clean designed outcome: shipped, a no-op (PASS 0 found nothing new), or a deliberate editor HOLD you surfaced + cleaned up. (A HOLD is a correct outcome, not a failure.)
-- `ROUTINE_INCOMPLETE: <one-line reason>` — at least one book actually broke: the manifest couldn't be parsed, an agent errored, a backup/write failed, a find kept erroring, or the redact gate exited 1. Name the book(s) and what broke.
+- `ROUTINE_INCOMPLETE: <one-line reason>` — at least one book actually broke: the manifest couldn't be parsed, an agent errored, a backup/write failed, a find kept erroring, or the redact gate exited non-zero. Name the book(s) and what broke.
 
 Output nothing after that line. This line is how Steve gets a done / not-fully-done alert on Telegram.
