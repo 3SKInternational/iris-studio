@@ -92,6 +92,25 @@ class TestClaudeJobTimeout(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertLess(took, 20)
 
+    def test_grandchild_that_ignores_term_is_killed(self):
+        # two levels below the CLI (claude -> MCP launcher -> server shape): only a
+        # recursive tree walk reaches it (A-113; a one-level walk passed this suite)
+        pidf = self.tmp / "pidc"
+        rc, _ = self.run_with(
+            f"bash -c \"bash -c \\\"trap '' TERM; sleep 120 & echo \\\\\\$! > {pidf}; wait\\\"; :\"")
+        self.assertEqual(rc, 124)
+        time.sleep(0.3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pidf.read_text()), 0)
+
+    def test_exec_failure_says_why(self):
+        self.log_start = LOG.stat().st_size if LOG.exists() else 0
+        env = dict(self.env, CLAUDE_BIN="/nonexistent/claude")
+        r = subprocess.run(["/bin/bash", str(WRAPPER), JOB, str(self.prompt)],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 127)
+        self.assertIn("cannot exec /nonexistent/claude: No such file or directory", self.new_log())
+
     def test_killed_wrapper_group_takes_cli_down(self):
         # launchd stops a job by killing its process group; the CLI must be in it
         pidf = self.tmp / "pid"
@@ -129,6 +148,27 @@ class TestClaudeJobTimeout(unittest.TestCase):
         log = self.new_log()
         self.assertIn("bad CLAUDE_JOB_TIMEOUT_SEC '2h'", log)
         self.assertIn("bad CLAUDE_JOB_KILL_GRACE_SEC 'abc'", log)
+
+    def test_zero_timeout_falls_back(self):
+        # "00" got past the old literal `0)` arm and `alarm "00"` switched the cap off
+        # Pin the value perl receives, not just the log line: logging "using 28800" while
+        # still passing 0 would leave the cap off (review r1, 2026-11-02).
+        argv = self.tmp / "argv"
+        for v in ("0", "00"):
+            self.env["CLAUDE_JOB_TIMEOUT_SEC"] = v
+            rc, _ = self.run_with(f"ps -o command= -p $PPID > {argv}; echo ROUTINE_COMPLETE")
+            self.assertEqual(rc, 0)
+            self.assertIn(f"bad CLAUDE_JOB_TIMEOUT_SEC '{v}', using 28800", self.new_log())
+            self.assertIn("-- 28800 ", argv.read_text())
+
+    def test_leading_zero_values_are_decimal(self):
+        # "010" and "020" are octal 8 and 16 to bash arithmetic; they must mean 10 and 20 s.
+        # (A 2 s gap was too small: the bounded wait after KILL adds ~1 s.)
+        self.env.update(CLAUDE_JOB_TIMEOUT_SEC="010", CLAUDE_JOB_KILL_GRACE_SEC="020")
+        rc, took = self.run_with("trap '' TERM; sleep 120")
+        self.assertEqual(rc, 124)
+        self.assertGreaterEqual(took, 30)  # 10 + 20; octal 16 grace ends near 27
+        self.assertIn(f"'{JOB}' TIMED OUT after 10s", self.new_log())
 
     # --- A-110: background-wait ceiling reaches the CLI ---------------------
     def bg_wait_seen(self, **env):

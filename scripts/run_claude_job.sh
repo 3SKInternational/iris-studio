@@ -215,10 +215,17 @@ JOB_START=$(date +%s)
 JOB_TIMEOUT="${CLAUDE_JOB_TIMEOUT_SEC:-28800}"
 KILL_GRACE="${CLAUDE_JOB_KILL_GRACE_SEC:-30}"  # overridable for self-tests
 # A typo like "2h" would reach perl as 2 and kill every run; refuse it.
-case "$JOB_TIMEOUT" in ''|*[!0-9]*|0)
+case "$JOB_TIMEOUT" in ''|*[!0-9]*)
     echo "run_claude_job: bad CLAUDE_JOB_TIMEOUT_SEC '${JOB_TIMEOUT}', using 28800" >> "$LOG"; JOB_TIMEOUT=28800 ;; esac
+# Zero check after the base-10 read: "00" got past a literal `0)` arm and `alarm "00"`
+# turned the cap off (A-113). 10# also keeps "010" from reading as octal 8.
+JOB_TIMEOUT=$((10#$JOB_TIMEOUT))
+if [ "$JOB_TIMEOUT" -eq 0 ]; then
+    echo "run_claude_job: bad CLAUDE_JOB_TIMEOUT_SEC '${CLAUDE_JOB_TIMEOUT_SEC}', using 28800" >> "$LOG"; JOB_TIMEOUT=28800
+fi
 case "$KILL_GRACE" in ''|*[!0-9]*)
     echo "run_claude_job: bad CLAUDE_JOB_KILL_GRACE_SEC '${KILL_GRACE}', using 30" >> "$LOG"; KILL_GRACE=30 ;; esac
+KILL_GRACE=$((10#$KILL_GRACE))
 # Background-wait ceiling (A-110). In print mode the CLI ends the run 600 s after
 # its last turn if background tasks are still running; on 10-27 that killed the
 # nightly mid-review, with no sentinel and no bridge entry. 45 min covers a
@@ -231,7 +238,8 @@ export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$BG_WAIT"
 /usr/bin/perl -e '
     my ($t, $g, @cmd) = @ARGV;
     my $pid = fork // exit 127;
-    if (!$pid) { exec @cmd or exit 127 }
+    # block form: no shell, no word split, and say why exec failed (perl -e has no warnings)
+    if (!$pid) { exec { $cmd[0] } @cmd or do { print STDERR "run_claude_job: cannot exec $cmd[0]: $!\n"; exit 127 } }
     sub tree {
         my @todo = @_; my @all;
         while (@todo) { my $p = shift @todo; push @all, $p; push @todo, split " ", `pgrep -P $p`; }
@@ -242,11 +250,14 @@ export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$BG_WAIT"
         kill "TERM", @t;
         for (1 .. $g) { last if waitpid($pid, 1) > 0; sleep 1 }  # 1 = WNOHANG
         kill "KILL", @t;
-        waitpid $pid, 0;
+        # bounded: a child stuck in kernel I/O (a detaching volume) ignores KILL until
+        # the I/O returns, and a blocking wait here would hold the job lock again
+        for (1 .. 10) { last if waitpid($pid, 1) != 0; sleep 1 }
         exit 124;
     };
     alarm $t;
     waitpid $pid, 0;
+    alarm 0;  # a CLI that finished at the cap is not a timeout
     exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
 ' -- "$JOB_TIMEOUT" "$KILL_GRACE" "$CLAUDE" --print --dangerously-skip-permissions "$PROMPT" 2>&1 | tee -a "$LOG" | tee "$RUN_OUT" >/dev/null
 rc=${PIPESTATUS[0]}
