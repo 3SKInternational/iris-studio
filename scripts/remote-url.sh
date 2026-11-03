@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-LOG="/Users/steve/iris_studio/logs/claude-remote.log"
+LOG="${REMOTE_LOG:-/Users/steve/iris_studio/logs/claude-remote.log}"  # REMOTE_LOG: tests only
 
 if [ ! -f "$LOG" ]; then
     echo "ERROR: Claude Code Remote Control log not found at $LOG" >&2
@@ -36,7 +36,7 @@ if [ ! -f "$LOG" ]; then
     exit 1
 fi
 
-URL=$(grep -oE "https://claude\.ai/code\?environment=[a-zA-Z0-9_]+" "$LOG" | tail -1)
+URL=$(grep -aoE "https://claude\.ai/code\?environment=[a-zA-Z0-9_]+" "$LOG" | tail -1 || true)  # no match: print the message below, not a silent set -e exit
 
 if [ -z "$URL" ]; then
     echo "ERROR: No URL found in $LOG (yet?). The launchd job may still be starting." >&2

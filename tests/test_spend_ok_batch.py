@@ -255,7 +255,14 @@ class TestSpendWatch(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
         state = tmp / "state.json"
-        state.write_text(json.dumps({"stages": {"5_images": {"status": "running"}}}))
+
+        def set_status(st):
+            # Atomic, as the orchestrator writes it: an in-place write_text truncates
+            # first, and a watcher read in that gap sees status '' and alerts (A-120).
+            (tmp / "state.tmp").write_text(json.dumps({"stages": {"5_images": {"status": st}}}))
+            os.replace(tmp / "state.tmp", state)
+
+        set_status("running")
         script = (REPO / "scripts" / "spend_watch.sh").read_text()
         for old, new in [
                 ('STATE="/Users/steve/Documents/3SK/outputs/BRANDS/3SK_Finance/'
@@ -268,18 +275,35 @@ class TestSpendWatch(unittest.TestCase):
         alerts = tmp / "alerts"
         (tmp / "notify.sh").write_text(f'#!/bin/sh\necho "$1" >> {alerts}\n')
         (tmp / "notify.sh").chmod(0o755)
-        # A process the watcher's pattern matches, gone after ~2 s.
-        fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)",
-                                 f"image_factory/generate_images.py x Video_{VIDEO}_HD"])
+        # A process the watcher's pattern matches, alive until we remove `flag`, so a
+        # slow watcher start cannot miss it (a fixed 2 s life could, under load).
+        flag = tmp / "alive"
+        flag.touch()
+        fake = subprocess.Popen([sys.executable, "-c",
+                                 "import os, sys, time\n"
+                                 "end = time.time() + 120  # no orphan if the runner is killed\n"
+                                 "while os.path.exists(sys.argv[1]) and time.time() < end:\n"
+                                 "    time.sleep(0.05)",
+                                 str(flag), f"image_factory/generate_images.py x Video_{VIDEO}_HD"])
         self.addCleanup(lambda: fake.poll() is None and (fake.kill(), fake.wait()))
         w = subprocess.Popen(["bash", str(watch), str(VIDEO)],
                              env={**os.environ, "HOME": str(tmp)})
         self.addCleanup(lambda: w.poll() is None and (w.kill(), w.wait()))
+        log = tmp / "iris_studio" / "logs" / f"spend_watch_v{VIDEO}.log"
+        deadline = time.time() + 60
+        while "entering watch loop" not in (log.read_text() if log.exists() else ""):
+            self.assertIsNone(w.poll(), "watcher exited before it saw the batch")
+            self.assertLess(time.time(), deadline, "watcher never saw the batch")
+            time.sleep(0.1)
+        flag.unlink()
         fake.wait(timeout=10)
-        time.sleep(3)                                    # watcher sees it gone, still 'running'
+        # A negative claim needs some wall time: ~3 polls with the batch gone and
+        # stage 5 still 'running'. Under load fewer polls run; that weakens the check
+        # but cannot fail it.
+        time.sleep(3)
         self.assertIsNone(w.poll(), "must keep watching, not report a crash")
-        state.write_text(json.dumps({"stages": {"5_images": {"status": "done"}}}))
-        self.assertEqual(w.wait(timeout=10), 0)
+        set_status("done")
+        self.assertEqual(w.wait(timeout=30), 0)
         self.assertFalse(alerts.exists(), alerts.exists() and alerts.read_text())
 
 

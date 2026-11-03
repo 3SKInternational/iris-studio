@@ -23,6 +23,12 @@ LOG = pathlib.Path.home() / "iris_studio" / "logs" / f"claude-code-{JOB}.log"
 
 
 class TestClaudeJobTimeout(unittest.TestCase):
+    SHORT_CAP = {"test_hang_that_ignores_term_is_killed", "test_exits_early_when_term_works",
+                 "test_kill_waits_for_grace", "test_children_get_term_first",
+                 "test_orphan_that_ignores_term_is_still_killed",
+                 "test_grandchild_that_ignores_term_is_killed",
+                 "test_term_not_before_cap", "test_cli_exit_124_before_cap_is_not_a_timeout"}
+
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.alerts = self.tmp / "alerts.txt"
@@ -32,9 +38,13 @@ class TestClaudeJobTimeout(unittest.TestCase):
         self.prompt = self.tmp / "p.prompt"
         self.prompt.write_text("selftest")
         self.env = dict(os.environ, NOTIFY_BIN=str(notify), RQ_BASE=str(self.tmp / "rq"),
-                        CLAUDE_JOB_TIMEOUT_SEC="2", CLAUDE_JOB_KILL_GRACE_SEC="1",
+                        CLAUDE_JOB_TIMEOUT_SEC="10", CLAUDE_JOB_KILL_GRACE_SEC="1",
                         JOB_QUIET_OK="1")
         self.env.pop("IRIS_RETRY", None)
+        # A trivial stub sometimes stalls past 2 s on first exec (A-121), so the cap
+        # is 10 s by default; tests that want a timeout opt into 2 s.
+        if self._testMethodName in self.SHORT_CAP:
+            self.env["CLAUDE_JOB_TIMEOUT_SEC"] = "2"
 
     def run_with(self, body):
         stub = self.tmp / "claude"
@@ -201,9 +211,14 @@ class TestClaudeJobTimeout(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(self.marker())
 
-    def test_job_just_inside_cap_finishes(self):
-        rc, _ = self.run_with("sleep 1; echo ROUTINE_COMPLETE")
-        self.assertEqual(rc, 0)
+    def test_term_not_before_cap(self):
+        # Replaces "1 s job inside a 2 s cap", which flaked on a slow exec. A stall can
+        # only make TERM later, so this bound never flakes and still kills `alarm $t-1`.
+        got = self.tmp / "term"
+        t0 = time.time()
+        rc, _ = self.run_with(f'trap "touch {got}; exit 0" TERM; sleep 120 & wait')
+        self.assertEqual(rc, 124)
+        self.assertGreaterEqual(got.stat().st_mtime - t0, 2)
 
     def test_nonzero_exit_code_kept(self):
         rc, _ = self.run_with("echo boom; exit 3")

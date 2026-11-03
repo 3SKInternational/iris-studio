@@ -17,10 +17,14 @@ URL_RE = r"https://claude\.ai/code\?environment=[a-zA-Z0-9_]+"
 SPIN = b"Reconnecting to the remote-control relay... retrying\n"  # 53 bytes
 
 
+REMOTE_URL = SCRIPT.resolve().parent / "remote-url.sh"
+
+
 def last_url(path):
-    """The same grep remote-url.sh runs."""
-    r = subprocess.run(f"grep -oE '{URL_RE}' '{path}' | tail -1", shell=True,
-                       capture_output=True, text=True)
+    """What the real remote-url.sh prints for this log ('' when it finds none)."""
+    r = subprocess.run(["/bin/bash", str(REMOTE_URL)], env=dict(os.environ, REMOTE_LOG=str(path)),
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode in (0, 1), r.stderr  # 127: no remote-url.sh beside SCRIPT
     return r.stdout.strip()
 
 
@@ -75,6 +79,20 @@ class TestRotate(unittest.TestCase):
         body = self.remote.read_bytes()
         self.assertEqual(body.count(b"environment="), 1)
         self.assertTrue(body.endswith(url + b"\n"), body[-120:])
+
+    def test_remote_url_reads_past_a_nul(self):
+        # BSD grep without -a prints "Binary file matches" instead of the URL (A-121)
+        self.remote.write_bytes(b"https://claude.ai/code?environment=env_OLD5\n\x00garbage\n"
+                                b"Open https://claude.ai/code?environment=env_NUL5\n")
+        self.assertEqual(last_url(self.remote), "https://claude.ai/code?environment=env_NUL5")
+
+    def test_remote_url_says_when_no_url(self):
+        # set -e used to end it silently on grep's no-match exit
+        self.remote.write_bytes(SPIN)
+        r = subprocess.run(["/bin/bash", str(REMOTE_URL)], env=dict(os.environ, REMOTE_LOG=str(self.remote)),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No URL found", r.stderr)
 
     def test_no_url_anywhere(self):
         self.big(self.remote)
