@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 # RQ_UNDER_TEST points at a copy for mutation runs; live wrappers source the real one.
 QUEUE = Path(os.environ.get("RQ_UNDER_TEST") or REPO / "scripts" / "retry_queue.sh")
-RUNNER = REPO / "scripts" / "retry_runner.sh"
+RUNNER = Path(os.environ.get("RUNNER_UNDER_TEST") or REPO / "scripts" / "retry_runner.sh")
 
 
 def write_marker(base, job, kind="claude", paused=1, attempts=48,
@@ -146,7 +146,7 @@ class TestUnpauseOnRecovery(unittest.TestCase):
         self.assertEqual(field(self.base, "credential-check", "attempts"), "49")
 
 
-class TestRunnerCapAndOrder(unittest.TestCase):
+class RunnerFixture(unittest.TestCase):
     """Run a copy of retry_runner.sh next to a fake run_job.sh that logs which
     job it was asked to replay and clears that marker (a successful replay)."""
 
@@ -159,6 +159,7 @@ class TestRunnerCapAndOrder(unittest.TestCase):
         self.base.mkdir()
         self.calls = root / "calls.txt"
         (self.scripts / "retry_runner.sh").write_text(RUNNER.read_text())
+        (self.scripts / "retry_queue.sh").write_text(QUEUE.read_text())
         (self.scripts / "notify.sh").write_text("#!/bin/bash\nexit 0\n")
         (self.scripts / "run_job.sh").write_text(
             f'#!/bin/bash\necho "$1" >> "{self.calls}"\n'
@@ -179,6 +180,8 @@ class TestRunnerCapAndOrder(unittest.TestCase):
                        env=env, capture_output=True, text=True, check=True)
         return self.calls.read_text().split() if self.calls.exists() else []
 
+
+class TestRunnerCapAndOrder(RunnerFixture):
     def test_default_cap_is_two_and_oldest_goes_first(self):
         # names sort opposite to age, so alphabetical order would fail this
         write_marker(self.base, "a-newest", paused=0,
@@ -203,6 +206,75 @@ class TestRunnerCapAndOrder(unittest.TestCase):
         write_marker(self.base, "c", paused=0,
                      last_attempt="2026-10-02T00:00:00Z", argv0=self.wrapper)
         self.assertEqual(self.run_runner(cap=1), ["b"])
+
+
+class TestRunnerLock(RunnerFixture):
+    """A-105: the sweep lock uses the A-99 job lock. A live sweep is never
+    stolen (one 8 h replay used to outlast the 6 h steal), a dead one is taken
+    at once, and the exit trap leaves a lock that is no longer ours."""
+
+    def setUp(self):
+        super().setUp()
+        self.lock = self.base / "locks" / ".runner.lock"
+        write_marker(self.base, "job", paused=0, argv0=self.wrapper)
+
+    def make_lock(self, pid, age_min):
+        self.lock.mkdir(parents=True)
+        (self.lock / "pid").write_text(f"{pid}\n")
+        t = time.time() - age_min * 60
+        os.utime(self.lock, (t, t))
+
+    def test_live_sweep_at_7h_is_not_stolen(self):
+        self.make_lock(os.getpid(), age_min=420)
+        self.assertEqual(self.run_runner(), [])
+        self.assertEqual((self.lock / "pid").read_text().strip(), str(os.getpid()))
+        self.assertIn("already running", (Path(self.tmp.name) / "runner.log").read_text())
+
+    def test_dead_sweep_is_taken_and_released(self):
+        p = subprocess.Popen(["/usr/bin/true"])
+        p.wait()
+        self.make_lock(p.pid, age_min=1)
+        self.assertEqual(self.run_runner(), ["job"])
+        self.assertFalse(self.lock.exists())
+
+    def test_normal_sweep_releases_its_lock(self):
+        self.assertEqual(self.run_runner(), ["job"])
+        self.assertFalse(self.lock.exists())
+
+    def test_sweep_holds_the_lock_with_its_pid_while_replaying(self):
+        # The fake wrapper records who holds the sweep lock mid-replay.
+        seen = Path(self.tmp.name) / "holder.txt"
+        (self.scripts / "run_job.sh").write_text(
+            f'#!/bin/bash\necho "$1" >> "{self.calls}"\n'
+            f'cat "{self.lock}/pid" > "{seen}"; echo "$PPID" >> "{seen}"\n'
+            f'rm -f "{self.base}/$1.retry"\n')
+        self.assertEqual(self.run_runner(), ["job"])
+        holder, parent = seen.read_text().split()
+        self.assertEqual(holder, parent)
+
+    def test_lock_mtime_is_refreshed_between_replays(self):
+        # The 24 h PID-reuse ceiling must count from the last replay, or a live
+        # sweep of several 8 h replays would be stolen. First replay ages the
+        # lock two days; the second records its mtime.
+        write_marker(self.base, "job2", paused=0, argv0=self.wrapper,
+                     last_attempt="2026-10-02T00:00:00Z")
+        seen = Path(self.tmp.name) / "mtime.txt"
+        (self.scripts / "run_job.sh").write_text(
+            f'#!/bin/bash\necho "$1" >> "{self.calls}"\n'
+            f'if [ "$1" = job ]; then touch -t 202601010000 "{self.lock}"; '
+            f'else stat -f %m "{self.lock}" > "{seen}"; fi\n'
+            f'rm -f "{self.base}/$1.retry"\n')
+        self.assertEqual(self.run_runner(), ["job", "job2"])
+        self.assertLess(time.time() - int(seen.read_text()), 600)
+
+    def test_exit_leaves_a_lock_taken_from_it(self):
+        # Mid-replay another sweep takes the lock; ours must not remove it.
+        (self.scripts / "run_job.sh").write_text(
+            f'#!/bin/bash\necho "$1" >> "{self.calls}"\n'
+            f'echo {os.getpid()} > "{self.lock}/pid"\n'
+            f'rm -f "{self.base}/$1.retry"\n')
+        self.assertEqual(self.run_runner(), ["job"])
+        self.assertEqual((self.lock / "pid").read_text().strip(), str(os.getpid()))
 
 
 class TestLockSteal(unittest.TestCase):

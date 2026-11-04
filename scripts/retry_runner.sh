@@ -22,24 +22,25 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RQ_BASE="${RQ_BASE:-$HOME/iris_studio/retry}"
 LOG="${RETRY_RUNNER_LOG:-$HOME/iris_studio/logs/claude-code-retry.log}"
-RUN_LOCK="$RQ_BASE/.runner.lock"
+RUN_LOCK_NAME=".runner"   # → $RQ_BASE/locks/.runner.lock
 
 mkdir -p "$RQ_BASE" "$(dirname "$LOG")" 2>/dev/null || true
+# shellcheck source=retry_queue.sh
+. "$SCRIPT_DIR/retry_queue.sh"
 
-# Only one sweep at a time. If the previous sweep is somehow still running
-# (a recovered heavy routine took >30 min), skip this tick — atomic mkdir lock.
-# The sweep touches RUN_LOCK between jobs, so a long-but-LIVE recovery batch keeps
-# its mtime fresh; only a genuinely dead lock (>6h untouched) gets stolen. This is
-# well above the realistic worst case of replaying the whole job suite back-to-back
-# after an auth outage, so a live batch is never mistaken for stale.
-if [ -d "$RUN_LOCK" ] && [ -n "$(find "$RUN_LOCK" -maxdepth 0 -mmin +360 2>/dev/null)" ]; then
-    rm -rf "$RUN_LOCK" 2>/dev/null || true   # steal a stale runner lock (>6h untouched)
-fi
-if ! mkdir "$RUN_LOCK" 2>/dev/null; then
+# Only one sweep at a time. If the previous sweep is still running (a recovered
+# heavy routine can take up to its 8 h cap, twice per tick), skip this tick.
+# Same lock as the per-job locks (A-105, after A-99): the holder's PID lives in
+# the dir, so a live sweep is never stolen and a dead one is taken at once; the
+# trap removes the lock only while it is still ours. Before A-105 the runner
+# stole any lock untouched for 6 h (one 8 h replay never touched it) and its
+# trap removed the lock even after it was stolen, so two sweeps could overlap.
+if ! rq_acquire_lock "$RUN_LOCK_NAME"; then
     echo "$(date '+%F %T') retry_runner: a sweep is already running, skipping" >> "$LOG"
     exit 0
 fi
-trap 'rmdir "$RUN_LOCK" 2>/dev/null || true' EXIT
+RUN_LOCK="$_RQ_LOCK"
+trap 'rq_release_lock' EXIT
 
 # Nothing queued → silent no-op (the common case).
 shopt -s nullglob
@@ -140,9 +141,9 @@ for marker in "${markers[@]}"; do
     echo "$(date '+%F %T') retry_runner: replaying '${job}' → ${argv[*]}" >> "$LOG"
     IRIS_RETRY=1 "${argv[@]}" >> "$LOG" 2>&1
     rc=$?
-    # Keep the runner lock fresh so a long sequential recovery batch isn't mistaken
-    # for a stale lock and stolen by the next 30-min tick.
-    touch "$RUN_LOCK" 2>/dev/null || true
+    # Keep the runner lock's mtime fresh so the 24 h PID-reuse ceiling in
+    # rq_acquire_lock counts from the last replay, not the start of the sweep.
+    [ -n "$RUN_LOCK" ] && touch "$RUN_LOCK" 2>/dev/null || true
     echo "$(date '+%F %T') retry_runner: '${job}' replay exit ${rc} ($( [ -f "$marker" ] && echo 'still queued' || echo 'cleared'))" >> "$LOG"
 done
 
