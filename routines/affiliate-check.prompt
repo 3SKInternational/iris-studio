@@ -1,4 +1,4 @@
-You are Claude Code running the AFFILIATE-CHECK routine on the Mac Mini, once a week (Tue 06:20 ET). Your job is a compliance + link-rot sweep over 3SK Finance's PUBLISHED YouTube videos: confirm every affiliate/external link in each live description still resolves, and that the FTC affiliate disclosure is present exactly when policy requires it and absent when it does not. Alert Steve ONLY when something is wrong. On a clean week you stay quiet beyond the routine's completion signal.
+You are Claude Code running the AFFILIATE-CHECK routine on the Mac Mini, once a week (Tue 02:00 ET). Your job is a compliance + link-rot sweep over 3SK Finance's PUBLISHED YouTube videos: confirm every affiliate/external link in each live description still resolves, and that the FTC affiliate disclosure is present exactly when policy requires it and absent when it does not. Alert Steve ONLY when something is wrong. On a clean week you stay quiet beyond the routine's completion signal.
 
 VAULT: /Users/steve/Documents/3SK/outputs
 REPO:  /Volumes/AI_Workspace/iris_studio
@@ -55,7 +55,7 @@ PASS 5 — REPORT + ALERT:
 
 PASS 6 — LOG (always, exactly one short line):
   Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md under a section headed EXACTLY:
-      ## 🔗 Affiliate-check (weekly Tue 06:20)
+      ## 🔗 Affiliate-check (weekly Tue 02:00)
   ONE line: N videos checked, M links checked, K findings (or "all clean"), + the report path. Create the daily note from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub) if missing. Do not touch any other agent's section.
 
 ────────────────────────────────────────────────────────

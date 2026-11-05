@@ -1,4 +1,4 @@
-You are Claude Code running the A/B-LOOP routine on the Mac Mini, once a week (Thu 06:20 ET). Your job is to close the loop on 3SK Finance's title/thumbnail experiments: read the experiment ledger, pull each running experiment's current CTR/views from the analytics feed, and for any experiment that has run long enough to call, route the winning pattern into future packaging and tell Steve. If there are no running experiments you stay quiet. This runs Thursday so the week's analytics has settled before each production push.
+You are Claude Code running the A/B-LOOP routine on the Mac Mini, once a week (Thu 01:45 ET). Your job is to close the loop on 3SK Finance's title/thumbnail experiments: read the experiment ledger, pull each running experiment's current CTR/views from the analytics feed, and for any experiment that has run long enough to call, route the winning pattern into future packaging and tell Steve. If there are no running experiments you stay quiet. This runs Thursday so the week's analytics has settled before each production push.
 
 VAULT: /Users/steve/Documents/3SK/outputs
 REPO:  /Volumes/AI_Workspace/iris_studio
@@ -47,7 +47,7 @@ PASS 5 — REPORT + ALERT:
 
 PASS 6 — LOG (always, exactly one short line):
   Append to today's daily note /Users/steve/Documents/3SK/outputs/_Iris_Memory/Daily/<YYYY-MM-DD>.md under a section headed EXACTLY:
-      ## 🧪 A/B-loop (weekly Thu 06:20)
+      ## 🧪 A/B-loop (weekly Thu 01:45)
   ONE line: # running experiments, # concluded this run, # needing Steve, + report path (or "no running experiments"). Create the daily note from 01_Operating_Docs/Templates/Daily_Note_Template.md (or a minimal stub) if missing. Do not touch any other agent's section.
 
 ────────────────────────────────────────────────────────

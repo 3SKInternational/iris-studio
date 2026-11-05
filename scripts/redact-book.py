@@ -148,6 +148,15 @@ for pat, repl in CRED_PATTERNS:
     # inline (?i) are unaffected, and the alpha char-classes were already both-case.
     s = re.sub(pat, repl, s, flags=re.IGNORECASE)
 
+# Video ids: exact-substring scrub (also kills every URL form — youtu.be/<id>, watch?v=<id>,
+# youtube.com/embed/<id> — since the id substring itself is replaced). Case-SENSITIVE, since a
+# different casing is a different YouTube video; the residual check below mirrors this exactly.
+# Runs BEFORE the identity subs (A-114, 2026-11-05): run after them, a sub that hit a token
+# inside an id (`a1Steve_2cd`, `Ab3SKcdefgh`) cut the id up so neither replace nor check
+# matched it. It must still follow the CRED pass and precede `ordered`; test case 9 pins all three.
+for _vid in VIDEO_IDS:
+    s = s.replace(_vid, "[VIDEO_ID]")
+
 # 1) Ordered, case-SENSITIVE structural replacements. Paths + compound tokens appear in
 #    fixed forms in the sources; longest/most-specific first so a short token never
 #    pre-truncates a superstring.
@@ -196,18 +205,13 @@ s = re.sub(r"steve_context", "[AUTHOR]_CONTEXT", s, flags=re.IGNORECASE)
 # case form of Steve/Steven = the person -> [AUTHOR]. Lowercase first to keep the distinction.
 s = re.sub(r"(?<![A-Za-z])steve(?![A-Za-z])", "[USER]", s)
 s = re.sub(r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)
+s = re.sub(r"(?<![A-Za-z])arias(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)  # surname, as redact-buildlog.py
 # "iris" as a compound-token prefix (iris_X / iris.X) has NO leading word boundary when it
 # follows a word char (e.g. "_Iris_Memory"), so the standalone pattern below would miss it while the
 # residual check `iris[_.]\w` flags it -> the redaction would fail-closed on a path the
 # scrub never rewrote. Mirror the check exactly so replace-set and check-set can't drift.
 s = re.sub(r"iris(?=[_.]\w)", "[ASSISTANT]", s, flags=re.IGNORECASE)
 s = re.sub(r"(?<![A-Za-z])iris(?![A-Za-z])", "[ASSISTANT]", s, flags=re.IGNORECASE)
-
-# Video ids: exact-substring scrub (also kills every URL form — youtu.be/<id>, watch?v=<id>,
-# youtube.com/embed/<id> — since the id substring itself is replaced). Case-SENSITIVE, since a
-# different casing is a different YouTube video; the residual check below mirrors this exactly.
-for _vid in VIDEO_IDS:
-    s = s.replace(_vid, "[VIDEO_ID]")
 
 try:
     with open(P, "w", encoding="utf-8") as fh:
@@ -218,11 +222,11 @@ except OSError as e:
 
 # 3) Residual check, fail-closed. Identity tokens + every credential shape from the same
 #    CRED_PATTERNS list, so a surviving secret can never pass as "REDACTION OK".
-# The identity checks keep the letter boundary too: a later rewrite (3SK, iris_, a video
-# id) can turn a letter next to a skipped token into `[`, and only this check sees it then
-# (test case 9). camelCase (`alertSteve`) still passes both sub and check.
+# The identity checks keep the letter boundary too: a later rewrite (3SK, iris_) can turn
+# a letter next to a skipped token into `[`, and only this check sees it then (test case 9). camelCase (`alertSteve`) still passes both sub and check.
 checks = [
     r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])",
+    r"(?<![A-Za-z])arias(?![A-Za-z])",
     r"(?<![A-Za-z])iris(?![A-Za-z])",
     r"iris[_.]\w",
     r"3sk",

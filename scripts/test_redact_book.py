@@ -169,20 +169,40 @@ def main():
     assert code == 0 and out == "Stevenson read the iridescent irises.", f"over-redacted: {out!r}"
 
     # 9) The residual check needs letter boundaries too (review r1, 2026-11-01). A token glued
-    #    to a letter is skipped by its sub; a LATER rewrite (video id, iris_ prefix, 3SK) turns
-    #    that letter into `[`, leaving `_`/digit on the other side. A \b check misses that and
+    #    to a letter is skipped by its sub; a LATER rewrite (3SK, iris_ prefix) turns that
+    #    letter into `[`, leaving `_`/digit on the other side. A \b check misses that and
     #    prints OK with the name on disk. These must fail closed: rc 1, name still visible.
-    #    FJljsipxTkA is in VIDEO_ID_SUPPLEMENT. If the video-id replace ever moves ahead of the
-    #    identity subs, the first two cases redact cleanly instead; swap in new inputs then.
-    for text, token in (("FJljsipxTkASteve9", "steve"), ("9SteveFJljsipxTkA", "steve"),
-                        ("FJljsipxTkAIris_ x", "iris"), ("_IrisFJljsipxTkA", "iris"),
-                        ("3SKmainfolder_x", "mainfolder"), ("9mainfolderFJljsipxTkA", "mainfolder"),
-                        ("9Steveiris_x", "steve")):
+    for text, token in (("3SKmainfolder_x", "mainfolder"), ("9mainfolderiris_x", "mainfolder"),
+                        ("9Steveiris_x", "steve"), ("9ariasiris_x", "arias")):
         code, out, msg = run(text)
         assert code == 1 and token in out.lower(), \
             f"fail-OPEN: {text!r} should fail closed, got rc={code} {out!r} {msg!r}"
+    #    The video-id replace runs BEFORE the identity subs (A-114, 2026-11-05), so a token
+    #    glued to an id is cut free and redacts cleanly. Run after them, the identity sub
+    #    cut into an id that contained a token and the id survived. FJljsipxTkA is in
+    #    VIDEO_ID_SUPPLEMENT. Move the replace back below the identity subs and these fail
+    #    closed instead (rc 1).
+    for text, want in (("FJljsipxTkASteve9", "[VIDEO_ID][AUTHOR]9"),
+                       ("9SteveFJljsipxTkA", "9[AUTHOR][VIDEO_ID]"),
+                       ("FJljsipxTkAIris_ x", "[VIDEO_ID][ASSISTANT]_ x"),
+                       ("_IrisFJljsipxTkA", "_[ASSISTANT][VIDEO_ID]"),
+                       ("9mainfolderFJljsipxTkA", "9[USER][VIDEO_ID]"),
+                       # ...and AFTER the CRED pass (moved above it, `[` breaks the secret
+                       # pattern and `abcd` survives) and BEFORE `ordered` (moved below it,
+                       # `AI_Workspace` cuts the id and ten of its letters survive). Review r1.
+                       ("token: abcdFJljsipxTkA", "token: [REDACTED]"),
+                       ("FJljsipxTkAI_Workspace", "[VIDEO_ID]I_Workspace")):
+        code, out, msg = run(text)
+        assert code == 0 and out == want, \
+            f"video id replace out of place: {text!r} -> rc={code} {out!r} {msg!r}"
 
-    print("test_redact_book: 16/16 pass")
+    # 10) Surname (A-114): redact-book.py lacked the `arias` pattern redact-buildlog.py has.
+    #     Pin the token and the letter bounds (a longer word is not touched).
+    code, out, msg = run("by S. Arias, see notify_arias_now; Zacharias sang arias2 in Ariasburg")
+    assert code == 0 and out == "by S. [AUTHOR], see notify_[AUTHOR]_now; Zacharias sang [AUTHOR]2 in Ariasburg", \
+        f"surname not redacted: rc={code} {out!r} {msg!r}"
+
+    print("test_redact_book: 17/17 pass")
 
 
 if __name__ == "__main__":
