@@ -197,10 +197,19 @@ RUN_TABLE: dict[str, dict] = {
     # goes to ~171 min (60 + 1800 + 2×(2400+1800)) — RECOMPUTED 2026-07-27 when
     # 2_review went 480 → 1800; the old figure here said "~105 min (60 + 480 +
     # 2×(2400+480))" and was silently 66 minutes stale, since that 480 IS 2_review.
-    # Nothing kills a long stage (run_job.sh has no watchdog) and launchd coalesces
-    # StartInterval ticks, so the hourly sweep will not overlap itself; but --status
-    # takes the same BLOCKING per-video flock, so `/pipeline 14 status` from Telegram
-    # can now hang up to ~2h51m (was ~1h45m) while a stage runs. That is the real
+    # In the hourly sweep nothing caps a single stage below that worst case (a
+    # Telegram run has its own 3600s cap, see 7_packaging). run_job.sh caps the
+    # whole sweep at its 6 h JOB_TIMEOUT_SEC default (21600 s, A-104; the
+    # pipeline-sweep plist sets no override), so a multi-video sweep of long
+    # stages can be killed mid-stage. That is accepted: run_job.sh's watchdog
+    # TERMs the process tree, this file's install_agent_reaper handler reaps every
+    # agent group on that TERM, and the next sweep's reconcile_orphans resets the
+    # stage to ready. The cost is one redone stage and a red alert (none on a
+    # retry replay), not lost work.
+    # launchd coalesces StartInterval ticks, so the hourly sweep will not overlap
+    # itself; but --status takes the same BLOCKING per-video flock, so
+    # `/pipeline 14 status` from Telegram can now hang up to ~2h51m (was ~1h45m)
+    # while a stage runs. That is the real
     # operator-facing cost of this bump — if it bites, give --status a non-blocking
     # LOCK_NB probe rather than shrinking the timeout back.
     "1_script":      {"kind": "agent",  "agent": "scriptwriter",             "timeout": 2400},
@@ -234,7 +243,8 @@ RUN_TABLE: dict[str, dict] = {
     # A Telegram /pipeline run is capped by iris.py PIPELINE_SUBPROCESS_TIMEOUT
     # (3600s); producer + one review can reach that, so a Telegram-started stage 7
     # that needs a fix round is stopped (SIGTERM, agents reaped) and left for the
-    # hourly sweep, which has no cap. 2_review has the same exposure.
+    # hourly sweep, capped only by run_job.sh's 6 h sweep limit (A-104). 2_review
+    # has the same exposure.
     # mutequiv: 1800 vs 1801s stage timeout is a tunable knob, no exact-value contract
     "7_packaging":   {"kind": "agent",  "agent": "packaging-strategist",     "timeout": 1800},
     "12_leadmagnet": {"kind": "agent",  "agent": "lead-magnet-writer",       "timeout": 900},
