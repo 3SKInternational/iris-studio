@@ -206,6 +206,7 @@ s = re.sub(r"steve_context", "[AUTHOR]_CONTEXT", s, flags=re.IGNORECASE)
 s = re.sub(r"(?<![A-Za-z])steve(?![A-Za-z])", "[USER]", s)
 s = re.sub(r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)
 s = re.sub(r"(?<![A-Za-z])arias(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)  # surname, as redact-buildlog.py
+s = re.sub(r"(?<![A-Za-z])mercury(?![A-Za-z])", "[BANK]", s, flags=re.IGNORECASE)  # the business bank (A-122)
 # "iris" as a compound-token prefix (iris_X / iris.X) has NO leading word boundary when it
 # follows a word char (e.g. "_Iris_Memory"), so the standalone pattern below would miss it while the
 # residual check `iris[_.]\w` flags it -> the redaction would fail-closed on a path the
@@ -227,6 +228,7 @@ except OSError as e:
 checks = [
     r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])",
     r"(?<![A-Za-z])arias(?![A-Za-z])",
+    r"(?<![A-Za-z])mercury(?![A-Za-z])",
     r"(?<![A-Za-z])iris(?![A-Za-z])",
     r"iris[_.]\w",
     r"3sk",

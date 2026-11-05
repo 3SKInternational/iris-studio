@@ -173,7 +173,8 @@ def main():
     #    letter into `[`, leaving `_`/digit on the other side. A \b check misses that and
     #    prints OK with the name on disk. These must fail closed: rc 1, name still visible.
     for text, token in (("3SKmainfolder_x", "mainfolder"), ("9mainfolderiris_x", "mainfolder"),
-                        ("9Steveiris_x", "steve"), ("9ariasiris_x", "arias")):
+                        ("9Steveiris_x", "steve"), ("9ariasiris_x", "arias"),
+                        ("9mercuryiris_x", "mercury")):
         code, out, msg = run(text)
         assert code == 1 and token in out.lower(), \
             f"fail-OPEN: {text!r} should fail closed, got rc={code} {out!r} {msg!r}"
@@ -202,7 +203,13 @@ def main():
     assert code == 0 and out == "by S. [AUTHOR], see notify_[AUTHOR]_now; Zacharias sang [AUTHOR]2 in Ariasburg", \
         f"surname not redacted: rc={code} {out!r} {msg!r}"
 
-    print("test_redact_book: 17/17 pass")
+    # 11) Bank name (A-122): it reached two books through a changelog and a source filename.
+    #     Bare word, inside a filename with `_`/`-` neighbours, and letter-joined words stay.
+    code, out, msg = run("Mercury account; see 2026-09-14_mercury-precondition.md and MERCURY_x; Mercurys and xmercury stay")
+    assert code == 0 and out == "[BANK] account; see 2026-09-14_[BANK]-precondition.md and [BANK]_x; Mercurys and xmercury stay", \
+        f"bank name not redacted: rc={code} {out!r} {msg!r}"
+
+    print("test_redact_book: 18/18 pass")
 
 
 if __name__ == "__main__":
