@@ -148,6 +148,7 @@ s = re.sub(r"(?<!\d)5582798766(?!\d)", "[USER_ID]", s)
 s = re.sub(r"(?<![A-Za-z])steve(?![A-Za-z])", "[USER]", s)  # macOS username (lowercase form)
 s = re.sub(r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)  # the person
 s = re.sub(r"(?<![A-Za-z])arias(?![A-Za-z])", "[AUTHOR]", s, flags=re.IGNORECASE)                 # surname
+s = re.sub(r"(?<![A-Za-z])mercury(?![A-Za-z])", "[BANK]", s, flags=re.IGNORECASE)                # the business bank, as redact-book.py (A-122)
 
 try:
     with open(P, "w", encoding="utf-8") as fh:
@@ -173,6 +174,7 @@ checks = [
     r"steve", r"mainfolder", r"5582798766",
     r"(?<![A-Za-z])ste(?:ven?s?|phens?)(?![A-Za-z])",  # mutequiv: same bounds as its sub, nothing rewrites after it
     r"(?<![A-Za-z])arias(?![A-Za-z])",                  # mutequiv: same bounds as its sub, nothing rewrites after it
+    r"(?<![A-Za-z])mercury(?![A-Za-z])",                # mutequiv: same bounds as its sub, nothing rewrites after it
 ] + [pat for pat, _ in CRED_PATTERNS]
 bad = []
 for c in checks:

@@ -115,7 +115,15 @@ def main():
         code, out, _ = run(text)
         assert code == 1 and out == text, f"bare check must fail closed: {text!r} -> {code} {out!r}"
 
-    print("test_redact_buildlog: 4/4 pass")
+    # 5) Bank name (A-122 port): build-log drafts are public, and the book redactor already
+    #    scrubs it. Every case form, inside identifiers, letter-bounded like the names above.
+    code, out, msg = run("Mercury account; see 2026-09-14_mercury-precondition.md and MERCURY_x; Mercurys and xmercury stay")
+    assert code == 0 and out == "[BANK] account; see 2026-09-14_[BANK]-precondition.md and [BANK]_x; Mercurys and xmercury stay", \
+        f"bank name not redacted: rc={code} {out!r} {msg!r}"
+    code, out, _ = run("3SKmercury paid")
+    assert code == 0 and out == "[COMPANY][BANK] paid", f"bank after company: {code} {out!r}"
+
+    print("test_redact_buildlog: 5/5 pass")
 
 
 if __name__ == "__main__":
