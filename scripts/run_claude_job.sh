@@ -214,8 +214,10 @@ JOB_START=$(date +%s)
 # longer sets CLAUDE_JOB_TIMEOUT_SEC in its plist.
 JOB_TIMEOUT="${CLAUDE_JOB_TIMEOUT_SEC:-28800}"
 KILL_GRACE="${CLAUDE_JOB_KILL_GRACE_SEC:-30}"  # overridable for self-tests
-# A typo like "2h" would reach perl as 2 and kill every run; refuse it.
-case "$JOB_TIMEOUT" in ''|*[!0-9]*)
+# A typo like "2h" would reach perl as 2 and kill every run; refuse it. Refuse
+# seven or more digits too: bash 3.2 wraps past 2^63 and perl's alarm is 32-bit,
+# so a huge value turned the cap off (A-121). The most it takes is 999999 s.
+case "$JOB_TIMEOUT" in ''|*[!0-9]*|???????*)
     echo "run_claude_job: bad CLAUDE_JOB_TIMEOUT_SEC '${JOB_TIMEOUT}', using 28800" >> "$LOG"; JOB_TIMEOUT=28800 ;; esac
 # Zero check after the base-10 read: "00" got past a literal `0)` arm and `alarm "00"`
 # turned the cap off (A-113). 10# also keeps "010" from reading as octal 8.

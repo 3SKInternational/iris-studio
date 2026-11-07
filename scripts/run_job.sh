@@ -175,8 +175,10 @@ LOG_OFF_BEFORE="${LOG_OFF_BEFORE//[^0-9]/}"; LOG_OFF_BEFORE="${LOG_OFF_BEFORE:-0
 # 24 h lock steal can start a second copy beside the first.
 JOB_TIMEOUT="${JOB_TIMEOUT_SEC:-21600}"
 KILL_GRACE="${JOB_KILL_GRACE_SEC:-30}"  # overridable for self-tests
-# A typo like "2h" would reach perl as 2 and kill every run; refuse it.
-case "$JOB_TIMEOUT" in ''|*[!0-9]*)
+# A typo like "2h" would reach perl as 2 and kill every run; refuse it. Refuse
+# seven or more digits too: bash 3.2 wraps past 2^63 and perl's alarm is 32-bit,
+# so a huge value turned the cap off (A-121). The most it takes is 999999 s.
+case "$JOB_TIMEOUT" in ''|*[!0-9]*|???????*)
     echo "run_job: bad JOB_TIMEOUT_SEC '${JOB_TIMEOUT}', using 21600" >> "$LOG"; JOB_TIMEOUT=21600 ;; esac
 JOB_TIMEOUT=$((10#$JOB_TIMEOUT))  # "08" is bad octal to bash; read it as decimal
 if [ "$JOB_TIMEOUT" -eq 0 ]; then

@@ -167,6 +167,19 @@ class TestRunJobTimeout(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("bad JOB_TIMEOUT_SEC '0'", self.new_log())
 
+    def test_huge_timeout_falls_back(self):
+        # bash 3.2 wraps past 2^63 and perl's alarm is 32-bit: any value from 2^32 up
+        # turned the cap off (A-121). Seven digits is the first length refused, six the
+        # last taken. Pin what perl receives, not only the log line.
+        argv = self.tmp / "argv"
+        for v, want in (("9223372036854775808", "21600"), ("4294967296", "21600"),
+                        ("1000000", "21600"), ("999999", "999999")):
+            rc, _ = self.run_with(f"ps -o command= -p $PPID > {argv}", JOB_TIMEOUT_SEC=v)
+            self.assertEqual(rc, 0)
+            self.assertIn(f"-- {want} ", argv.read_text())
+            if want != v:
+                self.assertIn(f"bad JOB_TIMEOUT_SEC '{v}', using 21600", self.new_log())
+
     def test_leading_zero_values_are_decimal(self):
         # "010" and "020" are octal 8 and 16 to bash; they must mean 10 and 20 s.
         # ("08" can't catch a missing 10#: bash errors, keeps the string, and perl

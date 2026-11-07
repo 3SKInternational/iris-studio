@@ -171,6 +171,20 @@ class TestClaudeJobTimeout(unittest.TestCase):
             self.assertIn(f"bad CLAUDE_JOB_TIMEOUT_SEC '{v}', using 28800", self.new_log())
             self.assertIn("-- 28800 ", argv.read_text())
 
+    def test_huge_timeout_falls_back(self):
+        # bash 3.2 wraps past 2^63 and perl's alarm is 32-bit: any value from 2^32 up
+        # turned the cap off (A-121). Seven digits is the first length refused, six the
+        # last taken. Pin what perl receives, not only the log line.
+        argv = self.tmp / "argv"
+        for v, want in (("9223372036854775808", "28800"), ("4294967296", "28800"),
+                        ("1000000", "28800"), ("999999", "999999")):
+            self.env["CLAUDE_JOB_TIMEOUT_SEC"] = v
+            rc, _ = self.run_with(f"ps -o command= -p $PPID > {argv}; echo ROUTINE_COMPLETE")
+            self.assertEqual(rc, 0)
+            self.assertIn(f"-- {want} ", argv.read_text())
+            if want != v:
+                self.assertIn(f"bad CLAUDE_JOB_TIMEOUT_SEC '{v}', using 28800", self.new_log())
+
     def test_leading_zero_values_are_decimal(self):
         # "010" and "020" are octal 8 and 16 to bash arithmetic; they must mean 10 and 20 s.
         # (A 2 s gap was too small: the bounded wait after KILL adds ~1 s.)
